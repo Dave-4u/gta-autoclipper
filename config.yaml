@@ -1,0 +1,106 @@
+# GTA AutoClipper — tuned for GTA 6 Shorts/TikTok clipping (free, self-hosted)
+# Edit keywords, durations, and paths to taste.
+
+search:
+  # yt-dlp search queries. Prefer recent + high-view GTA 6 / GTA RP content.
+  # Uses ytsearch + optional date-sorted results URL; ranks by recency + view_count.
+  keywords:
+    - "GTA 6 trailer"
+    - "GTA VI trailer reaction"
+    - "GTA 6 news"
+    - "GTA 6 leaks"
+    - "GTA 6 gameplay"
+    - "GTA 6 streamer reaction"
+    - "GTA RP funny moments"
+    - "GTA 5 RP highlights shorts"
+    - "GTA VI rockstar"
+  # How many search results to consider per keyword each run
+  results_per_keyword: 8
+  # Prefer videos shorter than this (seconds) as source material
+  max_source_duration: 900
+  # Prefer videos longer than this
+  min_source_duration: 15
+  # Sort preference: recent_views | views | recent
+  sort_by: recent_views
+  # Prefer uploads from the last N days when metadata allows (0 = no filter)
+  max_age_days: 90
+
+download:
+  # Also process URLs listed one-per-line (TikTok, Facebook, YouTube, etc.)
+  links_file: links.txt
+  output_dir: downloads
+  format: "bv*[height<=1080][vcodec!~='av01'][vcodec!~='av1']+ba/b[height<=1080]/b"
+
+history:
+  file: history.json
+
+clips:
+  width: 1080
+  height: 1920
+  min_duration: 15
+  max_duration: 60
+  target_duration: 30
+  max_clips_per_video: 3
+  loudness_lufs: -14
+  hook_duration: 2.0
+  font: ""
+  output_dir: outputs
+
+analysis:
+  weights:
+    loudness: 1.0
+    scene_change: 1.2
+    motion: 0.8
+    keyword: 1.5
+  transcript_boost_words:
+    - gta 6
+    - gta vi
+    - trailer
+    - leak
+    - rockstar
+    - lucia
+    - leonida
+    - vice city
+    - reaction
+    - oh my god
+    - crazy
+    - insane
+    - wait
+    - look
+    - police
+    - chase
+    - crash
+    - fail
+    - funny
+  use_whisper: true
+  whisper_model: base  # use 'tiny' for faster/low-RAM
+  scene_threshold: 27.0
+  # Vocal emphasis before whisper (highpass/lowpass/denoise) — always on in code
+  vocal_prefilter: true
+  # Relaxed no-speech / VAD handled in gta_autoclipper/transcribe.py
+
+scheduler:
+  default_hours: 6
+
+hashtags:
+  - "#GTA6"
+  - "#GTAVI"
+  - "#GTA"
+  - "#GTA6Trailer"
+  - "#GTARp"
+  - "#Gaming"
+  - "#GamingClips"
+  - "#Shorts"
+  - "#TikTok"
+  - "#FYP"
+  - "#Viral"
+  - "#RockstarGames"
+  - "#GTA6News"
+
+
+hooks:
+  # Optional local Ollama for smarter headers (free). Falls back to rules if offline.
+  use_ollama: true
+  ollama_host: "http://127.0.0.1:11434"
+  ollama_model: "llama3.2"
+  ollama_timeout: 8

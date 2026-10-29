@@ -1,0 +1,62 @@
+# Virtualenvs / Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime data
+outputs/
+downloads/
+history.json
+hook_style_history.json
+config.test.yaml
+*.ass
+
+# Media / models
+*.mp4
+*.mkv
+*.webm
+*.mov
+*.wav
+*.m4a
+models/
+*.bin
+*.pt
+*.onnx
+*.gguf
+.cache/
+whisper/
+faster-whisper*/
+
+# Secrets / credentials / cookies — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credentials*
+*secret*
+cookies.txt
+cookies.json
+*.cookies
+.netscape-cookies
+**/cookies/
+**/*cookie*
+.gh-token
+github_token*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
