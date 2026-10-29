@@ -1,4 +1,4 @@
-"""Render fully edited 9:16 clips with blur fill, smart hook, captions, loudnorm."""
+"""Render fully edited 9:16 clips with blur fill, smart hook, captions, VO, loudnorm."""
 
 from __future__ import annotations
 
@@ -11,11 +11,10 @@ from typing import Any
 
 from .analyze import Segment, get_word_timestamps
 from .hooks import HookContext, generate_hook
+from .voiceover import make_voiceover
 
-# ASS colors are &HAABBGGRR
-COLOR_ACTIVE = "H0000FFFF"   # yellow highlight (active word)
-COLOR_DIM = "H00FFFFFF"      # white (upcoming / past in line)
-COLOR_OUTLINE = "H00000000"  # black outline
+COLOR_ACTIVE = "H0000FFFF"
+COLOR_DIM = "H00FFFFFF"
 
 
 def _find_font(cfg: dict[str, Any]) -> str:
@@ -37,10 +36,16 @@ def _find_font(cfg: dict[str, Any]) -> str:
 
 
 def _escape_drawtext(text: str) -> str:
-    text = text.replace("\\", "\\\\")
-    text = text.replace(":", "\\:")
-    text = text.replace("'", "\\'")
+    """Sanitize text for ffmpeg drawtext inside filter_complex single quotes."""
+    text = text.replace(chr(92), " ")
+    text = text.replace("'", "")
+    text = text.replace(chr(34), "")
+    text = text.replace(":", " -")
     text = text.replace("%", "%%")
+    text = text.replace(",", " ")
+    text = text.replace("[", "(").replace("]", ")")
+    text = text.replace(";", ",")
+    text = text.replace(chr(8230), "...")
     return text
 
 
@@ -72,12 +77,6 @@ def _write_ass_captions(
     height: int,
     font_name: str = "DejaVu Sans",
 ) -> int:
-    """
-    Burn colored word-by-word captions.
-    For each word in a chunk, emit a dialogue line spanning that word's time
-    where the active word is yellow and the rest of the chunk is white.
-    Returns number of dialogue events written.
-    """
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
@@ -108,7 +107,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         ass_path.write_text(header, encoding="utf-8")
         return 0
 
-    # Chunk into groups of ~5 words for readable karaoke lines
     chunks: list[list[dict[str, Any]]] = []
     cur: list[dict[str, Any]] = []
     for w in cleaned:
@@ -123,7 +121,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     for chunk in chunks:
         tokens = [_ass_escape(c["word"]) for c in chunk]
         for i, w in enumerate(chunk):
-            # Build colored line: past white, active yellow+bold/scale, future white
             parts = []
             for j, tok in enumerate(tokens):
                 if j == i:
@@ -137,7 +134,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             line = " ".join(parts)
             start = w["start"]
             end = w["end"]
-            # Hold until next word if gap is small
             if i + 1 < len(chunk):
                 end = max(end, chunk[i + 1]["start"])
             else:
@@ -153,11 +149,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def _drawtext_caption_fallback(
-    words: list[dict[str, Any]], font_opt: str, clip_dur: float
+    words: list[dict[str, Any]], font_opt: str
 ) -> str:
-    """If ASS fails, stack timed drawtext filters for each word (colored)."""
     filters = []
-    # Show ~1 word at a time in yellow
     for w in words[:80]:
         token = _escape_drawtext((w.get("word") or "").strip())
         if not token:
@@ -172,6 +166,92 @@ def _drawtext_caption_fallback(
             f"enable='between(t\\,{s:.3f}\\,{e:.3f})'"
         )
     return ",".join(filters)
+
+
+def _copyright_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    clips = cfg.get("clips") or {}
+    cs = clips.get("copyright_safe")
+    if isinstance(cs, dict):
+        return cs
+    top = cfg.get("copyright_safe")
+    if isinstance(top, dict):
+        return top
+    return {"enabled": True}
+
+
+def _cap_segment(segment: Segment, cfg: dict[str, Any]) -> Segment:
+    cs = _copyright_cfg(cfg)
+    if not cs.get("enabled", True):
+        return segment
+    max_src = float(cs.get("max_source_seconds", 18))
+    length = segment.end - segment.start
+    if length <= max_src:
+        return segment
+    mid = (segment.start + segment.end) / 2.0
+    start = max(segment.start, mid - max_src / 2.0)
+    end = start + max_src
+    if end > segment.end:
+        end = segment.end
+        start = max(segment.start, end - max_src)
+    return Segment(
+        start=round(start, 2),
+        end=round(end, 2),
+        score=segment.score,
+        reason=segment.reason + "+safe",
+    )
+
+
+def _video_chain(
+    *,
+    width: int,
+    height: int,
+    ass_filter: str | None,
+    hook: str,
+    font_opt: str,
+    hook_dur: float,
+    speed: float,
+    zoom: float,
+    commentary: str,
+    commentary_on: bool,
+    drawtext_extra: str = "",
+    in_label: str = "0:v",
+    out_label: str = "vout",
+) -> str:
+    z = max(1.0, float(zoom))
+    speed = max(0.5, min(2.0, float(speed)))
+    parts = [
+        f"[{in_label}]split[bg][fg]",
+        f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},gblur=sigma=20[bg]",
+        f"[fg]scale=iw*{z}:ih*{z},crop=iw/{z}:ih/{z},"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease[fg]",
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setpts=PTS/{speed}[base]",
+    ]
+    cur = "base"
+    if ass_filter:
+        parts.append(f"[{cur}]{ass_filter}[cap]")
+        cur = "cap"
+    parts.append(
+        f"[{cur}]drawtext=text='{hook}'{font_opt}:fontsize=72:fontcolor=yellow:"
+        f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.12:"
+        f"enable='lte(t\\,{hook_dur})'[hooked]"
+    )
+    cur = "hooked"
+    if commentary_on and commentary:
+        parts.append(
+            f"[{cur}]drawtext=text='{commentary}'{font_opt}:fontsize=40:"
+            f"fontcolor=white:borderw=3:bordercolor=black:"
+            f"x=(w-text_w)/2:y=h*0.22:"
+            f"enable='lte(t\\,{max(hook_dur + 2.5, 4.0)})'[com]"
+        )
+        cur = "com"
+    if drawtext_extra:
+        parts.append(f"[{cur}]{drawtext_extra}[{out_label}]")
+    else:
+        # Relabel final pad
+        if cur != out_label:
+            parts.append(f"[{cur}]null[{out_label}]")
+    return ";".join(parts)
 
 
 def render_clip(
@@ -191,6 +271,13 @@ def render_clip(
     out_dir = Path(clips["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    segment = _cap_segment(segment, cfg)
+    cs = _copyright_cfg(cfg)
+    safe_on = bool(cs.get("enabled", True))
+    speed = float(cs.get("speed", 1.05)) if safe_on else 1.0
+    zoom = float(cs.get("zoom", 1.08)) if safe_on else 1.0
+    commentary_on = bool(cs.get("commentary_layer", True)) if safe_on else False
+
     safe_id = re.sub(r"[^\w\-]+", "_", video_id or source.stem)[:40]
     out_path = out_dir / f"{safe_id}_clip{index+1:02d}.mp4"
 
@@ -198,62 +285,80 @@ def render_clip(
     font_name = "DejaVu Sans"
     if font:
         stem = Path(font).stem
-        font_name = stem.replace("Bold", "").replace("-", " ").replace("_", " ").strip() or font_name
+        font_name = (
+            stem.replace("Bold", "").replace("-", " ").replace("_", " ").strip()
+            or font_name
+        )
 
     ana = cfg.get("analysis") or {}
     model_name = str(ana.get("whisper_model", "base"))
     use_whisper = ana.get("use_whisper", True)
+    vo_cfg = cfg.get("voiceover") or {}
+    vo_enabled = bool(vo_cfg.get("enabled", True))
 
     words: list[dict[str, Any]] = []
     if use_whisper:
         words = get_word_timestamps(
-            source,
-            segment.start,
-            segment.end,
-            model_name=model_name,
+            source, segment.start, segment.end, model_name=model_name
         )
-        if not words:
-            print("[edit] ERROR: transcription returned no words — captions will use placeholders")
+        if not words and not vo_enabled:
+            print("[edit] ERROR: transcription returned no words — retrying tiny")
             words = get_word_timestamps(
                 source, segment.start, segment.end, model_name="tiny"
             )
     else:
-        print("[edit] WARNING: whisper disabled (--no-whisper); captions will be placeholders")
+        print("[edit] WARNING: whisper disabled (--no-whisper)")
         dur = segment.end - segment.start
         words = [
             {"word": "[no captions — whisper off]", "start": 0.3, "end": min(3.0, dur)}
         ]
 
     real_words = [w for w in words if not str(w.get("word", "")).startswith("[")]
-    print(f"[edit] caption words: {len(words)} ({len(real_words)} real dialogue tokens)")
+    print(f"[edit] dialogue tokens: {len(real_words)}")
 
     snippet = " ".join(w.get("word", "") for w in real_words[:40] if w.get("word"))
     boost = []
     for w in ana.get("transcript_boost_words") or []:
         if w.lower() in (snippet + " " + title).lower():
             boost.append(w)
-    hook_res = generate_hook(
-        HookContext(
-            title=title,
-            reason=segment.reason,
-            transcript_snippet=snippet,
-            boost_hits=boost,
-            duration=segment.end - segment.start,
-        ),
-        cfg,
+    ctx = HookContext(
+        title=title,
+        reason=segment.reason,
+        transcript_snippet=snippet,
+        boost_hits=boost,
+        duration=segment.end - segment.start,
     )
+    hook_res = generate_hook(ctx, cfg)
     print(f"[hooks] style={hook_res.style} via={hook_res.via}: {hook_res.text}")
     hook = _escape_drawtext(hook_res.text)
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
-        ass_path = td_path / "captions.ass"
-        n_events = _write_ass_captions(words, ass_path, width, height, font_name=font_name)
-        print(f"[edit] ASS events: {n_events}")
+        vo_result = None
+        caption_words = list(words)
+        if vo_enabled:
+            vo_wav = td_path / "voiceover.wav"
+            vo_result = make_voiceover(ctx, cfg, vo_wav)
+            if vo_result.words:
+                caption_words = vo_result.words
+            elif vo_result.text:
+                caption_words = [
+                    {
+                        "word": t,
+                        "start": 0.2 + i * 0.35,
+                        "end": 0.55 + i * 0.35,
+                    }
+                    for i, t in enumerate(vo_result.text.split()[:24])
+                ]
 
-        # Copy ASS next to output for debugging
-        debug_ass = out_path.with_suffix(".ass")
-        debug_ass.write_text(ass_path.read_text(encoding="utf-8"), encoding="utf-8")
+        ass_path = td_path / "captions.ass"
+        n_events = _write_ass_captions(
+            caption_words, ass_path, width, height, font_name=font_name
+        )
+        print(f"[edit] ASS events: {n_events}")
+        out_path.with_suffix(".ass").write_text(
+            ass_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
 
         ass_escaped = str(ass_path).replace("\\", "/").replace(":", "\\:")
         fontsdir = ""
@@ -265,66 +370,116 @@ def render_clip(
 
         font_opt = f":fontfile={font.replace(':', '\\:')}" if font else ""
 
-        vf = (
-            f"split[bg][fg];"
-            f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},gblur=sigma=20[bg];"
-            f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[base];"
-            f"[base]{ass_filter}[cap];"
-            f"[cap]drawtext=text='{hook}'{font_opt}:fontsize=72:fontcolor=yellow:"
-            f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.12:"
-            f"enable='lte(t\\,{hook_dur})'"
-        )
+        commentary_text = ""
+        if commentary_on:
+            raw = vo_result.text if vo_result else hook_res.text
+            line = raw.split(".")[0].strip() or raw
+            if len(line.split()) > 10:
+                line = " ".join(line.split()[:10]) + "…"
+            commentary_text = _escape_drawtext(line)
 
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(segment.start),
-            "-to", str(segment.end),
-            "-i", str(source),
-            "-vf", vf,
-            "-af", f"loudnorm=I={lufs}:TP=-1.5:LRA=11",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart",
-            "-pix_fmt", "yuv420p",
-            "-r", "30",
-            str(out_path),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if proc.returncode != 0 or not out_path.is_file():
-            print("[edit] ASS burn failed, falling back to timed drawtext captions…")
-            print((proc.stderr or "")[-1000:])
-            dt = _drawtext_caption_fallback(words, font_opt, segment.end - segment.start)
-            vf2 = (
-                f"split[bg][fg];"
-                f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},gblur=sigma=20[bg];"
-                f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
-                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,"
-                f"drawtext=text='{hook}'{font_opt}:fontsize=72:fontcolor=yellow:"
-                f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.12:"
-                f"enable='lte(t\\,{hook_dur})'"
+        atempo = speed if abs(speed - 1.0) > 0.001 else 1.0
+        src_af = f"atempo={atempo}" if abs(atempo - 1.0) > 0.001 else "anull"
+        vo_vol = float(vo_cfg.get("volume", 1.0))
+        duck = float(vo_cfg.get("duck_level", 0.22))
+        use_sidechain = bool(vo_cfg.get("sidechain", True))
+
+        def run_ffmpeg(use_ass: bool, use_dt_fallback: bool = False) -> bool:
+            dt = _drawtext_caption_fallback(caption_words, font_opt) if use_dt_fallback else ""
+            vchain = _video_chain(
+                width=width,
+                height=height,
+                ass_filter=ass_filter if use_ass else None,
+                hook=hook,
+                font_opt=font_opt,
+                hook_dur=hook_dur,
+                speed=speed,
+                zoom=zoom,
+                commentary=commentary_text,
+                commentary_on=commentary_on and bool(commentary_text),
+                drawtext_extra=dt,
+                out_label="vout",
             )
-            if dt:
-                vf2 += "," + dt
-            cmd2 = [
-                "ffmpeg", "-y",
-                "-ss", str(segment.start),
-                "-to", str(segment.end),
-                "-i", str(source),
-                "-vf", vf2,
-                "-af", f"loudnorm=I={lufs}:TP=-1.5:LRA=11",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                "-c:a", "aac", "-b:a", "192k",
-                "-movflags", "+faststart",
-                "-pix_fmt", "yuv420p",
-                "-r", "30",
-                str(out_path),
-            ]
-            proc2 = subprocess.run(cmd2, capture_output=True, text=True, check=False)
-            if proc2.returncode != 0 or not out_path.is_file():
-                print(f"[edit] failed: {(proc2.stderr or '')[-600:]}")
+            has_vo = (
+                vo_enabled
+                and vo_result
+                and vo_result.wav_path
+                and vo_result.wav_path.is_file()
+            )
+            if has_vo:
+                if use_sidechain:
+                    achain = (
+                        f"[0:a]{src_af}[a0];"
+                        f"[1:a]volume={vo_vol},apad=whole_dur=3600,asplit=2[sc][voice];"
+                        f"[a0][sc]sidechaincompress=threshold=0.012:ratio=8:"
+                        f"attack=40:release=280:makeup=1[ducked];"
+                        f"[ducked][voice]amix=inputs=2:duration=first:"
+                        f"dropout_transition=0:normalize=0,"
+                        f"loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
+                    )
+                else:
+                    achain = (
+                        f"[0:a]{src_af},volume={duck}[a0];"
+                        f"[1:a]volume={vo_vol},apad=whole_dur=3600[voice];"
+                        f"[a0][voice]amix=inputs=2:duration=first:"
+                        f"dropout_transition=0:normalize=0,"
+                        f"loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
+                    )
+                fc = f"{vchain};{achain}"
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(segment.start),
+                    "-to", str(segment.end),
+                    "-i", str(source),
+                    "-i", str(vo_result.wav_path),
+                    "-filter_complex", fc,
+                    "-map", "[vout]",
+                    "-map", "[aout]",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    "-pix_fmt", "yuv420p",
+                    "-r", "30",
+                    str(out_path),
+                ]
+            else:
+                # Single-input: use -vf / -af for simplicity
+                # Convert labeled chain to unlabeled -vf is messy; keep filter_complex
+                achain = (
+                    f"[0:a]{src_af},loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
+                    if src_af != "anull"
+                    else f"[0:a]loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
+                )
+                fc = f"{vchain};{achain}"
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(segment.start),
+                    "-to", str(segment.end),
+                    "-i", str(source),
+                    "-filter_complex", fc,
+                    "-map", "[vout]",
+                    "-map", "[aout]",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    "-pix_fmt", "yuv420p",
+                    "-r", "30",
+                    str(out_path),
+                ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if proc.returncode != 0 or not out_path.is_file():
+                print((proc.stderr or "")[-1200:])
+                return False
+            return True
+
+        ok = run_ffmpeg(use_ass=True)
+        if not ok:
+            print("[edit] ASS burn failed, falling back to timed drawtext…")
+            if out_path.is_file():
+                out_path.unlink(missing_ok=True)
+            ok = run_ffmpeg(use_ass=False, use_dt_fallback=True)
+            if not ok:
+                print("[edit] render failed")
                 return None
 
     meta_side = out_path.with_suffix(".hook.json")
@@ -334,8 +489,22 @@ def render_clip(
                 "hook": hook_res.text,
                 "style": hook_res.style,
                 "via": hook_res.via,
-                "caption_words": len(words),
+                "caption_words": len(caption_words),
                 "real_dialogue_words": len(real_words),
+                "voiceover": None
+                if not vo_result
+                else {
+                    "text": vo_result.text,
+                    "style": vo_result.style,
+                    "via": vo_result.via,
+                    "engine": vo_result.engine,
+                },
+                "copyright_safe": {
+                    "enabled": safe_on,
+                    "source_seconds": round(segment.end - segment.start, 2),
+                    "speed": speed,
+                    "zoom": zoom,
+                },
             },
             indent=2,
         ),

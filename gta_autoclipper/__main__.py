@@ -130,15 +130,37 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Only process URLs from links.txt (no YouTube search)",
     )
+    vo_group = parser.add_mutually_exclusive_group()
+    vo_group.add_argument(
+        "--voiceover",
+        action="store_true",
+        help="Force AI voiceover on (overrides config)",
+    )
+    vo_group.add_argument(
+        "--no-voiceover",
+        action="store_true",
+        help="Disable AI voiceover for this run",
+    )
+    parser.add_argument(
+        "--no-copyright-safe",
+        action="store_true",
+        help="Disable short/zoom/speed transformative defaults",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
     if args.links_only:
         cfg.setdefault("search", {})["keywords"] = []
 
+    if args.voiceover:
+        cfg.setdefault("voiceover", {})["enabled"] = True
+    if args.no_voiceover:
+        cfg.setdefault("voiceover", {})["enabled"] = False
+    if args.no_copyright_safe:
+        cfg.setdefault("clips", {}).setdefault("copyright_safe", {})["enabled"] = False
+
     interval = args.every
     if interval is None and not args.once:
-        # default: single pass
         interval = None
 
     if getattr(args, "fast", False):

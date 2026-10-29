@@ -21,9 +21,12 @@ if not exist .venv (
   python -m venv .venv
   call .venv\Scripts\activate.bat
   python -m pip install -U pip
-  pip install -r requirements.txt
 ) else (
   call .venv\Scripts\activate.bat
 )
+
+REM Always sync deps so git pull + new packages (piper-tts, edge-tts) install
+echo [run] ensuring dependencies...
+python -m pip install -r requirements.txt -q
 
 python -m gta_autoclipper %*

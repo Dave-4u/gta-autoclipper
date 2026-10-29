@@ -9,13 +9,14 @@ if [[ ! -d .venv ]]; then
   # shellcheck disable=SC1091
   source .venv/bin/activate
   pip install -U pip
-  pip install -r requirements.txt
 else
   # shellcheck disable=SC1091
   source .venv/bin/activate
 fi
 
-# Ensure ffmpeg is available
+echo "[run] ensuring dependencies…"
+pip install -r requirements.txt -q
+
 if ! command -v ffmpeg >/dev/null 2>&1; then
   echo "ERROR: ffmpeg not found. Install ffmpeg and re-run."
   exit 1
