@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import random
 import subprocess
 import tempfile
@@ -376,6 +377,78 @@ def _snap_window(
     return round(best_s, 2), round(best_e, 2)
 
 
+def detect_black_ranges(path: Path, *, min_dur: float = 0.35, pic_th: float = 0.92, pix_th: float = 0.12) -> list[tuple[float, float]]:
+    """Return (start, end) ranges that ffmpeg blackdetect marks as near-black."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-i", str(path),
+        "-vf", f"blackdetect=d={min_dur}:pic_th={pic_th}:pix_th={pix_th}",
+        "-an", "-f", "null", "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    blob = (proc.stderr or "") + (proc.stdout or "")
+    ranges: list[tuple[float, float]] = []
+    for m in re.finditer(
+        r"black_start:\s*([0-9.]+)\s+black_end:\s*([0-9.]+)",
+        blob,
+    ):
+        try:
+            ranges.append((float(m.group(1)), float(m.group(2))))
+        except ValueError:
+            continue
+    return ranges
+
+
+def _black_overlap(start: float, end: float, blacks: list[tuple[float, float]]) -> float:
+    """Seconds of overlap between [start,end] and black ranges."""
+    total = 0.0
+    for bs, be in blacks:
+        lo = max(start, bs)
+        hi = min(end, be)
+        if hi > lo:
+            total += hi - lo
+    return total
+
+
+def _trim_black_edges(start: float, end: float, blacks: list[tuple[float, float]], min_d: float) -> tuple[float, float] | None:
+    """Shrink window to drop leading/trailing black; None if mostly black."""
+    if not blacks:
+        return start, end
+    length = end - start
+    if length <= 0:
+        return None
+    if _black_overlap(start, end, blacks) / length > 0.35:
+        return None
+    # Trim leading black
+    for bs, be in blacks:
+        if bs <= start + 0.05 and be > start and be < end:
+            start = be + 0.05
+    # Trim trailing black
+    for bs, be in blacks:
+        if be >= end - 0.05 and bs < end and bs > start:
+            end = bs - 0.05
+    if end - start < min_d * 0.85:
+        return None
+    if _black_overlap(start, end, blacks) / max(0.01, end - start) > 0.25:
+        return None
+    return round(start, 2), round(end, 2)
+
+
+def face_reaction_spike_scores(face: np.ndarray) -> np.ndarray:
+    """Derivative of face-motion: expression change / motion spike, not static presence."""
+    if face is None or len(face) == 0:
+        return np.zeros(1, dtype=np.float32)
+    f = face.astype(np.float32)
+    # Absolute first difference (expression change) + local variance
+    d = np.abs(np.diff(f, prepend=f[:1]))
+    # Rolling variance proxy
+    kern = np.ones(3) / 3.0
+    local = np.convolve(f, kern, mode="same")
+    var = np.abs(f - local)
+    spike = d * 1.4 + var * 0.8 + f * 0.25
+    return spike.astype(np.float32)
+
+
+
 def find_highlights(
     path: Path, cfg: dict[str, Any]
 ) -> list[Segment]:
@@ -399,6 +472,8 @@ def find_highlights(
 
     niche_id = str(cfg.get("niche_id") or (cfg.get("niche") or {}).get("id") or "").lower()
     reaction_mode = niche_id in {"reactions", "funny"} or "reaction" in niche_id
+    # GTA clips often have a streamer PiP — require visible face reaction spikes too
+    need_face_reaction = reaction_mode or niche_id in {"gta6", "reactions"}
 
     duration = _video_duration(path)
     if duration < min_d:
@@ -413,12 +488,17 @@ def find_highlights(
     print("[analyze] motion…")
     motion = extract_motion_scores(path)
 
-    spikes = laugh = scream = face = None
-    if reaction_mode or ana.get("always_reaction_signals", False):
+    spikes = laugh = scream = face = face_spike = None
+    if reaction_mode or need_face_reaction or ana.get("always_reaction_signals", False):
         print("[analyze] laughter/scream spikes…")
         spikes, laugh, scream = extract_laughter_scream_scores(path)
         print("[analyze] face motion…")
         face = extract_face_motion_scores(path)
+        face_spike = face_reaction_spike_scores(face) if face is not None else None
+    print("[analyze] blackdetect…")
+    blacks = detect_black_ranges(path)
+    if blacks:
+        print(f"[analyze] black ranges: {len(blacks)}")
 
     n = max(len(loud), len(motion), int(duration) + 1)
     if spikes is not None:
@@ -453,10 +533,17 @@ def find_highlights(
             score[i] += w_loud * 0.5 * float(spike_n[i])
             score[i] += w_laugh * float(laugh_n[i])
             score[i] += w_scream * float(scream_n[i])
+    face_spike_n = np.zeros(n, dtype=np.float32)
     if face is not None:
         face_n = _normalize(face)
         for i in range(min(n, len(face_n))):
-            score[i] += w_face * float(face_n[i])
+            # Static face presence alone is weak — prefer expression change
+            score[i] += w_face * 0.45 * float(face_n[i])
+    if face_spike is not None:
+        face_spike_n = _normalize(face_spike)
+        w_spike = w_face * (1.8 if need_face_reaction else 1.1)
+        for i in range(min(n, len(face_spike_n))):
+            score[i] += w_spike * float(face_spike_n[i])
 
     transcript_hits: list[tuple[float, float, str]] = []
     if ana.get("use_whisper", True):
@@ -489,6 +576,17 @@ def find_highlights(
             continue
         if smooth[idx] < 0.05 and len(pool) > 0:
             break
+        # Require a visible face-reaction spike (not just loud audio) for PiP niches
+        if need_face_reaction and face_spike_n is not None and len(face_spike_n) > 0:
+            ii0 = min(idx, len(face_spike_n) - 1)
+            # Also accept nearby spike within ±1s
+            local = float(face_spike_n[ii0])
+            if ii0 > 0:
+                local = max(local, float(face_spike_n[ii0 - 1]))
+            if ii0 + 1 < len(face_spike_n):
+                local = max(local, float(face_spike_n[ii0 + 1]))
+            if local < 0.28 and len(pool) > 0:
+                continue
         peak_t = float(idx)
         # Center on peak with short lead-in (especially for reactions)
         if reaction_mode:
@@ -542,6 +640,13 @@ def find_highlights(
             start, end, duration=duration, scenes=scenes,
             min_d=min_d, max_d=max_d, peak_t=peak_t,
         )
+        trimmed = _trim_black_edges(start, end, blacks, min_d)
+        if trimmed is None:
+            continue
+        start, end = trimmed
+        if "face" in reasons or (len(face_spike_n) > ii and face_spike_n[ii] > 0.35):
+            if "face_react" not in reasons:
+                reasons.append("face_react")
         pool.append(
             Segment(start=round(start, 2), end=round(end, 2),
                     score=float(smooth[idx]), reason="+".join(reasons) or "peak")
@@ -553,10 +658,14 @@ def find_highlights(
         top = pool[: max(max_clips * 3, max_clips)]
         weights_l = [max(0.05, s.score) ** 1.5 for s in top]
         # Prefer reaction peaks when in reaction mode
-        if reaction_mode:
+        if reaction_mode or need_face_reaction:
             for j, seg in enumerate(top):
-                if "react_peak" in seg.reason or "laugh" in seg.reason or "scream" in seg.reason:
+                if "face_react" in seg.reason:
+                    weights_l[j] *= 3.0
+                elif "react_peak" in seg.reason or "laugh" in seg.reason or "scream" in seg.reason:
                     weights_l[j] *= 2.2
+                elif need_face_reaction and "face" not in seg.reason:
+                    weights_l[j] *= 0.35
         chosen_idx: set[int] = set()
         while len(candidates) < max_clips and len(chosen_idx) < len(top):
             i = random.choices(range(len(top)), weights=weights_l, k=1)[0]

@@ -100,6 +100,8 @@ PUBLISHERS = {
     "youtube", "music", "vevo", "crunchyroll", "netflix", "disney", "hulu",
     "amazon prime", "prime video", "hbo", "max", "rockstar games", "sony",
     "microsoft", "xbox", "playstation", "nintendo", "ign", "gamespot",
+    "anime", "anime hub", "gaming world z", "davis studios", "thebixx",
+    "streamers react hub", "clip channel", "reacts", "reaction",
 }
 
 STREAMER_ALIASES = [
@@ -112,6 +114,130 @@ STREAMER_ALIASES = [
     ("caseoh", "CaseOh"),
     ("yourrage", "YourRAGE"),
 ]
+
+# Spoken forms for TTS (handles / leetspeak → readable words)
+PRONUNCIATION_MAP = [
+    (r"(?i)\bmoistcr1tikal\b", "Moist Critical"),
+    (r"(?i)\bmoist\s*critical\b", "Moist Critical"),
+    (r"(?i)\bpenguinz0\b", "Penguin Zero"),
+    (r"(?i)\bxqc\b", "X Q C"),
+    (r"(?i)\bishowspeed\b", "I Show Speed"),
+    (r"(?i)\bkai\s*cenat\b", "Kai See-nat"),
+    (r"(?i)\basmongold\b", "As-mon-gold"),
+    (r"(?i)\bcaseoh\b", "Case Oh"),
+    (r"(?i)\byourrage\b", "Your Rage"),
+    (r"(?i)\bninja\b", "Ninja"),
+    (r"(?i)\bgtavi\b", "G T A six"),
+    (r"(?i)\bgta\s*vi\b", "G T A six"),
+    (r"(?i)\bgta\s*6\b", "G T A six"),
+    (r"(?i)\bgta6\b", "G T A six"),
+]
+
+
+def normalize_pronunciation(text: str) -> str:
+    """Rewrite handles/leetspeak so TTS does not butcher them."""
+    t = text or ""
+    for pat, repl in PRONUNCIATION_MAP:
+        t = re.sub(pat, repl, t)
+    # Generic leetspeak: Cr1TiKaL-style digits inside names → words
+    digit_words = {"0": " zero ", "1": " one ", "3": " e ", "4": " a ", "5": " s ", "7": " t "}
+    def _leet(m: re.Match) -> str:
+        s = m.group(0)
+        # Only rewrite if mixed letters+digits and looks like a handle
+        if not re.search(r"\d", s) or not re.search(r"[A-Za-z]", s):
+            return s
+        out = []
+        for ch in s:
+            if ch.isdigit() and ch in digit_words:
+                out.append(digit_words[ch])
+            else:
+                out.append(ch)
+        return re.sub(r"\s+", " ", "".join(out)).strip()
+    t = re.sub(r"\b[A-Za-z][A-Za-z0-9]{2,}\b", _leet, t)
+    # Collapse leftover digit clusters that are still awkward mid-word
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def detect_reactor(title: str = "", channel: str = "") -> str | None:
+    """Return who is reacting — only when title/channel says '<X> reacts'.
+    Never attribute a name that is merely the subject being watched ('react to X').
+    """
+    title = title or ""
+    channel = channel or ""
+    t_clean = re.sub(r"^[\"'\s]+", "", title)
+
+    # Object of reaction: everything after 'react(s|ion) to' is NOT the reactor
+    object_blob = ""
+    mo = re.search(r"(?i)\breacts?(?:\s+to)?\s+(.+)$", t_clean)
+    if mo:
+        object_blob = mo.group(1).lower()
+    mo2 = re.search(r"(?i)\breaction\s+to\s+(.+)$", t_clean)
+    if mo2:
+        object_blob = (object_blob + " " + mo2.group(1)).lower()
+
+    def _canon(name: str) -> str | None:
+        name = name.strip(" -_|:.'\"")
+        if len(name) < 2:
+            return None
+        # Reject generic collective subjects
+        if re.fullmatch(r"(?i)streamers?|everyone|chat|they|people|fans?", name):
+            return None
+        nl = name.lower()
+        # If this name only appears as the object of 'react to', reject
+        if object_blob:
+            for alias, canon in STREAMER_ALIASES:
+                if alias in nl or nl in alias:
+                    if alias in object_blob or canon.lower() in object_blob:
+                        # name equals the object → not reactor
+                        if nl == alias or nl == canon.lower() or alias in nl:
+                            return None
+        for alias, canon in STREAMER_ALIASES:
+            if alias in nl or nl in alias or nl == canon.lower():
+                # Object check for known aliases
+                if object_blob and (alias in object_blob or canon.lower() in object_blob):
+                    if not re.search(rf"(?i){re.escape(name)}\s+reacts?", t_clean):
+                        return None
+                return canon
+        return name
+
+    # Pattern A: start of title "Name Reacts…"
+    m = re.search(
+        r"(?i)^\s*([A-Za-z0-9][A-Za-z0-9 ._\-]{1,40}?)\s+reacts?(?:\s+to)?\b",
+        t_clean,
+    )
+    if m:
+        got = _canon(m.group(1))
+        if got:
+            return got
+
+    # Pattern B: mid-title "Name Reacts" (e.g. after a quote)
+    for m in re.finditer(
+        r"(?i)(?:^|[\"'\|\-:]\s*|\s)([A-Za-z0-9][A-Za-z0-9 ._\-]{1,36}?)\s+reacts?(?:\s+to)?\b",
+        t_clean,
+    ):
+        got = _canon(m.group(1))
+        if got:
+            return got
+
+    # Channel as reactor when it's a known streamer / person channel on a reaction upload
+    ch = channel.strip()
+    ch_l = ch.lower()
+    if ch and "react" in (title + " " + ch).lower():
+        for alias, canon in STREAMER_ALIASES:
+            if alias in ch_l or canon.lower() in ch_l:
+                # Don't use channel if channel name is the object being reacted to
+                if object_blob and (alias in object_blob or canon.lower() in object_blob):
+                    break
+                return canon
+        if (
+            ch_l not in PUBLISHERS
+            and len(ch) > 2
+            and re.search(r"(?i)\breaction\b", title)
+            and not re.search(r"(?i)\breacts?\s+to\b", title)
+        ):
+            return ch
+    return None
 
 
 @dataclass
@@ -164,9 +290,32 @@ def extract_entities(
     # Only add character names to allowed when franchise detected — already done above.
     # Do NOT put characters on es from undetected packs.
 
+    reactor = detect_reactor(title, channel)
+    if reactor:
+        if reactor not in es.streamers:
+            es.streamers.insert(0, reactor)
+        allowed.add(reactor.lower())
+    # Names that appear only after "react to" are subjects, not reactors
+    react_to_obj = ""
+    m_obj = re.search(r"(?i)\breacts?(?:\s+to)?\s+(.+)$", title or "")
+    if m_obj:
+        react_to_obj = m_obj.group(1).lower()
+    m_obj2 = re.search(r"(?i)\breaction\s+to\s+(.+)$", title or "")
+    if m_obj2:
+        react_to_obj += " " + m_obj2.group(1).lower()
     for alias, name in STREAMER_ALIASES:
         if alias in blob:
+            is_object = bool(react_to_obj) and (alias in react_to_obj or name.lower() in react_to_obj)
             if name not in es.streamers:
+                if is_object and (reactor is None or name != reactor):
+                    # Subject being watched — allow term, do not attribute as reactor
+                    allowed.add(name.lower())
+                    allowed.add(alias)
+                    continue
+                if reactor and name != reactor and ("react" in blob):
+                    allowed.add(name.lower())
+                    allowed.add(alias)
+                    continue
                 es.streamers.append(name)
             allowed.add(name.lower())
             allowed.add(alias)
@@ -183,8 +332,12 @@ def extract_entities(
                        "animation", "studio", "crunchyroll", "network")
         )
     ):
+        # Channel is likely the uploader/reactor — put first only if no explicit reactor
         if ch not in es.streamers:
-            es.streamers.append(ch)
+            if reactor:
+                es.streamers.append(ch)
+            else:
+                es.streamers.insert(0, ch)
         allowed.add(ch_l)
 
     title_clean = re.sub(r"[|\[\]\(\)#]", " ", title or "")
@@ -284,23 +437,31 @@ def event_summary(es: EntitySet, title: str = "", transcript: str = "", reason: 
     proper = [x for x in proper if x not in skip]
 
     if action == "reaction":
-        if es.streamers:
-            name = es.streamers[0]
-            if "reaction" in name.lower():
-                return name  # channel already says Reaction
-            return f"{name} reaction"
+        reactor = detect_reactor(title, "")
+        # Prefer explicit reactor from title; fall back to entity streamers[0] only if it matches title "X reacts"
+        if reactor:
+            return f"{reactor} reacts"
+        # If title is just "… reaction" without a named reactor, describe the event not a wrong name
+        for word in ("trailer", "gameplay", "fight", "ending", "scene", "clip"):
+            if word in t:
+                return f"{word} reaction"
+        if es.franchises:
+            return es.franchises[0].replace("_", " ") + " reaction"
         if proper:
-            return f"{proper[0]} reaction"
+            # proper[0] might be the content, not the reactor — avoid "<wrong> reaction"
+            return "that reaction"
         return "streamer reaction"
 
     if action:
         if es.characters and action in ("fight", "battle", "vs", "moment"):
             return f"{es.characters[0].title()} {action}"
         if proper:
-            return f"{proper[0]} {action}"
+            # Avoid "Fight fight" when proper noun == action word
+            if proper[0].lower() != action.lower():
+                return f"{proper[0]} {action}"
         if es.franchises:
             return f"{es.franchises[0].replace('_', ' ')} {action}"
-        if es.streamers:
+        if es.streamers and es.streamers[0].lower() not in ("anime", "youtube", "music"):
             return f"{es.streamers[0]} {action}"
         return action
 

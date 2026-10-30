@@ -62,6 +62,7 @@ class HookContext:
     entities: Any = None
     event: str = ""
     confidence: float = 0.0
+    header_text: str = ""
 
 
 @dataclass
@@ -679,19 +680,42 @@ def generate_hook(ctx: HookContext, cfg: dict[str, Any]) -> HookResult:
     grounded_cands = [("Watch what happens next", "question", "neutral"),
                       ("Did you catch this moment?", "question", "neutral"),
                       ("Wait for this part", "hype", "neutral")]
-    if not ugly and ev and ev.lower() not in {"this moment", "moment"}:
-        grounded_cands = [
-            (f"Did you catch {ev}?", "question", "grounded"),
-            (f"Wait for {ev}", "hype", "grounded"),
-            (f"POV: {ev}", "pov", "grounded"),
-            (f"When {ev} hits", "when_you", "grounded"),
-        ] + grounded_cands
+    if not ugly and ev and ev.lower() not in {"this moment", "moment", "that reaction"}:
+        # Prefer short punchy headers — avoid awkward "Name reaction" phrasing
+        short_ev = ev
+        if short_ev.lower().endswith(" reaction") and "reacts" not in short_ev.lower():
+            # "GTA 6 reaction" → "the reaction" / event-focused
+            base = short_ev[: -len(" reaction")].strip()
+            grounded_cands = [
+                (f"Wait for this {base}" if len(base) < 18 else "Wait for this part", "hype", "grounded"),
+                ("Did you catch that?", "question", "grounded"),
+                (f"POV: {base} hits" if len(base) < 20 else "POV: this hits", "pov", "grounded"),
+            ] + grounded_cands
+        elif "reacts" in short_ev.lower():
+            grounded_cands = [
+                (short_ev if len(short_ev) <= 34 else short_ev.split()[0] + " reacts", "reaction", "grounded"),
+                ("Look at the face cam", "reaction", "grounded"),
+                ("Chat is not ready", "hype", "grounded"),
+            ] + grounded_cands
+        else:
+            grounded_cands = [
+                (f"Did you catch {ev}?" if len(ev) < 28 else "Did you catch this?", "question", "grounded"),
+                (f"Wait for {ev}" if len(ev) < 30 else "Wait for this part", "hype", "grounded"),
+                (f"POV: {ev}" if len(ev) < 32 else "POV: this moment", "pov", "grounded"),
+                (f"When {ev} hits" if len(ev) < 28 else "When this hits", "when_you", "grounded"),
+            ] + grounded_cands
     # Franchise-safe character hooks
     for ch in (es.characters or [])[:2]:
         grounded_cands.append((f"Watch {ch.title()} here", "hype", "grounded"))
         grounded_cands.append((f"Did {ch.title()} just cook?", "question", "grounded"))
-    for st in (es.streamers or [])[:2]:
-        grounded_cands.append((f"{st} wasn't ready", "reaction", "grounded"))
+    # Only name a streamer if they are the reactor (title says X reacts)
+    from .entities import detect_reactor
+    reactor = detect_reactor(ctx.title, getattr(ctx, "channel", "") or "")
+    if reactor:
+        grounded_cands.insert(0, (f"{reactor} wasn't ready", "reaction", "grounded"))
+        grounded_cands.insert(0, (f"{reactor} reacts", "reaction", "grounded"))
+        grounded_cands.insert(0, ("Look at the face cam", "reaction", "grounded"))
+        grounded_cands.insert(0, ("Chat is cooked", "hype", "grounded"))
     pool = grounded_cands + list(pool)
 
     scored: list[tuple[float, str, str, str]] = []
@@ -724,6 +748,17 @@ def generate_hook(ctx: HookContext, cfg: dict[str, Any]) -> HookResult:
         evl = (ctx.event or "").lower()
         if ("teaser" in evl or "trailer" in evl) and any(x in text_h.lower() for x in ("tank", "fight", "sakuga", "bankai", "hit?")):
             sc -= 3.0
+        # Demote awkward ALL-CAPS "WAIT FOR <event>" restatements
+        tl = text_h.lower()
+        if tl.startswith("wait for ") and ("react" in tl or "fight" in tl or "hub" in tl):
+            sc -= 2.5
+        if "anime hub" in tl or "davis studios" in tl:
+            sc -= 4.0
+        # Boost short punchy face-cam / chat lines
+        if tl in ("look at the face cam", "chat is cooked", "chat is not ready", "don't blink here"):
+            sc += 2.5
+        if text_h.endswith(" reacts") and len(text_h.split()) <= 3:
+            sc += 1.5
         if sc <= -50:
             continue
         scored.append((sc, text_h, style, via))

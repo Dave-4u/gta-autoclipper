@@ -70,15 +70,21 @@ def _escape_drawtext(text: str) -> str:
 
 
 def _fit_header(text: str, max_chars: int = 36) -> str:
-    """Keep headers readable on 9:16; prefer intact short lines over ellipsis."""
+    """Keep headers readable on 9:16; never truncate mid-word / mid-name."""
     text = re.sub(r"\s+", " ", (text or "").strip())
     if len(text) <= max_chars:
         return text
-    cut = text[: max_chars].rsplit(" ", 1)[0]
-    # Only ellipsize if we keep enough meaning (>= 18 chars)
-    if len(cut) >= 18:
-        return cut.rstrip(" .,:;-") + "…"
-    return text[:max_chars].rstrip() + "…"
+    words = text.split()
+    out: list[str] = []
+    for w in words:
+        trial = (" ".join(out + [w])).strip()
+        if len(trial) > max_chars:
+            break
+        out.append(w)
+    if out:
+        return " ".join(out)
+    return text[:max_chars].rsplit(" ", 1)[0] or text[:max_chars]
+
 
 
 def _ass_escape(text: str) -> str:
@@ -427,7 +433,9 @@ def render_clip(
         shift = intro_dur if (intro_result and intro_result.wav_path) else 0.0
         if vo_enabled:
             vo_wav = td_path / "voiceover.wav"
-            vo_result = make_voiceover(ctx, cfg, vo_wav)
+            # VO must add a NEW detail — never restate the on-screen header
+            ctx.header_text = hook_res.text
+            vo_result = make_voiceover(ctx, cfg, vo_wav, header_text=hook_res.text)
             if vo_result.words:
                 caption_words = [
                     {

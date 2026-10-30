@@ -23,6 +23,22 @@ from .niches import apply_niche_to_config, niche_relevance
 from .voiceover import make_intro_vo
 
 
+def _fit_header_words(text: str, max_chars: int = 28) -> str:
+    """Truncate on word boundaries only — never mid-name."""
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if len(text) <= max_chars:
+        return text
+    words = text.split()
+    out: list[str] = []
+    for w in words:
+        trial = (" ".join(out + [w])).strip()
+        if len(trial) > max_chars:
+            break
+        out.append(w)
+    return " ".join(out) if out else text[:max_chars].rsplit(" ", 1)[0]
+
+
+
 TOPIC_TEMPLATES = {
     "gta6": [
         "Top {n} wildest GTA 6 trailer moments",
@@ -94,26 +110,243 @@ def _format_views(n: int) -> str:
     return f"{n} views"
 
 
+
+def detect_topic_type(topic: str) -> str:
+    """Classify ranking topic into a strict filter type."""
+    t = (topic or "").lower()
+    if any(k in t for k in ("reaction", "reacts", "react ", "streamer meltdown", "broke chat")):
+        return "reactions"
+    if any(k in t for k in ("fight", "battle", "vs", "sakuga", "boss")):
+        return "fights"
+    if any(k in t for k in ("funny", "fail", "meme", "hilarious", "comedy")):
+        return "funny"
+    if any(k in t for k in ("gameplay", "clutch", "playthrough", "walkthrough")):
+        return "gameplay"
+    if any(k in t for k in ("trailer", "teaser", "cinematic")) and "reaction" not in t:
+        return "trailers"
+    if any(k in t for k in ("meltdown", "rage", "unhinged")):
+        return "reactions"
+    return "general"
+
+
+def _has_face_cam(path: Path, sample_secs: float = 8.0) -> bool:
+    """True if YuNet/upper-third face motion suggests a reaction face-cam."""
+    try:
+        from .analyze import extract_face_motion_scores
+        import numpy as np
+        scores = extract_face_motion_scores(path, sample_fps=2.0)
+        if scores is None or len(scores) == 0:
+            return False
+        # Look at first ~sample_secs and overall — need sustained face presence
+        head = scores[: max(1, int(sample_secs))]
+        return float(np.mean(head)) > 0.35 or float(np.max(scores)) > 0.7
+    except Exception as e:
+        print(f"[ranking] face-cam check failed: {e}")
+        return False
+
+
+def topic_matches(
+    topic_type: str,
+    *,
+    title: str,
+    channel: str = "",
+    description: str = "",
+    tags: list[str] | None = None,
+    has_face_cam: bool | None = None,
+) -> tuple[bool, str]:
+    """Strict topic relevance. Returns (ok, reason)."""
+    blob = f"{title} {channel} {description} {' '.join(tags or [])}".lower()
+    title_l = (title or "").lower()
+    ch_l = (channel or "").lower()
+
+    # Hard-reject official trailers/uploads for non-trailer topics
+    official_signals = (
+        "official trailer", "launch trailer", "rockstar games",
+        "grand theft auto vi trailer", "gta vi trailer 1", "gta 6 trailer 1",
+    )
+    is_official = any(s in blob for s in official_signals) or (
+        "official" in title_l and "trailer" in title_l and "react" not in title_l
+    )
+    # Channel is Rockstar / pure game publisher
+    publisher_ch = any(p in ch_l for p in ("rockstar", "playstation", "xbox", "nintendo", "crunchyroll"))
+
+    if topic_type == "reactions":
+        if is_official and "react" not in title_l:
+            return False, "official_trailer"
+        if publisher_ch and "react" not in title_l:
+            return False, "publisher_channel"
+        react_sig = any(
+            k in blob
+            for k in ("react", "reaction", "reacts", "reacting", "watched", "watching")
+        )
+        # Known streamer aliases in entities
+        from .entities import STREAMER_ALIASES
+        streamer_sig = any(a in blob for a, _ in STREAMER_ALIASES) or any(
+            k in ch_l for k in ("react", "live", "twitch", "yt ")
+        )
+        # Channel looks like a person (not a game brand)
+        person_ch = bool(ch_l) and not publisher_ch and len(ch_l) > 2
+        if not (react_sig or streamer_sig):
+            return False, "no_reaction_signal"
+        # Face-cam required when we have the file (post-download)
+        if has_face_cam is False:
+            return False, "no_face_cam"
+        if has_face_cam is None and not react_sig:
+            # Pre-download: require explicit react in title if no face yet
+            if "react" not in title_l and "reaction" not in title_l:
+                return False, "need_react_in_title"
+        return True, "ok"
+
+    if topic_type == "fights":
+        if is_official and "fight" not in title_l:
+            return False, "official_not_fight"
+        if not any(k in blob for k in ("fight", "battle", "vs", "duel", "boss", "spar")):
+            return False, "no_fight_signal"
+        return True, "ok"
+
+    if topic_type == "funny":
+        if is_official:
+            return False, "official_trailer"
+        if not any(k in blob for k in ("funny", "fail", "meme", "hilarious", "comedy", "laugh", "prank")):
+            return False, "no_funny_signal"
+        return True, "ok"
+
+    if topic_type == "gameplay":
+        if not any(k in blob for k in ("gameplay", "playthrough", "walkthrough", "clutch", "ranked", "stream")):
+            # allow if not clearly a trailer-only upload
+            if "trailer" in title_l and "gameplay" not in title_l:
+                return False, "trailer_not_gameplay"
+        return True, "ok"
+
+    if topic_type == "trailers":
+        if "react" in title_l:
+            return False, "reaction_not_trailer"
+        if not any(k in blob for k in ("trailer", "teaser", "cinematic")):
+            return False, "no_trailer_signal"
+        return True, "ok"
+
+    # general: reject pure official trailers unless topic asks for them
+    if is_official and "trailer" not in (topic or "").lower():
+        return False, "official_trailer"
+    return True, "ok"
+
+
+def smart_rank_label(
+    *,
+    title: str,
+    channel: str = "",
+    topic_type: str = "general",
+    niche_id: str = "",
+) -> str:
+    """Short label that never truncates mid-name."""
+    from .entities import extract_entities, STREAMER_ALIASES, detect_reactor
+
+    es = extract_entities(title=title, channel=channel, niche_id=niche_id)
+    title_l = (title or "").lower()
+
+    # Prefer the actual reactor (title says X reacts) — never a random mentioned name
+    if topic_type == "reactions" or "react" in title_l:
+        # Mashups / multi-reactor comps first — never a single wrong name
+        if any(k in title_l for k in (
+            "mashup", "compilation", "streamers react", "youtubers react",
+            "mega reaction", "reactors react", "everyone react",
+        )):
+            if es.franchises and any(f.startswith("gta") for f in es.franchises):
+                return "GTA 6 reactions"
+            return "Reaction mashup"
+        reactor = detect_reactor(title, channel)
+        if reactor and reactor.lower() not in ("youtubers", "streamers", "everyone"):
+            return reactor[:28]
+        m = re.search(r"^(.{3,28}?)\s+react", title or "", flags=re.I)
+        if m:
+            cand = m.group(1).strip(" -_|:")
+            if cand.lower() not in ("youtubers", "streamers", "everyone", "big streamers"):
+                return cand[:28]
+        # Event-focused label if no clear reactor
+        for kind in ("trailer", "gameplay", "fight", "ending"):
+            if kind in title_l:
+                if es.franchises:
+                    show = es.franchises[0].replace("_", " ")
+                    if show.startswith("gta"):
+                        show = "GTA 6"
+                    return f"{show} {kind}"[:28]
+                return f"{kind} reaction"
+        if es.franchises and any(f.startswith("gta") for f in es.franchises):
+            return "GTA 6 reaction"
+        return "Streamer reaction"
+
+    # Franchise + content type
+    if es.franchises:
+        show = es.franchises[0].replace("_", " ")
+        if show.startswith("gta"):
+            show = "GTA 6" if "gta6" in es.franchises or "gta 6" in title_l or "gta vi" in title_l else "GTA"
+        else:
+            show = show.title()
+        for kind in ("trailer", "gameplay", "fight", "teaser", "clutch", "fail"):
+            if kind in title_l:
+                return f"{show} {kind}"
+        if es.characters:
+            return f"{es.characters[0].title()}"
+        return show
+
+    if es.characters:
+        return es.characters[0].title()
+
+    # Clean title: drop noise words, keep whole words only
+    clean = re.sub(
+        r"(?i)\b(official|hd|4k|shorts?|tiktok|part\s*\d+|finally+|crazy|insane)\b",
+        " ",
+        title or "",
+    )
+    clean = re.sub(r"[|\[\]\(\)#_]+", " ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip(" -")
+    words = clean.split()
+    # Take whole words up to ~28 chars — never cut a word
+    out: list[str] = []
+    for w in words[:6]:
+        trial = (" ".join(out + [w])).strip()
+        if len(trial) > 28:
+            break
+        out.append(w)
+    label = " ".join(out).strip() or "viral moment"
+    return label
+
+
 def _topic_search_queries(niche_id: str, topic: str) -> list[str]:
-    # Derive searchable phrases from topic + niche defaults
     base = re.sub(r"(?i)^top\s*\d+\s*", "", topic).strip()
     base = re.sub(r"\s+", " ", base)
+    ttype = detect_topic_type(topic)
     qs = [base, topic]
     niche = (niche_id or "").lower()
-    if niche == "gta6":
-        qs += ["GTA 6 trailer reaction", "GTA 6 gameplay", "GTA VI official trailer"]
-    elif niche == "anime":
+    if ttype == "reactions":
+        if niche == "gta6":
+            qs += [
+                "GTA 6 trailer reaction",
+                "GTA VI trailer reaction",
+                "streamer reacts GTA 6",
+                "reacts to GTA 6 trailer",
+            ]
+        else:
+            qs += ["streamer reaction funny", "trailer reaction", "twitch funny reaction"]
+    elif ttype == "fights" or niche == "anime":
         qs += ["anime fight scene 4k", "best anime fight moments", "anime edit fight"]
-    elif niche == "reactions":
-        qs += ["streamer reaction funny", "trailer reaction", "twitch funny reaction"]
-    # uniq
+    elif ttype == "gameplay":
+        qs += ["GTA 6 gameplay", "gameplay clutch", "gameplay funny"]
+    elif ttype == "trailers":
+        qs += ["GTA 6 official trailer", "GTA VI trailer"]
+    elif niche == "gta6":
+        qs += ["GTA 6 trailer reaction", "GTA 6 gameplay"]
+    # Never add bare "official trailer" when topic is reactions
     out, seen = [], set()
     for q in qs:
         k = q.lower()
+        if ttype == "reactions" and "official trailer" in k and "react" not in k:
+            continue
         if k and k not in seen:
             seen.add(k)
             out.append(q)
-    return out[:6]
+    return out[:8]
+
 
 
 def collect_rank_items(
@@ -133,13 +366,12 @@ def collect_rank_items(
     root = Path(cfg.get("_root") or ".")
     cfg.setdefault("search", {})
     cfg["search"]["keywords"] = _topic_search_queries(niche_id, topic)
-    cfg["search"]["results_per_keyword"] = max(6, int(cfg["search"].get("results_per_keyword") or 6))
-    # Don't reuse history for ranking variety — use a side history file
-    root = Path(cfg.get("_root") or ".")
+    cfg["search"]["results_per_keyword"] = max(8, int(cfg["search"].get("results_per_keyword") or 8))
+    ttype = detect_topic_type(topic)
+    _log(f"[ranking] topic_type={ttype}")
+
     hist = History(root / "history_ranking.json")
     cfg_rank = dict(cfg)
-    # discover uses history from cfg
-    # Point history file at ranking-specific path via config
     cfg_rank.setdefault("history", {})
     cfg_rank["history"]["file"] = str((root / "history_ranking.json").resolve())
     cands = discover(cfg_rank, hist)
@@ -147,53 +379,56 @@ def collect_rank_items(
 
     picked: list[tuple[Candidate, Path, Segment, str]] = []
     seen_ids: set[str] = set()
+    # Over-fetch then filter strictly
     for cand in cands:
         if len(picked) >= n:
             break
         if cand.id in seen_ids:
             continue
+        channel = str((cand.extra or {}).get("channel") or "")
+        desc = str((cand.extra or {}).get("description") or "")
+        tags = list((cand.extra or {}).get("tags") or [])
         ok, rel, reason = niche_relevance(
             niche_id,
             title=cand.title,
-            description=str((cand.extra or {}).get("description") or ""),
-            channel=str((cand.extra or {}).get("channel") or ""),
-            tags=list((cand.extra or {}).get("tags") or []),
+            description=desc,
+            channel=channel,
+            tags=tags,
         )
         if not ok:
             _log(f"[ranking] skip off-niche ({reason}): {cand.title[:70]}")
             continue
-        # Topic soft relevance
-        topic_bits = [w for w in re.findall(r"[a-z0-9]+", topic.lower()) if len(w) > 3 and w not in {"top", "best", "most", "moments", "moment"}]
-        title_l = cand.title.lower()
-        if topic_bits and sum(1 for b in topic_bits if b in title_l) < 1:
-            # allow if niche relevance strong
-            if rel < 0.5:
-                continue
+        ok_t, why_t = topic_matches(
+            ttype, title=cand.title, channel=channel, description=desc, tags=tags, has_face_cam=None
+        )
+        if not ok_t:
+            _log(f"[ranking] skip topic ({why_t}): {cand.title[:70]}")
+            continue
         try:
             path = download_video(cand, cfg_rank)
             if not path:
                 continue
+            # Post-download face-cam gate for reaction topics
+            face = None
+            if ttype == "reactions":
+                face = _has_face_cam(path)
+                ok_f, why_f = topic_matches(
+                    ttype, title=cand.title, channel=channel, description=desc, tags=tags, has_face_cam=face
+                )
+                if not ok_f:
+                    _log(f"[ranking] skip after face check ({why_f}): {cand.title[:70]}")
+                    continue
             segs = find_highlights(path, cfg_rank)
             if not segs:
                 continue
             seg = segs[0]
-            es = extract_entities(
-                title=cand.title,
-                channel=str((cand.extra or {}).get("channel") or ""),
-                description=str((cand.extra or {}).get("description") or ""),
-                tags=list((cand.extra or {}).get("tags") or []),
-                niche_id=niche_id,
+            label = smart_rank_label(
+                title=cand.title, channel=channel, topic_type=ttype, niche_id=niche_id
             )
-            label = event_summary(es, cand.title, "", seg.reason)
-            # Short grounded label
-            label = re.sub(r"\s+", " ", label).strip()[:36] or "viral moment"
-            ok_l, _ = validate_copy(label, es)
-            if not ok_l:
-                label = "viral moment"
             picked.append((cand, path, seg, label))
             seen_ids.add(cand.id)
-            hist.mark(cand.id, {"status": "ranking", "niche": niche_id, "topic": topic})
-            _log(f"[ranking] keep {cand.title[:60]} views={cand.view_count} label={label}")
+            hist.mark(cand.id, {"status": "ranking", "niche": niche_id, "topic": topic, "topic_type": ttype})
+            _log(f"[ranking] keep {cand.title[:60]} views={cand.view_count} label={label!r} face={face}")
         except Exception as e:
             _log(f"[ranking] error {cand.id}: {e}")
             continue
@@ -201,12 +436,11 @@ def collect_rank_items(
     if not picked:
         return []
 
-    # Order LOWEST → HIGHEST views so last segment is #1 (most views)
     picked.sort(key=lambda x: x[0].view_count)
     items: list[RankItem] = []
     total = len(picked)
     for i, (cand, path, seg, label) in enumerate(picked):
-        rank_num = total - i  # first (lowest views) = #N
+        rank_num = total - i
         items.append(
             RankItem(
                 rank=rank_num,
@@ -218,6 +452,7 @@ def collect_rank_items(
             )
         )
     return items
+
 
 
 def _render_title_card(
@@ -307,7 +542,7 @@ def _render_rank_segment(
     width = int((cfg.get("clips") or {}).get("width", 1080))
     height = int((cfg.get("clips") or {}).get("height", 1920))
     rank_txt = _escape_drawtext(f"#{item.rank}")
-    label = _escape_drawtext(_fit_header(item.label, 28))
+    label = _escape_drawtext(_fit_header_words(item.label, 28))
     views = _escape_drawtext(_format_views(item.views))
     out = out_dir / f"rank_{item.rank:02d}_{item.candidate.id}.mp4"
 
@@ -363,8 +598,8 @@ def build_ranking_video(
     _log(f"[ranking] topic={topic!r} niche={niche_id} n={n}")
 
     items = collect_rank_items(niche_id, topic, n=n, cfg=cfg, log=log)
-    if len(items) < 2:
-        _log("[ranking] not enough items")
+    if len(items) < 3:
+        _log(f"[ranking] not enough items ({len(items)}); need >=3")
         return None
 
     out_root = Path(cfg["clips"]["output_dir"]) / "ranking"

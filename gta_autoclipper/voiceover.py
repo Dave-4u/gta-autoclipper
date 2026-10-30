@@ -25,31 +25,31 @@ SCRIPT_STYLES = ("hype", "commentary", "reaction", "news")
 # Niche → preferred Kokoro voices (rotate among list). af_=female am_=male US; bf_/bm_=UK
 NICHE_VOICE_PROFILES: dict[str, dict[str, Any]] = {
     "gta6": {
-        "kokoro": ["am_fenrir", "am_michael", "am_onyx", "am_adam"],  # deep hype male
+        "kokoro": ["am_fenrir", "am_puck", "am_onyx", "am_adam"],  # expressive hype
         "edge": ["en-US-AndrewMultilingualNeural", "en-US-BrianNeural", "en-US-GuyNeural"],
         "piper": ["en_US-ryan-high", "en_US-lessac-high"],
-        "speed": (0.92, 1.02),
-        "style": "hype",
-    },
-    "anime": {
-        "kokoro": ["af_bella", "af_nicole", "af_sarah", "am_puck"],  # energetic
-        "edge": ["en-US-AvaMultilingualNeural", "en-US-JennyNeural", "en-US-AnaNeural"],
-        "piper": ["en_US-amy-medium", "en_US-lessac-medium"],
         "speed": (1.02, 1.12),
         "style": "hype",
     },
+    "anime": {
+        "kokoro": ["af_bella", "am_puck", "af_nicole", "af_sky"],  # punchy energetic
+        "edge": ["en-US-AvaMultilingualNeural", "en-US-JennyNeural", "en-US-AnaNeural"],
+        "piper": ["en_US-amy-medium", "en_US-lessac-medium"],
+        "speed": (1.06, 1.16),
+        "style": "hype",
+    },
     "reactions": {
-        "kokoro": ["am_echo", "am_liam", "af_sky", "am_puck"],  # casual/fun
+        "kokoro": ["am_puck", "af_sky", "am_echo", "am_liam"],  # casual/fun punchy
         "edge": ["en-US-BrianNeural", "en-US-ChristopherNeural", "en-US-RogerNeural"],
         "piper": ["en_US-joe-medium", "en_US-ryan-medium"],
-        "speed": (1.0, 1.08),
+        "speed": (1.05, 1.14),
         "style": "reaction",
     },
     "ranking": {
-        "kokoro": ["am_fenrir", "am_michael", "bm_george", "am_onyx"],  # countdown hype
+        "kokoro": ["am_fenrir", "am_puck", "am_onyx", "am_michael"],  # countdown hype
         "edge": ["en-US-AndrewMultilingualNeural", "en-US-BrianNeural"],
         "piper": ["en_US-ryan-high"],
-        "speed": (0.95, 1.05),
+        "speed": (1.0, 1.1),
         "style": "hype",
     },
     "gaming": {
@@ -123,9 +123,24 @@ def _pick_script_style(ctx: HookContext, cfg_style: str, recent: list[str]) -> s
     return preferred[0]
 
 
-def _rule_script(style: str, ctx: HookContext, scene: str, vocab: list[str] | None = None) -> str:
-    """One short grounded line — never title echo or analyzer jargon."""
-    from .entities import NEUTRAL_VO, event_summary, validate_copy, extract_entities
+def _overlap_ratio(a: str, b: str) -> float:
+    ta = {w for w in re.findall(r"[a-z0-9]+", (a or "").lower()) if len(w) > 2}
+    tb = {w for w in re.findall(r"[a-z0-9]+", (b or "").lower()) if len(w) > 2}
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(1, len(ta))
+
+
+def _rule_script(
+    style: str,
+    ctx: HookContext,
+    scene: str,
+    vocab: list[str] | None = None,
+    *,
+    header_text: str = "",
+) -> str:
+    """Short punchy line that ADDS a detail — never restates the on-screen header."""
+    from .entities import NEUTRAL_VO, event_summary, validate_copy, extract_entities, detect_reactor
 
     es = getattr(ctx, "entities", None)
     if es is None:
@@ -140,73 +155,97 @@ def _rule_script(style: str, ctx: HookContext, scene: str, vocab: list[str] | No
         ctx.entities = es
     event = getattr(ctx, "event", "") or event_summary(es, ctx.title, ctx.transcript_snippet, ctx.reason)
     conf = float(getattr(ctx, "confidence", None) or getattr(es, "confidence", 0) or 0)
+    header = header_text or getattr(ctx, "header_text", "") or ""
 
+    reactor = detect_reactor(ctx.title, getattr(ctx, "channel", "") or "")
     detail = ""
-    evl = (event or "").lower()
-    if "reaction" in evl and es.streamers:
-        detail = es.streamers[0]
-    elif es.streamers and (ctx.niche_id or "") == "reactions":
-        detail = es.streamers[0]
-    elif es.characters and "reaction" not in evl:
-        # Only name a character if they appear in title/transcript (not just franchise pack)
+    # Prefer a NEW angle: transcript bite, character, or punchline — not the header event
+    stop = {
+        "this", "that", "with", "from", "have", "been", "were", "they", "just", "like",
+        "watch", "catch", "gonna", "gotta", "wanna", "yeah", "okay", "alright", "really",
+        "something", "things", "going", "come", "comes", "here", "there", "about",
+    }
+    header_bits = set(re.findall(r"[a-z0-9]+", header.lower()))
+    title_bits = set(re.findall(r"[a-z0-9]+", (ctx.title or "").lower()))
+    toks = [
+        w for w in re.findall(r"[A-Za-z']+", ctx.transcript_snippet or "")
+        if len(w) > 3 and w.lower() not in stop and w.lower() not in header_bits
+        and w.isalpha()
+    ]
+    if toks:
+        detail = toks[0].lower()
+    elif es.characters:
         blob = f"{ctx.title} {ctx.transcript_snippet}".lower()
-        named = [c for c in es.characters if c.lower() in blob]
+        named = [c for c in es.characters if c.lower() in blob and c.lower() not in header_bits]
         if named:
             detail = named[0].title()
-    elif es.streamers:
-        detail = es.streamers[0]
-    else:
-        stop = {"this", "that", "with", "from", "have", "been", "were", "they", "just", "like"}
-        title_bits = set(re.findall(r"[a-z0-9]+", (ctx.title or "").lower()))
-        toks = [
-            w for w in re.findall(r"[A-Za-z']+", ctx.transcript_snippet or "")
-            if len(w) > 3 and w.lower() not in stop and w.lower() not in title_bits
-        ]
-        if toks:
-            detail = " ".join(toks[:3])
 
+    punchy = [
+        "Don't blink.",
+        "Chat is cooked.",
+        "That face though.",
+        "Rewind that.",
+        "No way that was real.",
+        "Pause. Replay.",
+        "Bro what.",
+        "It's over for them.",
+        "Send it.",
+        "Keep watching.",
+    ]
     if conf < 0.35:
-        line = random.choice(NEUTRAL_VO)
+        options = punchy + list(NEUTRAL_VO)
+    elif style == "reaction":
+        options = [
+            f"{reactor.split()[0]} lost it." if reactor else "They lost it.",
+            "Look at the face cam.",
+            "Chat went nuclear.",
+            f"Wait for {detail}." if detail else "Wait for it.",
+            "That reaction is nasty.",
+            "Don't scroll — face cam.",
+        ] + punchy
     else:
         options = [
-            f"Watch {event}." if event else "Watch what happens next.",
-            f"Here — {detail}." if detail else (f"Stay for {event}." if event else "Stay for this part."),
-            f"That {event} is the one." if event else "This is the beat that matters.",
-            f"{detail} cooked here." if detail else "Don't scroll past this.",
-        ]
-        if style == "reaction":
-            options = [
-                f"Wait — did you catch {event}?" if event else "Wait — did you catch that?",
-                f"{detail} wasn't ready." if detail else "I wasn't ready for this.",
-                "Look at their face here." if (ctx.niche_id or "") == "reactions" else (
-                    f"Look at {event}." if event else "Look at that."
-                ),
-            ]
-        line = random.choice(options)
+            f"Stay for {detail}." if detail else "Stay for the hit.",
+            f"{detail} hits different." if detail and detail.isalpha() else "This hits different.",
+            "Here comes the part.",
+            "You needed this clip.",
+            f"Watch the {detail}." if detail and detail.lower() not in header.lower() else "Watch the beat drop.",
+            "That's the moment.",
+        ] + punchy
 
-    clean = _clean_title(ctx.title).lower()
-    if clean:
-        bits = [w for w in clean.split() if len(w) > 3]
-        if bits and sum(1 for b in bits if b in line.lower()) >= max(2, int(0.5 * len(bits))):
-            line = random.choice(NEUTRAL_VO)
+    # Pick a line that does NOT echo the header
+    random.shuffle(options)
+    line = options[0]
+    for cand in options:
+        if _overlap_ratio(cand, header) < 0.45 and _overlap_ratio(cand, event) < 0.55:
+            line = cand
+            break
+    else:
+        line = random.choice(punchy)
+
+    # Hard reject if still too close to header
+    if header and _overlap_ratio(line, header) >= 0.5:
+        line = random.choice(punchy)
 
     ok, _why = validate_copy(line, es)
     if not ok:
-        line = random.choice(NEUTRAL_VO)
+        line = random.choice(punchy)
     words = line.split()
-    if len(words) > 18:
-        line = " ".join(words[:18])
+    if len(words) > 10:
+        line = " ".join(words[:10])
     return line.strip()
 
 
-def _try_ollama_script(style, ctx, scene, *, model, host, timeout):
+
+def _try_ollama_script(style, ctx, scene, *, model, host, timeout, header_text: str = ""):
     prompt = (
         "You write short TikTok/Shorts voiceover scripts.\n"
         f"Niche: {ctx.niche_id}\n"
+        f"On-screen header (DO NOT restate): {(header_text or '')[:80]}\n"
         f"Transcript keywords: {(ctx.transcript_snippet or '')[:220]}\n"
         f"Scene reason: {ctx.reason}\n"
-        "Rules: 1-3 short spoken sentences, max 36 words, energetic, no hashtags, "
-        "NEVER quote or paraphrase the video title, write original lines from the scene. "
+        "Rules: ONE short punchy sentence, max 10 words, energetic, no hashtags, "
+        "NEVER quote or paraphrase the video title OR the on-screen header — add a NEW detail or punchline. "
         "No stage directions. Output ONLY the spoken script."
     )
     body = json.dumps({
@@ -230,7 +269,7 @@ def _try_ollama_script(style, ctx, scene, *, model, host, timeout):
     return None
 
 
-def generate_script(ctx: HookContext, cfg: dict[str, Any]) -> tuple[str, str, str]:
+def generate_script(ctx: HookContext, cfg: dict[str, Any], *, header_text: str = "") -> tuple[str, str, str]:
     vo = cfg.get("voiceover") or {}
     hooks_cfg = cfg.get("hooks") or {}
     root = Path(cfg.get("_root") or ".")
@@ -243,6 +282,7 @@ def generate_script(ctx: HookContext, cfg: dict[str, Any]) -> tuple[str, str, st
             recent = []
     style = _pick_script_style(ctx, str(vo.get("script_style", "auto")), recent)
     scene = _detect_scene_type(ctx)
+    header = header_text or getattr(ctx, "header_text", "") or ""
     text = None
     via = "rules"
     if hooks_cfg.get("use_ollama", True):
@@ -251,25 +291,27 @@ def generate_script(ctx: HookContext, cfg: dict[str, Any]) -> tuple[str, str, st
             model=str(hooks_cfg.get("ollama_model", "llama3.2")),
             host=str(hooks_cfg.get("ollama_host", "http://127.0.0.1:11434")),
             timeout=float(hooks_cfg.get("ollama_timeout", 8)),
+            header_text=header,
         )
+        if text and header and _overlap_ratio(text, header) >= 0.45:
+            text = None  # ollama echoed the header — fall back
         if text:
             via = "ollama"
     if not text:
         vocab = list((cfg.get("hooks") or {}).get("vocab") or [])
-        text = _rule_script(style, ctx, scene, vocab=vocab)
+        text = _rule_script(style, ctx, scene, vocab=vocab, header_text=header)
         via = "rules"
     from .entities import validate_copy, extract_entities, NEUTRAL_VO
     es = getattr(ctx, "entities", None) or extract_entities(
         title=ctx.title, transcript=ctx.transcript_snippet or "", niche_id=ctx.niche_id
     )
     ok, _ = validate_copy(text or "", es)
-    if not ok:
-        text = _rule_script(style, ctx, scene, vocab=None)
+    if not ok or (header and _overlap_ratio(text or "", header) >= 0.5):
+        text = _rule_script(style, ctx, scene, vocab=None, header_text=header)
         ok2, _ = validate_copy(text or "", es)
         if not ok2:
-            text = random.choice(NEUTRAL_VO)
+            text = random.choice(["Don't blink.", "Chat is cooked.", "Rewind that.", "Bro what."])
         via = "rules_regen"
-    # Natural pauses via punctuation polish
     text = _punctuate_for_speech(text or "")
     recent.append(style)
     hist_path.write_text(json.dumps({"recent": recent[-24:]}, indent=2), encoding="utf-8")
@@ -343,10 +385,12 @@ def synthesize_kokoro(
     model, voices = _kokoro_paths(root)
     if not model.is_file() or not voices.is_file():
         raise FileNotFoundError(f"Kokoro models missing under {model.parent}")
+    from .entities import normalize_pronunciation
+    text = normalize_pronunciation(text)
     kk = _kokoro_engine(str(model), str(voices))
-    # Slight random speed jitter for variety
-    spd = float(speed) * random.uniform(0.98, 1.03)
-    samples, sr = kk.create(text=text, voice=voice, speed=spd, lang="en-us", sentence_pause=0.28, clause_pause=0.12)
+    # Per-line rate variation for livelier delivery
+    spd = float(speed) * random.uniform(0.94, 1.08)
+    samples, sr = kk.create(text=text, voice=voice, speed=spd, lang="en-us", sentence_pause=0.22, clause_pause=0.09)
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(out_wav), samples, sr)
     return out_wav
@@ -370,6 +414,8 @@ def _ensure_piper_voice(voice: str, models_dir: Path) -> Path:
 
 def synthesize_piper(text: str, out_wav: Path, voice: str, models_dir: Path) -> Path:
     from piper import PiperVoice
+    from .entities import normalize_pronunciation
+    text = normalize_pronunciation(text)
     model = _ensure_piper_voice(voice, models_dir)
     pv = PiperVoice.load(model, download_dir=models_dir)
     out_wav.parent.mkdir(parents=True, exist_ok=True)
@@ -393,6 +439,14 @@ def synthesize_edge(
         raise RuntimeError("edge-tts not installed") from e
 
     out_mp3 = out_wav.with_suffix(".mp3")
+
+    from .entities import normalize_pronunciation
+    text = normalize_pronunciation(text)
+    # Extra pitch/rate jitter when defaults passed
+    if rate == "+0%":
+        rate = random.choice(["-3%", "+0%", "+6%", "+10%"])
+    if pitch == "+0Hz":
+        pitch = random.choice(["-3Hz", "+0Hz", "+3Hz", "+6Hz"])
 
     async def _run() -> None:
         communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
@@ -512,8 +566,8 @@ def _synthesize_with_fallback(
     return None, "failed", ""
 
 
-def make_voiceover(ctx: HookContext, cfg: dict[str, Any], out_wav: Path) -> VoiceoverResult:
-    text, style, via = generate_script(ctx, cfg)
+def make_voiceover(ctx: HookContext, cfg: dict[str, Any], out_wav: Path, *, header_text: str = "") -> VoiceoverResult:
+    text, style, via = generate_script(ctx, cfg, header_text=header_text)
     print(f"[voiceover] style={style} via={via}: {text}")
     path, engine, voice = _synthesize_with_fallback(text, out_wav, cfg, ctx.niche_id or "gta6")
     if not path:
@@ -525,10 +579,22 @@ def make_voiceover(ctx: HookContext, cfg: dict[str, Any], out_wav: Path) -> Voic
 
 
 def make_intro_vo(text: str, cfg: dict[str, Any], out_wav: Path) -> VoiceoverResult:
+    from .entities import normalize_pronunciation
+    # Prefer a short punchy intro that is NOT a full restatement of a long header
     clean = re.sub(r"\s+", " ", (text or "").strip())
     words = clean.split()
-    if len(words) > 8:
-        clean = " ".join(words[:8])
+    # If header is long/awkward, speak a short hype instead of reading it verbatim
+    if len(words) > 5 or any(w.lower() in ("reaction", "reacts") for w in words):
+        clean = random.choice([
+            "Wait for this.",
+            "Look.",
+            "Here we go.",
+            "Watch closely.",
+            "Don't blink.",
+        ])
+    elif len(words) > 8:
+        clean = " ".join(words[:6])
+    clean = normalize_pronunciation(clean)
     clean = _punctuate_for_speech(clean)
     niche = str(cfg.get("niche_id") or (cfg.get("niche") or {}).get("id") or "gta6")
     path, engine, voice = _synthesize_with_fallback(clean, out_wav, cfg, niche)
