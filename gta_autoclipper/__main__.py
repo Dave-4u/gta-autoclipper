@@ -114,6 +114,9 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Comma-separated keywords when using --niche custom",
     )
+    parser.add_argument("--ranking", action="store_true", help="Build a Top-N ranking video for one niche")
+    parser.add_argument("--topic", default=None, help="Ranking topic (auto-suggest if omitted)")
+    parser.add_argument("--rank-n", type=int, default=5, help="Number of ranking items")
     parser.add_argument("--clips-per-niche", type=int, default=2)
     parser.add_argument("--interval", type=float, default=0.0, help="Autopilot hours between loops (0=once)")
     parser.add_argument("--once", action="store_true", help="Single pass (CLI default)")
@@ -140,6 +143,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.ranking:
+        from .ranking import build_ranking_video, suggest_topic
+        niches = args.niche or ["gta6"]
+        niche = niches[0]
+        out = build_ranking_video(
+            niche,
+            topic=args.topic,
+            n=max(3, min(7, args.rank_n)),
+            config_path=args.config,
+        )
+        print(out or "[ranking] failed")
+        return
     if args.auto:
         from .autopilot import run_autopilot
 

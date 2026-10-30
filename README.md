@@ -2,7 +2,7 @@
 
 **Free, self-hosted, CPU-only** Shorts/TikTok clipper. Discovers trending clips across niches (GTA 6, anime, animation, reactions, gaming, funny/viral, movies), picks peak moments, writes catchy headers with intro voiceover, burns captions, and can run fully hands-free.
 
-No paid APIs. Optional local [Ollama](https://ollama.com) for smarter headers. Voiceover uses **Piper TTS** on CPU (auto-downloads voices) with optional **edge-tts** fallback.
+No paid APIs. Optional local [Ollama](https://ollama.com) for smarter headers. Voiceover defaults to **Kokoro TTS** (CPU, natural) → **edge-tts** neural → **Piper** offline fallback. Per-niche voice profiles with rate variation and loudnorm polish.
 
 ---
 
@@ -27,6 +27,12 @@ cd %USERPROFILE%\gta-autoclipper
 git pull
 ui.bat
 ```
+
+### Ranking mode
+```bash
+python -m gta_autoclipper --ranking --niche gta6 --topic "Top 5 funniest GTA 6 reactions" --rank-n 5
+```
+Auto-suggests a niche topic, pulls viral moments, orders by view count (#N→#1), burns rank overlays.
 
 Or CLI autopilot (no UI):
 

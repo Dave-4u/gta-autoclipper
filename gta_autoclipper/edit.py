@@ -294,6 +294,7 @@ def render_clip(
     title: str = "",
     index: int = 0,
     video_id: str = "",
+    source_meta: dict[str, Any] | None = None,
 ) -> Path | None:
     clips = cfg["clips"]
     width = int(clips.get("width", 1080))
@@ -355,6 +356,24 @@ def render_clip(
     for w in ana.get("transcript_boost_words") or []:
         if w.lower() in (snippet + " " + title).lower():
             boost.append(w)
+    meta = source_meta or {}
+    from .entities import extract_entities, event_summary, grounded_vocab
+    es = extract_entities(
+        title=title,
+        channel=str(meta.get("channel") or ""),
+        description=str(meta.get("description") or ""),
+        tags=list(meta.get("tags") or []),
+        transcript=snippet,
+        niche_id=niche_id,
+    )
+    # Restrict hook vocab to grounded terms only
+    cfg = dict(cfg)
+    hooks_cfg = dict(cfg.get("hooks") or {})
+    hooks_cfg["vocab"] = grounded_vocab(es, niche_id)
+    cfg["hooks"] = hooks_cfg
+    ev = event_summary(es, title, snippet, segment.reason)
+    print(f"[ground] franchises={es.franchises} streamers={es.streamers[:2]} "
+          f"event={ev!r} conf={es.confidence:.2f}")
     ctx = HookContext(
         title=title,
         reason=segment.reason,
@@ -362,6 +381,12 @@ def render_clip(
         boost_hits=boost,
         duration=segment.end - segment.start,
         niche_id=niche_id,
+        channel=str(meta.get("channel") or ""),
+        description=str(meta.get("description") or ""),
+        tags=list(meta.get("tags") or []),
+        entities=es,
+        event=ev,
+        confidence=es.confidence,
     )
     hook_res = generate_hook(ctx, cfg)
     print(
@@ -637,6 +662,9 @@ def render_clip(
                 "score": hook_res.score,
                 "pool": hook_res.candidates[:8],
                 "niche": cfg.get("niche_id"),
+                "event": ev,
+                "franchises": list(es.franchises),
+                "confidence": float(es.confidence),
                 "caption_words": len(caption_words) if "caption_words" in dir() else 0,
                 "real_dialogue_words": len(real_words),
                 "intro_vo": None

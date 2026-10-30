@@ -25,14 +25,24 @@ from .history import History
 from .niches import list_niche_ids
 from .autopilot import get_state, request_stop, start_autopilot_background
 
-PIPER_VOICES = [
-    "en_US-ryan-high",
-    "en_US-lessac-high",
-    "en_US-lessac-medium",
-    "en_US-amy-medium",
-    "en_US-joe-medium",
-    "en_US-libritts-high",
-]
+try:
+    from .voiceover import list_available_voices
+    _av = list_available_voices()
+    VOICE_CHOICES = (
+        ["auto (kokoro→edge→piper)"]
+        + [f"kokoro:{v}" for v in _av.get("kokoro", [])]
+        + [f"edge:{v}" for v in _av.get("edge", [])]
+        + [f"piper:{v}" for v in _av.get("piper", [])]
+    )
+except Exception:
+    VOICE_CHOICES = [
+        "auto (kokoro→edge→piper)",
+        "kokoro:am_fenrir",
+        "kokoro:af_bella",
+        "edge:en-US-AndrewMultilingualNeural",
+        "piper:en_US-ryan-high",
+    ]
+PIPER_VOICES = VOICE_CHOICES  # back-compat alias
 
 
 class LogCapture:
@@ -199,7 +209,16 @@ def apply_ui_options(
 
     cfg["voiceover"]["enabled"] = bool(voiceover)
     if voice:
-        cfg["voiceover"]["voice"] = voice
+        v = str(voice).strip()
+        if v.startswith("auto"):
+            cfg["voiceover"]["engine"] = "auto"
+            cfg["voiceover"]["voice"] = ""
+        elif ":" in v:
+            eng, name = v.split(":", 1)
+            cfg["voiceover"]["engine"] = "edge" if eng.startswith("edge") else eng
+            cfg["voiceover"]["voice"] = name
+        else:
+            cfg["voiceover"]["voice"] = v
     cfg["clips"]["burn_captions"] = bool(captions)
     cfg["clips"]["copyright_safe"]["enabled"] = bool(copyright_safe)
     cfg["clips"]["max_clips_per_video"] = max(1, int(max_clips))
@@ -355,6 +374,37 @@ def run_ui_job(
     return [str(p) for p in produced], log.text()
 
 
+def on_suggest_topic(niche: str, n: float):
+    from .ranking import suggest_topic
+    from .config import load_config
+    cfg = load_config()
+    return suggest_topic(str(niche or "gta6"), int(n or 5), cfg)
+
+
+def on_ranking_make(niche: str, topic: str, n: float, progress=None):
+    from .ranking import build_ranking_video
+    logs = []
+    def log(m):
+        logs.append(m)
+        print(m)
+    try:
+        if progress is not None:
+            progress(0.1, desc="Ranking search…")
+        out = build_ranking_video(
+            str(niche or "gta6"),
+            topic=topic or None,
+            n=max(3, min(7, int(n or 5))),
+            log=log,
+        )
+        if progress is not None:
+            progress(1.0, desc="Done")
+        if not out:
+            return "Ranking failed — see log", "\n".join(logs[-40:]), None, []
+        return f"Wrote {out}", "\n".join(logs[-60:]), str(out), [str(out)]
+    except Exception as e:
+        return f"Error: {e}", "\n".join(logs[-40:]) + f"\n{e}", None, []
+
+
 def build_app(config_path: str | None = None):
     import gradio as gr
 
@@ -486,7 +536,7 @@ Free local multi-niche Shorts clipper — smart discovery, catchy headers, intro
                         )
                         with gr.Row():
                             voiceover = gr.Checkbox(label="Commentary AI voiceover", value=True)
-                            voice = gr.Dropdown(voices, value=default_voice, label="Voice (Piper)")
+                            voice = gr.Dropdown(voices, value=default_voice, label="Voice (Kokoro / edge-tts / Piper)")
                         with gr.Row():
                             captions = gr.Checkbox(label="Burn captions", value=True)
                             copyright_safe = gr.Checkbox(
@@ -555,6 +605,29 @@ Free local multi-niche Shorts clipper — smart discovery, catchy headers, intro
                 )
                 stop_btn.click(on_auto_stop, outputs=[ap_status, ap_log])
                 poll_btn.click(on_auto_poll, outputs=[ap_status, ap_log, ap_gallery, ap_files])
+
+            with gr.Tab("Ranking"):
+                gr.Markdown(
+                    "Top-N ranking video: auto topic → trending moments in one niche → "
+                    "ordered by views (#N lowest → #1 highest) with rank overlays."
+                )
+                rk_niche = gr.Dropdown(choices=niche_ids, value="gta6", label="Niche")
+                with gr.Row():
+                    rk_n = gr.Slider(3, 7, value=5, step=1, label="Items (N)")
+                    suggest_btn = gr.Button("Suggest topic")
+                rk_topic = gr.Textbox(label="Topic", placeholder="Top 5 funniest GTA 6 reactions")
+                rk_make = gr.Button("Make Ranking Video", variant="primary")
+                rk_status = gr.Textbox(label="Status", interactive=False)
+                rk_log = gr.Textbox(label="Log", lines=12, interactive=False)
+                rk_video = gr.Video(label="Ranking output")
+                rk_files = gr.Files(label="Output file")
+                suggest_btn.click(on_suggest_topic, inputs=[rk_niche, rk_n], outputs=[rk_topic])
+                rk_make.click(
+                    on_ranking_make,
+                    inputs=[rk_niche, rk_topic, rk_n],
+                    outputs=[rk_status, rk_log, rk_video, rk_files],
+                )
+
 
     return demo
 

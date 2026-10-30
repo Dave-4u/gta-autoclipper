@@ -19,14 +19,14 @@ NICHES: dict[str, dict[str, Any]] = {
             "GTA 6 leaks",
         ],
         "header_styles": ["pov", "hype", "hot_take", "question", "reaction", "when_you", "info_news"],
-        "voice": "en_US-ryan-high",
+        "voice": "am_fenrir",
         "voice_style": "hype",
         "hashtags": ["#GTA6", "#GTAVI", "#GTA", "#Shorts", "#FYP", "#Gaming", "#RockstarGames"],
         "boost_words": [
             "gta 6", "gta vi", "trailer", "leak", "rockstar", "lucia", "leonida",
             "vice city", "crazy", "insane", "oh my god", "chase", "police", "fail",
         ],
-        "vocab": ["Los Santos", "Vice City", "Lucia", "Rockstar", "wanted level", "heist"],
+        "vocab": ["trailer", "gameplay", "chase", "Rockstar"],
     },
     "anime": {
         "label": "Anime",
@@ -41,14 +41,15 @@ NICHES: dict[str, dict[str, Any]] = {
             "anime goated moment",
         ],
         "header_styles": ["pov", "hype", "reaction", "question", "when_you", "hot_take"],
-        "voice": "en_US-amy-medium",
+        "voice": "af_bella",
         "voice_style": "hype",
         "hashtags": ["#Anime", "#AnimeEdit", "#Shorts", "#FYP", "#Manga", "#Otaku", "#AnimeMoments"],
         "boost_words": [
-            "anime", "sensei", "power", "final", "form", "bankai", "nen", "chakra",
+            "anime", "sensei", "power", "final", "form", "fight", "battle",
             "wait", "no way", "bro", "insane", "peak", "goat", "aura",
         ],
-        "vocab": ["aura", "peak fiction", "goat", "shonen", "bankai", "plot armor"],
+        # Franchise slang (bankai, domain expansion, etc.) lives in entities.FRANCHISE_PACKS
+        "vocab": ["aura", "peak fiction", "goat", "shonen", "animation", "fight"],
     },
     "animation": {
         "label": "Animation / Cartoons",
@@ -62,7 +63,7 @@ NICHES: dict[str, dict[str, Any]] = {
             "indie animation short",
         ],
         "header_styles": ["pov", "when_you", "hype", "question", "reaction", "hot_take"],
-        "voice": "en_US-lessac-high",
+        "voice": "af_nicole",
         "voice_style": "commentary",
         "hashtags": ["#Animation", "#Cartoon", "#Shorts", "#FYP", "#Pixar", "#Disney", "#Animated"],
         "boost_words": ["cartoon", "animation", "funny", "wait", "look", "omg", "crazy", "trailer"],
@@ -80,7 +81,7 @@ NICHES: dict[str, dict[str, Any]] = {
             "ishowspeed reaction",
         ],
         "header_styles": ["reaction", "pov", "when_you", "hype", "question", "hot_take"],
-        "voice": "en_US-joe-medium",
+        "voice": "am_echo",
         "voice_style": "reaction",
         "hashtags": ["#Reaction", "#Streamer", "#Twitch", "#Shorts", "#FYP", "#Funny", "#Live"],
         "boost_words": [
@@ -101,7 +102,7 @@ NICHES: dict[str, dict[str, Any]] = {
             "best gaming clips",
         ],
         "header_styles": ["hype", "pov", "when_you", "hot_take", "question", "reaction"],
-        "voice": "en_US-ryan-high",
+        "voice": "am_adam",
         "voice_style": "hype",
         "hashtags": ["#Gaming", "#GamingClips", "#Shorts", "#FYP", "#Clutch", "#GameFail"],
         "boost_words": [
@@ -120,7 +121,7 @@ NICHES: dict[str, dict[str, Any]] = {
             "prank gone wrong funny",
         ],
         "header_styles": ["when_you", "pov", "reaction", "question", "hot_take", "hype"],
-        "voice": "en_US-lessac-medium",
+        "voice": "am_puck",
         "voice_style": "reaction",
         "hashtags": ["#Funny", "#Viral", "#Shorts", "#FYP", "#Comedy", "#Fail", "#Memes"],
         "boost_words": ["funny", "wait", "what", "bro", "no", "omg", "laugh", "fail", "prank"],
@@ -137,7 +138,7 @@ NICHES: dict[str, dict[str, Any]] = {
             "blockbuster trailer",
         ],
         "header_styles": ["hype", "question", "hot_take", "info_news", "pov", "reaction"],
-        "voice": "en_US-libritts-high",
+        "voice": "bm_george",
         "voice_style": "commentary",
         "hashtags": ["#Movies", "#Trailer", "#Cinema", "#Shorts", "#FYP", "#FilmTok", "#Hollywood"],
         "boost_words": [
@@ -215,8 +216,12 @@ def apply_niche_to_config(cfg: dict[str, Any], niche_id: str, custom_keywords: l
         )
     )
     cfg["hashtags"] = list(niche.get("hashtags") or cfg.get("hashtags") or [])
+    # Prefer niche Kokoro profile voice; keep engine=auto so fallbacks still work
     if niche.get("voice"):
         cfg["voiceover"]["voice"] = niche["voice"]
+    eng = str(cfg["voiceover"].get("engine") or "auto").lower()
+    if eng in ("", "piper") and niche.get("voice", "").startswith(("af_", "am_", "bf_", "bm_")):
+        cfg["voiceover"]["engine"] = "auto"
     if niche.get("voice_style"):
         cfg["voiceover"]["script_style"] = niche["voice_style"]
 

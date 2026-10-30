@@ -140,6 +140,7 @@ def run_niche_pass(
                     title=cand.title,
                     index=i,
                     video_id=cand.id,
+                    source_meta=dict(cand.extra or {}),
                 )
                 if not out:
                     continue

@@ -339,6 +339,43 @@ def extract_face_motion_scores(path: Path, sample_fps: float = 3.0) -> np.ndarra
 
 
 
+
+def _snap_window(
+    start: float,
+    end: float,
+    *,
+    duration: float,
+    scenes: list[float],
+    min_d: float,
+    max_d: float,
+    peak_t: float | None = None,
+) -> tuple[float, float]:
+    """Snap start to nearest prior scene/sentence-ish boundary; end after peak at next cut."""
+    sc = sorted(t for t in scenes if 0 < t < duration)
+    # Start: nearest scene within 3s before start, else keep
+    best_s = start
+    for t in reversed(sc):
+        if t <= start + 0.15 and start - t <= 3.5:
+            best_s = t
+            break
+    # End: first scene after peak (or after 60% of window), within max_d
+    peak = peak_t if peak_t is not None else (start + end) / 2
+    best_e = end
+    for t in sc:
+        if t >= max(peak + 0.4, best_s + min_d * 0.7) and t - best_s <= max_d + 0.5:
+            best_e = t
+            break
+    # Ensure duration bounds
+    if best_e - best_s < min_d:
+        best_e = min(duration, best_s + min_d)
+    if best_e - best_s > max_d:
+        best_e = best_s + max_d
+    if best_e > duration:
+        best_e = duration
+        best_s = max(0.0, best_e - max_d)
+    return round(best_s, 2), round(best_e, 2)
+
+
 def find_highlights(
     path: Path, cfg: dict[str, Any]
 ) -> list[Segment]:
@@ -501,6 +538,10 @@ def find_highlights(
             reasons.append("hype_speech")
         if reaction_mode and ("laugh" in reasons or "scream" in reasons or "face" in reasons):
             reasons.append("react_peak")
+        start, end = _snap_window(
+            start, end, duration=duration, scenes=scenes,
+            min_d=min_d, max_d=max_d, peak_t=peak_t,
+        )
         pool.append(
             Segment(start=round(start, 2), end=round(end, 2),
                     score=float(smooth[idx]), reason="+".join(reasons) or "peak")

@@ -55,6 +55,13 @@ class HookContext:
     view_count: int = 0
     source_url: str = ""
     niche_id: str = "gta6"
+    channel: str = ""
+    description: str = ""
+    tags: list[str] = field(default_factory=list)
+    # Grounded entities (filled by edit/autopilot)
+    entities: Any = None
+    event: str = ""
+    confidence: float = 0.0
 
 
 @dataclass
@@ -83,34 +90,32 @@ def _clean_title(title: str) -> str:
 
 
 def _action_tokens(ctx: HookContext) -> list[str]:
-    """Derive action/scene tokens from reason + transcript + boost hits."""
+    """Viewer-facing event tokens — never analyzer internals like volume spike."""
     toks: list[str] = []
+    if getattr(ctx, "event", ""):
+        toks.append(ctx.event)
     reason = (ctx.reason or "").lower()
     for key, label in (
-        ("loud", "the volume spike"),
-        ("hype_speech", "that line"),
-        ("motion", "the movement"),
-        ("cut", "the cut"),
-        ("keyword", "that beat"),
         ("laugh", "the laugh"),
         ("scream", "the scream"),
-        ("face", "face cam"),
+        ("face", "the face cam"),
         ("react", "the reaction"),
+        ("keyword", "that line"),
+        ("hype_speech", "that line"),
     ):
         if key in reason:
             toks.append(label)
-    blob = f"{ctx.transcript_snippet} {' '.join(ctx.boost_hits)}".lower()
+    blob = f"{ctx.transcript_snippet} {' '.join(ctx.boost_hits)} {ctx.title}".lower()
     for w in (
-        "chase", "crash", "fight", "jump", "flip", "gun", "police", "wanted",
-        "domain", "bankai", "power", "final", "twist", "boss", "clutch", "fail",
-        "laugh", "scream", "wait", "bro", "omg", "crazy", "insane", "look",
+        "chase", "crash", "fight", "battle", "jump", "police", "wanted",
+        "power", "final", "twist", "boss", "clutch", "fail",
+        "laugh", "scream", "trailer", "heist", "reaction",
     ):
         if w in blob:
             toks.append(w)
-    # uniq preserve order
     out: list[str] = []
     for t in toks:
-        if t not in out:
+        if t and t not in out:
             out.append(t)
     return out[:6]
 
@@ -133,7 +138,7 @@ def _detect_scene_type(ctx: HookContext) -> str:
     blob = f"{ctx.title} {ctx.transcript_snippet} {' '.join(ctx.boost_hits)} {ctx.niche_id}".lower()
     rules = [
         ("trailer", ("trailer", "teaser", "cinematic")),
-        ("fight", ("fight", "battle", "vs", "boss", "bankai")),
+        ("fight", ("fight", "battle", "vs", "boss")),
         ("reaction", ("reaction", "reacts", "streamer", "watching")),
         ("anime", ("anime", "manga", "shonen")),
         ("funny", ("funny", "laugh", "fail", "meme")),
@@ -268,7 +273,7 @@ def _niche_bank(niche: str, actions: list[str], vocab: list[str], hits: list[str
                 "When the animation budget hits",
                 f"When {a} starts the comeback",
                 "When the OST goes demonic",
-                f"When {v} activates" if v else "When the domain expands",
+                f"When {v} activates" if v else "When the fight flips",
             ],
             "hot_take": [
                 "Hot take: this fight clears the season",
@@ -281,7 +286,7 @@ def _niche_bank(niche: str, actions: list[str], vocab: list[str], hits: list[str
                 f"Wait… was that {h}?" if h else "Is this the best sakuga yet?",
                 "Who else felt that aura?",
             ],
-            "hype": common_hype + ["AURA OVERLOAD", "THE ANIMATION IS ILLEGAL", "BANKAI ENERGY"],
+            "hype": common_hype + ["AURA OVERLOAD", "THE ANIMATION IS ILLEGAL", "THE FIGHT GOES CRAZY"],
             "reaction": [
                 "My honest anime reaction:",
                 "Bro the frame rate:",
@@ -623,54 +628,149 @@ def generate_hook_pool(ctx: HookContext, cfg: dict[str, Any], pool_size: int = 2
 
 
 def generate_hook(ctx: HookContext, cfg: dict[str, Any]) -> HookResult:
-    hooks_cfg = cfg.get("hooks") or {}
+    from .entities import (
+        NEUTRAL_HEADERS,
+        extract_entities,
+        grounded_vocab,
+        event_summary,
+        validate_copy,
+    )
+
+    # Ensure entities on context
+    if ctx.entities is None:
+        ctx.entities = extract_entities(
+            title=ctx.title,
+            channel=getattr(ctx, "channel", "") or "",
+            description=getattr(ctx, "description", "") or "",
+            tags=list(getattr(ctx, "tags", None) or []),
+            transcript=ctx.transcript_snippet or "",
+            niche_id=ctx.niche_id,
+        )
+    es = ctx.entities
+    if not ctx.event:
+        ctx.event = event_summary(es, ctx.title, ctx.transcript_snippet, ctx.reason)
+    ctx.confidence = float(getattr(es, "confidence", 0.0) or 0.0)
+
+    hooks_cfg = dict(cfg.get("hooks") or {})
+    # Ground vocab: only detected franchise terms
+    hooks_cfg["vocab"] = grounded_vocab(es, ctx.niche_id)
+    cfg_local = dict(cfg)
+    cfg_local["hooks"] = hooks_cfg
+
     pool_n = int(hooks_cfg.get("pool_size", 24))
-    pool = generate_hook_pool(ctx, cfg, pool_size=pool_n)
+    pool = generate_hook_pool(ctx, cfg_local, pool_size=pool_n)
     scene = _detect_scene_type(ctx)
+
+    # Low confidence → prefer neutral, unless event is a clean title-derived phrase
+    ev0 = (ctx.event or "").strip()
+    title_derived = bool(ev0) and any(w[:1].isupper() for w in ev0.split() if w)
+    if ctx.confidence < 0.35 and not title_derived:
+        for nh in NEUTRAL_HEADERS:
+            pool.insert(0, (nh, "question", "neutral"))
+
+    # Inject grounded event-aware candidates (skip ugly/repeated events)
+    ev = (ctx.event or "this moment").strip()
+    ev_words = ev.lower().split()
+    ugly = (
+        len(ev_words) > 5
+        or len(set(ev_words)) < max(2, len(ev_words) - 1)  # repeats
+        or any(w in ev.lower() for w in ("listen listen", "brought whole"))
+    )
+    grounded_cands = [("Watch what happens next", "question", "neutral"),
+                      ("Did you catch this moment?", "question", "neutral"),
+                      ("Wait for this part", "hype", "neutral")]
+    if not ugly and ev and ev.lower() not in {"this moment", "moment"}:
+        grounded_cands = [
+            (f"Did you catch {ev}?", "question", "grounded"),
+            (f"Wait for {ev}", "hype", "grounded"),
+            (f"POV: {ev}", "pov", "grounded"),
+            (f"When {ev} hits", "when_you", "grounded"),
+        ] + grounded_cands
+    # Franchise-safe character hooks
+    for ch in (es.characters or [])[:2]:
+        grounded_cands.append((f"Watch {ch.title()} here", "hype", "grounded"))
+        grounded_cands.append((f"Did {ch.title()} just cook?", "question", "grounded"))
+    for st in (es.streamers or [])[:2]:
+        grounded_cands.append((f"{st} wasn't ready", "reaction", "grounded"))
+    pool = grounded_cands + list(pool)
+
     scored: list[tuple[float, str, str, str]] = []
-    for text, style, via in pool:
-        sc = _score_candidate(text, style, ctx, scene)
+    for text_h, style, via in pool:
+        text_h = _truncate(text_h, 42)
+        ok, why = validate_copy(text_h, es)
+        if not ok:
+            continue
+        # Grounded event lines may intentionally reuse the show/streamer name from the title
+        if via not in ("grounded", "neutral"):
+            if _is_title_echo(text_h, ctx) or _is_generic(text_h, ctx):
+                continue
+        elif _is_generic(text_h, ctx):
+            continue
+        if via in ("grounded", "neutral"):
+            # Score without title-echo hard reject (show name is intentional)
+            sc = _score_candidate(text_h, style, ctx, scene)
+            if sc <= -50:
+                sc = 2.0 + (1.5 if "?" in text_h else 0.0)
+        else:
+            sc = _score_candidate(text_h, style, ctx, scene)
+        # Prefer grounded / event mention
+        if ctx.event and ctx.event.lower() in text_h.lower():
+            sc += 2.5
+        if via == "grounded":
+            sc += 2.0
+        if via == "neutral" and ctx.confidence < 0.45:
+            sc += 1.0
+        # Demote fight-generic lines when event is teaser/trailer
+        evl = (ctx.event or "").lower()
+        if ("teaser" in evl or "trailer" in evl) and any(x in text_h.lower() for x in ("tank", "fight", "sakuga", "bankai", "hit?")):
+            sc -= 3.0
         if sc <= -50:
             continue
-        scored.append((sc, text, style, via))
+        scored.append((sc, text_h, style, via))
     scored.sort(key=lambda x: x[0], reverse=True)
+
     if not scored:
-        # Safe niche-specific fallbacks (never title echo / POV: niche)
-        niche = (ctx.niche_id or "gta6").lower()
-        fallbacks = {
-            "gta6": ("NO WAY THIS IS REAL", "hype"),
-            "anime": ("AURA OVERLOAD", "hype"),
-            "reactions": ("THE SCREAM THO", "hype"),
-            "gaming": ("CLEANEST CLIP OF THE WEEK", "hype"),
-            "funny": ("I CAN'T BREATHE", "hype"),
-            "movies": ("CINEMA IS BACK", "hype"),
-            "animation": ("FRAME ONE CINEMA", "hype"),
-        }
-        text, style = fallbacks.get(niche, ("ABSOLUTE CINEMA", "hype"))
-        scored = [(0.5, text, style, "fallback")]
-    # Prefer intact on-screen length among top scores
+        # Safe fallbacks after validation
+        for fb in NEUTRAL_HEADERS + ["This is the moment", "Don't blink here"]:
+            ok, _ = validate_copy(fb, es)
+            if ok:
+                scored = [(0.5, fb, "question", "fallback")]
+                break
+        if not scored:
+            scored = [(0.5, "Watch what happens next", "question", "fallback")]
+
     top = scored[:8]
     weights = []
     for sc, tx, _st, _via in top:
         w = max(0.15, sc) ** 2
         if len(tx) <= 34:
-            w *= 1.6
-        elif len(tx) > 38:
-            w *= 0.35
+            w *= 1.5
         weights.append(w)
-    top = top[:5]
-    weights = weights[:5]
-    pick = random.choices(top, weights=weights, k=1)[0]
-    _, text, style, via = pick
+    top5 = top[:5]
+    w5 = weights[:5]
+    pick = random.choices(top5, weights=w5, k=1)[0]
+    _, text_h, style, via = pick
+    # Final self-check; regenerate once if somehow bad
+    ok, why = validate_copy(text_h, es)
+    if not ok:
+        for sc, tx, st, vi in scored:
+            ok2, _ = validate_copy(tx, es)
+            if ok2:
+                text_h, style, via = tx, st, vi
+                break
+        else:
+            text_h, style, via = "Watch what happens next", "question", "fallback"
+
     push_style(Path(cfg.get("_root") or "."), style)
     return HookResult(
-        text=text,
+        text=text_h,
         style=style,
         via=via,
         score=float(pick[0]),
         pool_size=len(pool),
         candidates=[t[1] for t in scored[:8]],
     )
+
 
 
 def pick_style(ctx: HookContext, recent: list[str]) -> str:

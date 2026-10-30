@@ -1,25 +1,19 @@
-# AutoClipper — free multi-niche Shorts/TikTok clipper (CPU)
-
-active_niche: gta6  # gta6 | anime | animation | reactions | gaming | funny | movies | custom
-
+active_niche: gta6
 search:
-  keywords: []  # filled from niche preset when using --niche / autopilot
+  keywords: []
   results_per_keyword: 8
   keywords_per_run: 5
   max_source_duration: 900
   min_source_duration: 15
-  sort_by: recent_views  # recent_views | views | recent | smart
+  sort_by: recent_views
   max_age_days: 45
   use_trending: true
-
 download:
   links_file: links.txt
   output_dir: downloads
-  format: "bv*[height<=1080][vcodec!~='av01'][vcodec!~='av1']+ba/b[height<=1080]/b"
-
+  format: bv*[height<=1080][vcodec!~='av01'][vcodec!~='av1']+ba/b[height<=1080]/b
 history:
   file: history.json
-
 clips:
   width: 1080
   height: 1920
@@ -29,7 +23,7 @@ clips:
   max_clips_per_video: 3
   loudness_lufs: -14
   hook_duration: 2.0
-  font: ""
+  font: ''
   output_dir: outputs
   burn_captions: true
   copyright_safe:
@@ -38,7 +32,6 @@ clips:
     speed: 1.05
     zoom: 1.08
     commentary_layer: true
-
 analysis:
   weights:
     loudness: 1.0
@@ -46,47 +39,42 @@ analysis:
     motion: 0.8
     keyword: 1.5
   transcript_boost_words:
-    - crazy
-    - insane
-    - wait
-    - look
-    - oh my god
+  - crazy
+  - insane
+  - wait
+  - look
+  - oh my god
   use_whisper: true
   whisper_model: tiny
   scene_threshold: 27.0
   vocal_prefilter: true
-
 scheduler:
   default_hours: 6
-
 autopilot:
   niches:
-    - gta6
-    - anime
+  - gta6
+  - anime
   clips_per_niche: 2
   max_videos: 2
   interval_hours: 0
-
 hashtags:
-  - "#Shorts"
-  - "#FYP"
-  - "#Viral"
-
+- '#Shorts'
+- '#FYP'
+- '#Viral'
 hooks:
   use_ollama: true
-  ollama_host: "http://127.0.0.1:11434"
-  ollama_model: "llama3.2"
+  ollama_host: http://127.0.0.1:11434
+  ollama_model: llama3.2
   ollama_timeout: 8
   pool_size: 16
-
 voiceover:
   enabled: true
-  intro_header: true   # Piper speaks the header for ~1–2s at the start
+  intro_header: true
   intro_seconds: 1.8
-  engine: piper
-  voice: en_US-ryan-high
+  engine: auto
+  voice: am_fenrir
   fallback_voice: en_US-lessac-high
-  edge_voice: en-US-GuyNeural
+  edge_voice: en-US-AndrewMultilingualNeural
   allow_edge_fallback: true
   volume: 1.0
   duck_level: 0.22
