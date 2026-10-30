@@ -58,8 +58,8 @@ def _escape_drawtext(text: str) -> str:
     text = text.replace(chr(92), " ")
     text = text.replace("'", "")
     text = text.replace(chr(34), "")
-    # Fullwidth colon — looks like ":" but does not break ffmpeg drawtext option parsing
-    text = text.replace(":", "：")
+    # Replace ":" with " -" so ffmpeg drawtext option parsing stays valid
+    text = text.replace(":", " -")
     text = text.replace("%", "%%")
     text = text.replace(",", " ")
     text = text.replace("[", "(").replace("]", ")")
