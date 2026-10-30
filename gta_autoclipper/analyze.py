@@ -161,10 +161,188 @@ def _normalize(arr: np.ndarray) -> np.ndarray:
     return (arr - mn) / (mx - mn)
 
 
+
+def extract_laughter_scream_scores(path: Path, window: float = 0.25) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Cheap CPU-only proxies for laughter / scream / loudness spikes from mono PCM.
+    Returns (loud_spike_per_sec, laugh_score_per_sec, scream_score_per_sec).
+    """
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        wav = Path(tmp.name)
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-i", str(path),
+            "-ac", "1", "-ar", "16000", "-vn", str(wav),
+        ]
+        subprocess.run(cmd, capture_output=True, check=False)
+        if not wav.is_file() or wav.stat().st_size < 100:
+            dur = _video_duration(path)
+            z = np.zeros(max(1, int(dur)), dtype=np.float32)
+            return z, z.copy(), z.copy()
+        import wave
+
+        with wave.open(str(wav), "rb") as w:
+            n = w.getnframes()
+            rate = w.getframerate()
+            raw = w.readframes(n)
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        # short windows for spike detection
+        win = max(1, int(rate * window))
+        n_wins = max(1, len(audio) // win)
+        rms = np.zeros(n_wins, dtype=np.float32)
+        zcr = np.zeros(n_wins, dtype=np.float32)
+        for i in range(n_wins):
+            chunk = audio[i * win : (i + 1) * win]
+            rms[i] = float(np.sqrt(np.mean(chunk ** 2) + 1e-12))
+            signs = np.sign(chunk)
+            zcr[i] = float(np.mean(np.abs(np.diff(signs)) > 0))
+        # Aggregate to per-second
+        wins_per_sec = max(1, int(round(1.0 / window)))
+        n_secs = max(1, int(np.ceil(n_wins / wins_per_sec)))
+        loud = np.zeros(n_secs, dtype=np.float32)
+        laugh = np.zeros(n_secs, dtype=np.float32)
+        scream = np.zeros(n_secs, dtype=np.float32)
+        for i in range(n_wins):
+            sec = min(n_secs - 1, i // wins_per_sec)
+            loud[sec] = max(loud[sec], rms[i])
+            # laughter: mid RMS + high zero-crossing (bursty)
+            if 0.08 < rms[i] < 0.45 and zcr[i] > 0.12:
+                laugh[sec] += 1.0
+            # scream: very loud + high zcr
+            if rms[i] > 0.35 and zcr[i] > 0.15:
+                scream[sec] += 1.2
+            elif rms[i] > 0.5:
+                scream[sec] += 0.6
+        # Spike emphasis: delta from local median
+        if loud.size >= 5:
+            med = np.median(loud)
+            spikes = np.clip(loud - med * 1.4, 0, None)
+        else:
+            spikes = loud.copy()
+        return spikes.astype(np.float32), laugh.astype(np.float32), scream.astype(np.float32)
+    finally:
+        try:
+            wav.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def extract_face_motion_scores(path: Path, sample_fps: float = 3.0) -> np.ndarray:
+    """
+    Face presence + ROI motion for reaction cams (CPU-only).
+    Tries FaceDetectorYN (YuNet) → Haar Cascade → upper-third motion fallback.
+    """
+    try:
+        import cv2
+    except ImportError:
+        dur = _video_duration(path)
+        return np.zeros(max(1, int(dur)), dtype=np.float32)
+
+    face_yn = None
+    face_cascade = None
+    try:
+        if hasattr(cv2, "FaceDetectorYN_create"):
+            model_dir = Path(__file__).resolve().parent.parent / "models"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            yunet = model_dir / "face_detection_yunet_2023mar.onnx"
+            if not yunet.is_file():
+                url = (
+                    "https://github.com/opencv/opencv_zoo/raw/main/models/"
+                    "face_detection_yunet/face_detection_yunet_2023mar.onnx"
+                )
+                try:
+                    import urllib.request
+                    print("[analyze] downloading YuNet face model…")
+                    urllib.request.urlretrieve(url, yunet)
+                except Exception as e:
+                    print(f"[analyze] YuNet download failed: {e}")
+            for cand in (yunet, Path("models") / "face_detection_yunet_2023mar.onnx"):
+                if cand.is_file():
+                    face_yn = cv2.FaceDetectorYN_create(str(cand), "", (320, 180), 0.7, 0.3, 5000)
+                    print(f"[analyze] FaceDetectorYN loaded ({cand.name})")
+                    break
+    except Exception as e:
+        print(f"[analyze] FaceDetectorYN skipped: {e}")
+        face_yn = None
+    if face_yn is None:
+        try:
+            if hasattr(cv2, "CascadeClassifier") and hasattr(cv2, "data"):
+                cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+                face_cascade = cv2.CascadeClassifier(cascade_path)
+                if face_cascade.empty():
+                    face_cascade = None
+            if face_cascade is None:
+                print("[analyze] no face model — upper-third motion fallback")
+        except Exception as e:
+            print(f"[analyze] Haar unavailable ({e}) — upper-third fallback")
+            face_cascade = None
+
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return np.zeros(1, dtype=np.float32)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration = total / fps if fps else 0
+    n_secs = max(1, int(duration) + 1)
+    scores = np.zeros(n_secs, dtype=np.float32)
+    counts = np.zeros(n_secs, dtype=np.float32)
+    step = max(1, int(fps / sample_fps))
+    prev_roi = None
+    idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if idx % step == 0:
+            small = cv2.resize(frame, (320, 180))
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            t = idx / fps
+            sec = min(n_secs - 1, int(t))
+            face_present = 0.0
+            motion = 0.0
+            roi = None
+            if face_yn is not None:
+                try:
+                    face_yn.setInputSize((small.shape[1], small.shape[0]))
+                    _, faces = face_yn.detect(small)
+                    if faces is not None and len(faces) > 0:
+                        # x, y, w, h, ...
+                        best = max(faces, key=lambda f: float(f[2]) * float(f[3]))
+                        x, y, w, h = [int(v) for v in best[:4]]
+                        x, y = max(0, x), max(0, y)
+                        roi = gray[y:y + max(1, h), x:x + max(1, w)]
+                        face_present = 1.0
+                except Exception:
+                    roi = None
+            elif face_cascade is not None:
+                faces = face_cascade.detectMultiScale(
+                    gray, scaleFactor=1.2, minNeighbors=4, minSize=(28, 28)
+                )
+                if len(faces) > 0:
+                    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                    roi = gray[y:y + h, x:x + w]
+                    face_present = 1.0
+            if roi is None or roi.size == 0:
+                hh, ww = gray.shape[:2]
+                roi = gray[0: max(1, hh // 3), :]
+                face_present = 0.55
+            roi = cv2.resize(roi, (48, 48))
+            if prev_roi is not None and prev_roi.shape == roi.shape:
+                motion = float(np.mean(np.abs(roi.astype(np.float32) - prev_roi.astype(np.float32))))
+            prev_roi = roi
+            scores[sec] += face_present * (0.4 + min(2.5, motion / 12.0))
+            counts[sec] += 1
+        idx += 1
+    cap.release()
+    counts = np.maximum(counts, 1)
+    return scores / counts
+
+
+
 def find_highlights(
     path: Path, cfg: dict[str, Any]
 ) -> list[Segment]:
-    """Score the timeline and return best clip windows."""
+    """Score timeline; for reaction niches bias to laugh/scream/face peaks and center with lead-in."""
     clips_cfg = cfg.get("clips", {})
     ana = cfg.get("analysis", {})
     weights = ana.get("weights") or {}
@@ -172,15 +350,21 @@ def find_highlights(
     w_scene = float(weights.get("scene_change", 1.2))
     w_motion = float(weights.get("motion", 0.8))
     w_kw = float(weights.get("keyword", 1.5))
+    w_laugh = float(weights.get("laughter", 1.6))
+    w_scream = float(weights.get("scream", 1.8))
+    w_face = float(weights.get("face_motion", 1.7))
 
     min_d = float(clips_cfg.get("min_duration", 15))
     max_d = float(clips_cfg.get("max_duration", 60))
     target = float(clips_cfg.get("target_duration", 30))
     max_clips = int(clips_cfg.get("max_clips_per_video", 3))
+    lead_in = float(clips_cfg.get("reaction_lead_in", 2.2))
+
+    niche_id = str(cfg.get("niche_id") or (cfg.get("niche") or {}).get("id") or "").lower()
+    reaction_mode = niche_id in {"reactions", "funny"} or "reaction" in niche_id
 
     duration = _video_duration(path)
     if duration < min_d:
-        # Whole video as one clip if short enough
         if duration >= 5:
             return [Segment(0, duration, 1.0, "full_short")]
         return []
@@ -192,7 +376,18 @@ def find_highlights(
     print("[analyze] motion…")
     motion = extract_motion_scores(path)
 
+    spikes = laugh = scream = face = None
+    if reaction_mode or ana.get("always_reaction_signals", False):
+        print("[analyze] laughter/scream spikes…")
+        spikes, laugh, scream = extract_laughter_scream_scores(path)
+        print("[analyze] face motion…")
+        face = extract_face_motion_scores(path)
+
     n = max(len(loud), len(motion), int(duration) + 1)
+    if spikes is not None:
+        n = max(n, len(spikes), len(laugh), len(scream))
+    if face is not None:
+        n = max(n, len(face))
     score = np.zeros(n, dtype=np.float32)
 
     loud_n = _normalize(loud)
@@ -205,13 +400,26 @@ def find_highlights(
         if i < n:
             score[i] += w_motion * v
 
-    # Scene density: +1 in a 2s window around each cut
     scene_arr = np.zeros(n, dtype=np.float32)
     for t in scenes:
         i = int(t)
         for j in range(max(0, i - 1), min(n, i + 2)):
             scene_arr[j] += 1.0
     score += w_scene * _normalize(scene_arr)
+
+    laugh_n = scream_n = face_n = spike_n = np.zeros(n, dtype=np.float32)
+    if spikes is not None:
+        spike_n = _normalize(spikes)
+        laugh_n = _normalize(laugh)
+        scream_n = _normalize(scream)
+        for i in range(min(n, len(spike_n))):
+            score[i] += w_loud * 0.5 * float(spike_n[i])
+            score[i] += w_laugh * float(laugh_n[i])
+            score[i] += w_scream * float(scream_n[i])
+    if face is not None:
+        face_n = _normalize(face)
+        for i in range(min(n, len(face_n))):
+            score[i] += w_face * float(face_n[i])
 
     transcript_hits: list[tuple[float, float, str]] = []
     if ana.get("use_whisper", True):
@@ -220,6 +428,7 @@ def find_highlights(
             path,
             ana.get("transcript_boost_words") or [],
             model_name=str(ana.get("whisper_model", "base")),
+            niche_id=niche_id or None,
         )
         kw_arr = np.zeros(n, dtype=np.float32)
         for s, e, _txt in transcript_hits:
@@ -227,11 +436,9 @@ def find_highlights(
                 kw_arr[j] += 1.0
         score += w_kw * _normalize(kw_arr)
 
-    # Smooth with moving average
     kernel = np.ones(5) / 5.0
     smooth = np.convolve(score, kernel, mode="same")
 
-    # Build many peak windows, then randomly sample varied top moments
     half = target / 2.0
     pool: list[Segment] = []
     used = np.zeros(n, dtype=bool)
@@ -245,9 +452,20 @@ def find_highlights(
             continue
         if smooth[idx] < 0.05 and len(pool) > 0:
             break
-        start = max(0.0, idx - half)
-        end = min(duration, start + target)
-        start = max(0.0, end - target)
+        peak_t = float(idx)
+        # Center on peak with short lead-in (especially for reactions)
+        if reaction_mode:
+            start = max(0.0, peak_t - lead_in)
+            end = min(duration, start + target)
+            start = max(0.0, end - target)
+            # Prefer keeping the peak inside the window with lead-in
+            if peak_t - start < lead_in * 0.5:
+                start = max(0.0, peak_t - lead_in)
+                end = min(duration, start + target)
+        else:
+            start = max(0.0, peak_t - half)
+            end = min(duration, start + target)
+            start = max(0.0, end - target)
         length = end - start
         if length < min_d:
             end = min(duration, start + min_d)
@@ -262,17 +480,27 @@ def find_highlights(
         for j in range(max(0, int(start) - pad), min(n, int(end) + pad)):
             used[j] = True
         reasons = []
+        ii = min(idx, n - 1)
         if loud_n[min(idx, len(loud_n) - 1)] > 0.6:
             reasons.append("loud")
-        if scene_arr[min(idx, n - 1)] > 0:
+        if scene_arr[ii] > 0:
             reasons.append("cut")
         if motion_n[min(idx, len(motion_n) - 1)] > 0.5:
             reasons.append("motion")
         if any(s <= idx <= e + 1 for s, e, _ in transcript_hits):
             reasons.append("keyword")
-        # Speech-excitement proxy: loud + keyword together
+        if len(laugh_n) > ii and laugh_n[ii] > 0.35:
+            reasons.append("laugh")
+        if len(scream_n) > ii and scream_n[ii] > 0.35:
+            reasons.append("scream")
+        if len(face_n) > ii and face_n[ii] > 0.35:
+            reasons.append("face")
+        if len(spike_n) > ii and spike_n[ii] > 0.5:
+            reasons.append("audio_spike")
         if "loud" in reasons and "keyword" in reasons:
             reasons.append("hype_speech")
+        if reaction_mode and ("laugh" in reasons or "scream" in reasons or "face" in reasons):
+            reasons.append("react_peak")
         pool.append(
             Segment(start=round(start, 2), end=round(end, 2),
                     score=float(smooth[idx]), reason="+".join(reasons) or "peak")
@@ -282,37 +510,40 @@ def find_highlights(
     candidates: list[Segment] = []
     if pool:
         top = pool[: max(max_clips * 3, max_clips)]
-        weights = [max(0.05, s.score) ** 1.5 for s in top]
+        weights_l = [max(0.05, s.score) ** 1.5 for s in top]
+        # Prefer reaction peaks when in reaction mode
+        if reaction_mode:
+            for j, seg in enumerate(top):
+                if "react_peak" in seg.reason or "laugh" in seg.reason or "scream" in seg.reason:
+                    weights_l[j] *= 2.2
         chosen_idx: set[int] = set()
         while len(candidates) < max_clips and len(chosen_idx) < len(top):
-            i = random.choices(range(len(top)), weights=weights, k=1)[0]
+            i = random.choices(range(len(top)), weights=weights_l, k=1)[0]
             if i in chosen_idx:
-                # try next best unused
                 for j, _ in sorted(enumerate(top), key=lambda x: -x[1].score):
                     if j not in chosen_idx:
                         i = j
                         break
             chosen_idx.add(i)
             candidates.append(top[i])
-            # discourage nearby windows already picked
             for j, seg in enumerate(top):
                 if j in chosen_idx:
                     continue
                 if abs(seg.start - top[i].start) < target * 0.6:
-                    weights[j] *= 0.15
+                    weights_l[j] *= 0.15
         candidates.sort(key=lambda s: s.start)
-        print(f"[analyze] picked {len(candidates)}/{len(pool)} varied peak windows")
+        print(f"[analyze] picked {len(candidates)}/{len(pool)} varied peak windows (reaction={reaction_mode})")
 
-    # If source is already short vertical-friendly, also offer full (capped)
     if duration <= max_d and not candidates:
         candidates = [Segment(0, duration, 1.0, "full")]
 
     if not candidates and duration >= min_d:
-        # Fallback: middle chunk
         start = max(0, (duration - target) / 2)
         candidates = [Segment(start, min(duration, start + target), 0.5, "fallback_mid")]
 
     return candidates
+
+
 
 def get_word_timestamps(
     path: Path,
@@ -327,8 +558,14 @@ def get_word_timestamps(
 
 
 def transcribe_keywords(
-    path: Path, boost_words: list[str], model_name: str = "base"
+    path: Path,
+    boost_words: list[str],
+    model_name: str = "base",
+    niche_id: str | None = None,
+    **kwargs,
 ) -> list[tuple[float, float, str]]:
     from .transcribe import transcribe_full_for_keywords
-    return transcribe_full_for_keywords(path, boost_words, model_name=model_name)
+    return transcribe_full_for_keywords(
+        path, boost_words, model_name=model_name, niche_id=niche_id
+    )
 

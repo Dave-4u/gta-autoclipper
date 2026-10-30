@@ -69,14 +69,16 @@ def _escape_drawtext(text: str) -> str:
 
 
 
-def _fit_header(text: str, max_chars: int = 30) -> str:
-    """Keep headers short so they do not clip off the 9:16 frame."""
+def _fit_header(text: str, max_chars: int = 36) -> str:
+    """Keep headers readable on 9:16; prefer intact short lines over ellipsis."""
     text = re.sub(r"\s+", " ", (text or "").strip())
     if len(text) <= max_chars:
         return text
-    # Prefer cutting at word boundary
-    cut = text[: max_chars - 1].rsplit(" ", 1)[0]
-    return (cut or text[: max_chars - 1]).rstrip(" .,:;-") + "…"
+    cut = text[: max_chars].rsplit(" ", 1)[0]
+    # Only ellipsize if we keep enough meaning (>= 18 chars)
+    if len(cut) >= 18:
+        return cut.rstrip(" .,:;-") + "…"
+    return text[:max_chars].rstrip() + "…"
 
 
 def _ass_escape(text: str) -> str:
@@ -327,15 +329,16 @@ def render_clip(
     vo_enabled = bool(vo_cfg.get("enabled", True))
     burn_captions = bool(clips.get("burn_captions", True))
 
+    niche_id = str(cfg.get("niche_id") or (cfg.get("niche") or {}).get("id") or "gta6")
     words: list[dict[str, Any]] = []
     if use_whisper:
         words = get_word_timestamps(
-            source, segment.start, segment.end, model_name=model_name
+            source, segment.start, segment.end, model_name=model_name, niche_id=niche_id
         )
         if not words and not vo_enabled:
-            print("[edit] ERROR: transcription returned no words — retrying tiny")
+            print("[edit] no dialogue words after filters — retrying tiny")
             words = get_word_timestamps(
-                source, segment.start, segment.end, model_name="tiny"
+                source, segment.start, segment.end, model_name="tiny", niche_id=niche_id
             )
     else:
         print("[edit] WARNING: whisper disabled (--no-whisper)")
@@ -358,7 +361,7 @@ def render_clip(
         transcript_snippet=snippet,
         boost_hits=boost,
         duration=segment.end - segment.start,
-        niche_id=str(cfg.get("niche_id") or (cfg.get("niche") or {}).get("id") or "gta6"),
+        niche_id=niche_id,
     )
     hook_res = generate_hook(ctx, cfg)
     print(
@@ -367,7 +370,7 @@ def render_clip(
     )
     if hook_res.candidates:
         print("[hooks] pool sample: " + " | ".join(hook_res.candidates[:5]))
-    hook_display = _fit_header(hook_res.text, 30)
+    hook_display = _fit_header(hook_res.text, 36)
     hook = _escape_drawtext(hook_display)
     intro_result = None
     vo_result = None
@@ -503,8 +506,15 @@ def render_clip(
         def run_ffmpeg(use_ass: bool, use_dt_fallback: bool = False) -> bool:
             dt = _drawtext_caption_fallback(words_for_burn if burn_captions else [], font_opt) if use_dt_fallback else ""
             # Extra animated header layer: large then normal via two drawtexts
-            header_fs_big = 54 if len(hook_display) > 20 else 68
-            header_fs = 46 if len(hook_display) > 20 else 56
+            nlen = len(hook_display)
+            if nlen > 32:
+                header_fs_big, header_fs = 44, 38
+            elif nlen > 24:
+                header_fs_big, header_fs = 50, 42
+            elif nlen > 18:
+                header_fs_big, header_fs = 56, 48
+            else:
+                header_fs_big, header_fs = 68, 56
             anim = (
                 f"drawtext=text='{hook}'{font_opt}:fontsize={header_fs_big}:fontcolor=yellow:"
                 f"borderw=6:bordercolor=black:x=(w-text_w)/2:y=h*0.14:"

@@ -11,8 +11,10 @@ No paid APIs. Optional local [Ollama](https://ollama.com) for smarter headers. V
 1. **Multi-niche presets** — `gta6`, `anime`, `animation`, `reactions`, `gaming`, `funny`, `movies`, plus `custom` keywords. Each has search queries, header styles, Piper voice, hashtags, and vocab.
 2. **Smart discovery** — yt-dlp search + date-sorted / “new / trending” queries. Scores by **view velocity**, **freshness**, **engagement**, and **title hook**, with jitter so runs vary. Dedupes via `history.json`.
 3. **Smart moments** — audio energy, scene-change density, motion, transcript keywords / hype speech. Builds a pool of peaks and **randomly samples varied top moments**.
-4. **Header pool** — many catchy candidates (POV / When you / hot take / question / hype / reaction / news + niche lines). Scores and picks (soft-random among top). Ollama if present, else rich templates.
+4. **Header pool** — big niche-specific template banks (POV / When you / hot take / question / hype / reaction / news). Scores for specificity + curiosity, **rejects title-echoes and hollow lines** like `POV: anime`. Prefers headers that fit on-screen. Ollama if present, else rules.
 5. **Intro VO** — Piper **speaks the header** over the first ~1–2s with a larger→smaller header animation, then the clip continues. Optional commentary VO + ducking + captions still work.
+6. **Whisper quality gates** — drops segments with low `avg_logprob`, high `no_speech_prob` / compression ratio, music-only loops, repeats, or off-niche text. Music-only clips get **no fake captions**.
+7. **Reaction peaks** — laughter/scream audio spikes + YuNet/OpenCV face-cam motion; centers the window on the peak with a short lead-in.
 6. **Autopilot** — CLI `--auto` and Gradio **Autopilot** tab: loop niches, render N clips each into `outputs/<niche>/` with metadata `.txt`. Optional schedule interval.
 7. **Copyright-safer defaults** — ~18s source, slight zoom, 1.05× speed, commentary text layer.
 
