@@ -404,6 +404,10 @@ def collect_rank_items(
         if not ok_t:
             _log(f"[ranking] skip topic ({why_t}): {cand.title[:70]}")
             continue
+        from .meta_signals import is_mashup_title
+        if ttype == "reactions" and is_mashup_title(cand.title):
+            _log(f"[ranking] skip mashup/compilation: {cand.title[:70]}")
+            continue
         try:
             path = download_video(cand, cfg_rank)
             if not path:
@@ -418,6 +422,16 @@ def collect_rank_items(
                 if not ok_f:
                     _log(f"[ranking] skip after face check ({why_f}): {cand.title[:70]}")
                     continue
+                from .scene_vlm import is_illegible_mashup_frame, reaction_emotion
+                # Sample mid-video for mashup density
+                try:
+                    from .download import probe_duration
+                    dur = probe_duration(path) or 30.0
+                    if is_illegible_mashup_frame(path, dur * 0.4):
+                        _log(f"[ranking] skip tiny multi-face mashup: {cand.title[:70]}")
+                        continue
+                except Exception as e:
+                    _log(f"[ranking] mashup-face check err: {e}")
             segs = find_highlights(path, cfg_rank)
             if not segs:
                 continue

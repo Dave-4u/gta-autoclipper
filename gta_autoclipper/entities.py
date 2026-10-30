@@ -454,7 +454,15 @@ def event_summary(es: EntitySet, title: str = "", transcript: str = "", reason: 
 
     if action:
         if es.characters and action in ("fight", "battle", "vs", "moment"):
-            return f"{es.characters[0].title()} {action}"
+            blob = (title or "").lower()
+            named = [c for c in es.characters if c.lower() in blob]
+            who = named[0] if named else None
+            # Prefer "X vs Y" from title
+            mvs = re.search(r"(?i)\b([A-Za-z][A-Za-z ]{1,20}?)\s+vs\.?\s+([A-Za-z][A-Za-z ]{1,20})", title or "")
+            if mvs:
+                return f"{mvs.group(1).strip().title()} vs {mvs.group(2).strip().title()}"
+            if who:
+                return f"{who.title()} {action}"
         if proper:
             # Avoid "Fight fight" when proper noun == action word
             if proper[0].lower() != action.lower():

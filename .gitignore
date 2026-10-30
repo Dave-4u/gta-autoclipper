@@ -64,3 +64,9 @@ voiceover_style_history.json
 ui_screenshot.png
 contact_sheet_review.jpg
 history_ranking.json
+
+.gemini_api_key
+
+**/GEMINI_API_KEY
+
+secrets/

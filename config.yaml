@@ -81,3 +81,7 @@ voiceover:
   sidechain: true
   models_dir: models/piper
   script_style: auto
+
+gemini:
+  api_key: ''
+  model: gemini-2.5-flash

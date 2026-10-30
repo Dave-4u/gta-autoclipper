@@ -11,3 +11,4 @@ edge-tts>=6.1.0
 gradio>=4.44.0
 kokoro-onnx>=0.6.0
 soundfile>=0.12
+google-genai>=1.0.0

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .analyze import Segment, get_word_timestamps
-from .hooks import HookContext, generate_hook
+from .hooks import HookContext, HookResult, generate_hook
 from .voiceover import make_intro_vo, make_voiceover
 
 COLOR_ACTIVE = "H0000FFFF"
@@ -401,6 +401,50 @@ def render_clip(
     )
     if hook_res.candidates:
         print("[hooks] pool sample: " + " | ".join(hook_res.candidates[:5]))
+
+    # --- Gemini scene understanding + writing (primary); templates if no key ---
+    from .scene_vlm import describe_moment, self_review
+    from .write_llm import write_header_vo
+    from .hooks import HookResult
+
+    vlm_desc = ""
+    llm_vo = ""
+    try:
+        t0 = __import__("time").time()
+        vlm_desc = describe_moment(
+            source, segment.start, segment.end, n_frames=4,
+            transcript=snippet, title=title,
+            channel=str(meta.get("channel") or ""), cfg=cfg,
+        )
+        print(f"[vlm] {__import__('time').time()-t0:.1f}s: {vlm_desc[:220]}")
+    except Exception as e:
+        print(f"[vlm] describe failed: {e}")
+    try:
+        written = write_header_vo(
+            niche_id=niche_id,
+            title=title,
+            channel=str(meta.get("channel") or ""),
+            vlm_desc=vlm_desc,
+            transcript=snippet,
+            event=ev,
+            entities=es,
+            cfg=cfg,
+        )
+        if written.get("header"):
+            hook_res = HookResult(
+                text=written["header"],
+                style="gemini",
+                via=written.get("via") or "gemini",
+                score=9.0,
+                pool_size=1,
+                candidates=[written["header"]],
+            )
+            llm_vo = written.get("vo") or ""
+            print(f"[llm] header={hook_res.text!r} vo={llm_vo!r} via={written.get('via')}")
+    except Exception as e:
+        print(f"[llm] write failed: {e}")
+    ctx.header_text = hook_res.text
+    ctx.vlm_desc = vlm_desc
     hook_display = _fit_header(hook_res.text, 36)
     hook = _escape_drawtext(hook_display)
     intro_result = None
@@ -433,9 +477,25 @@ def render_clip(
         shift = intro_dur if (intro_result and intro_result.wav_path) else 0.0
         if vo_enabled:
             vo_wav = td_path / "voiceover.wav"
-            # VO must add a NEW detail — never restate the on-screen header
             ctx.header_text = hook_res.text
-            vo_result = make_voiceover(ctx, cfg, vo_wav, header_text=hook_res.text)
+            # Prefer LLM punchline; skip commentary VO entirely when nothing real to add
+            if llm_vo:
+                from .voiceover import _synthesize_with_fallback, VoiceoverResult, _estimate_words, _wav_duration, _punctuate_for_speech
+                from .entities import normalize_pronunciation
+                line = _punctuate_for_speech(normalize_pronunciation(llm_vo))
+                path_v, engine_v, voice_v = _synthesize_with_fallback(line, vo_wav, cfg, niche_id)
+                if path_v:
+                    dur_v = _wav_duration(path_v)
+                    vo_result = VoiceoverResult(
+                        text=line, style="llm", via="llm", wav_path=path_v,
+                        words=_estimate_words(line, dur_v), engine=engine_v, voice=voice_v,
+                    )
+                    print(f"[voiceover] llm line: {line}")
+                else:
+                    vo_result = None
+            else:
+                print("[voiceover] skip commentary VO (nothing real to add)")
+                vo_result = None
             if vo_result.words:
                 caption_words = [
                     {
@@ -701,6 +761,41 @@ def render_clip(
         ),
         encoding="utf-8",
     )
+    # Also stash VLM description for reporting
+    try:
+        meta_p = out_path.with_suffix(".scene.json")
+        meta_p.write_text(
+            __import__("json").dumps({
+                "vlm_desc": getattr(ctx, "vlm_desc", "") or vlm_desc,
+                "header": hook_res.text,
+                "vo": (vo_result.text if vo_result else ""),
+                "segment": {"start": segment.start, "end": segment.end, "reason": segment.reason},
+            }, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    # Self-review gate — never ship a clip that fails VLM header match / blank face
+    try:
+        review = self_review(
+            out_path, hook_res.text, start=0.0, end=None,
+            cfg=cfg, title=title, transcript=snippet,
+        )
+        print(f"[review] ok={review.get('ok')} reasons={review.get('reasons')} "
+              f"desc={str(review.get('desc',''))[:160]}")
+        rev_path = out_path.with_suffix(".review.json")
+        rev_path.write_text(__import__("json").dumps(review, indent=2), encoding="utf-8")
+        if not review.get("ok"):
+            print("[review] FAIL — discarding clip")
+            try:
+                out_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+    except Exception as e:
+        print(f"[review] error (allowing clip): {e}")
+
     return out_path
 
 

@@ -154,3 +154,16 @@ gta-autoclipper/
   outputs/<niche>/
   models/piper/
 ```
+
+## Gemini scene understanding (recommended)
+
+Clips use Google Gemini (free tier) to describe frames and write headers/VO.
+
+1. Get a free key: https://aistudio.google.com/apikey
+2. Export it before running:
+
+```bash
+export GEMINI_API_KEY="your-key"
+```
+
+Or set `gemini.api_key` in `config.yaml` (never commit the key). Without a key, templates are used.

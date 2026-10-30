@@ -25,10 +25,10 @@ SCRIPT_STYLES = ("hype", "commentary", "reaction", "news")
 # Niche → preferred Kokoro voices (rotate among list). af_=female am_=male US; bf_/bm_=UK
 NICHE_VOICE_PROFILES: dict[str, dict[str, Any]] = {
     "gta6": {
-        "kokoro": ["am_fenrir", "am_puck", "am_onyx", "am_adam"],  # expressive hype
+        "kokoro": ["am_puck", "am_fenrir", "af_bella", "am_onyx"],  # expressive hype
         "edge": ["en-US-AndrewMultilingualNeural", "en-US-BrianNeural", "en-US-GuyNeural"],
         "piper": ["en_US-ryan-high", "en_US-lessac-high"],
-        "speed": (1.02, 1.12),
+        "speed": (1.08, 1.14),
         "style": "hype",
     },
     "anime": {
@@ -46,7 +46,7 @@ NICHE_VOICE_PROFILES: dict[str, dict[str, Any]] = {
         "style": "reaction",
     },
     "ranking": {
-        "kokoro": ["am_fenrir", "am_puck", "am_onyx", "am_michael"],  # countdown hype
+        "kokoro": ["am_puck", "am_fenrir", "af_bella", "am_onyx"],  # countdown hype
         "edge": ["en-US-AndrewMultilingualNeural", "en-US-BrianNeural"],
         "piper": ["en_US-ryan-high"],
         "speed": (1.0, 1.1),
@@ -389,7 +389,11 @@ def synthesize_kokoro(
     text = normalize_pronunciation(text)
     kk = _kokoro_engine(str(model), str(voices))
     # Per-line rate variation for livelier delivery
-    spd = float(speed) * random.uniform(0.94, 1.08)
+    # Prefer lively ~1.1 delivery
+    base = float(speed) if speed else 1.1
+    if abs(base - 1.0) < 0.05:
+        base = 1.1
+    spd = base * random.uniform(0.97, 1.04)
     samples, sr = kk.create(text=text, voice=voice, speed=spd, lang="en-us", sentence_pause=0.22, clause_pause=0.09)
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(out_wav), samples, sr)

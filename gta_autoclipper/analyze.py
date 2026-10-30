@@ -463,6 +463,8 @@ def find_highlights(
     w_laugh = float(weights.get("laughter", 1.6))
     w_scream = float(weights.get("scream", 1.8))
     w_face = float(weights.get("face_motion", 1.7))
+    w_heatmap = float(weights.get("heatmap", 2.8))
+    w_comments = float(weights.get("comments", 2.0))
 
     min_d = float(clips_cfg.get("min_duration", 15))
     max_d = float(clips_cfg.get("max_duration", 60))
@@ -544,6 +546,30 @@ def find_highlights(
         w_spike = w_face * (1.8 if need_face_reaction else 1.1)
         for i in range(min(n, len(face_spike_n))):
             score[i] += w_spike * float(face_spike_n[i])
+
+    # YouTube Most-replayed heatmap (primary viral signal when present)
+    heatmap = (ana.get("heatmap") or cfg.get("heatmap")
+               or (cfg.get("source_meta") or {}).get("heatmap") or [])
+    comment_times = (ana.get("comment_times") or cfg.get("comment_times")
+                     or (cfg.get("source_meta") or {}).get("comment_times") or [])
+    if heatmap:
+        from .meta_signals import heatmap_series
+        hm_arr = np.array(heatmap_series(heatmap, duration), dtype=np.float32)
+        hm_n = _normalize(hm_arr)
+        for i in range(min(n, len(hm_n))):
+            score[i] += w_heatmap * float(hm_n[i])
+        print(f"[analyze] heatmap peaks applied ({len(heatmap)} bins)")
+    if comment_times:
+        c_arr = np.zeros(n, dtype=np.float32)
+        for t in comment_times:
+            try:
+                i = int(float(t))
+            except (TypeError, ValueError):
+                continue
+            for j in range(max(0, i - 1), min(n, i + 2)):
+                c_arr[j] += 1.0
+        score += w_comments * _normalize(c_arr)
+        print(f"[analyze] comment timestamps: {len(comment_times)}")
 
     transcript_hits: list[tuple[float, float, str]] = []
     if ana.get("use_whisper", True):
@@ -647,6 +673,20 @@ def find_highlights(
         if "face" in reasons or (len(face_spike_n) > ii and face_spike_n[ii] > 0.35):
             if "face_react" not in reasons:
                 reasons.append("face_react")
+        if heatmap:
+            try:
+                from .meta_signals import heatmap_series
+                _hm = heatmap_series(heatmap, duration)
+                if ii < len(_hm) and _hm[ii] >= 0.45:
+                    reasons.append("heatmap")
+            except Exception:
+                pass
+        if comment_times and any(abs(float(t) - peak_t) < 2.0 for t in comment_times if str(t).replace('.','').isdigit() or True):
+            try:
+                if any(abs(float(t) - peak_t) < 2.5 for t in comment_times):
+                    reasons.append("comment_ts")
+            except Exception:
+                pass
         pool.append(
             Segment(start=round(start, 2), end=round(end, 2),
                     score=float(smooth[idx]), reason="+".join(reasons) or "peak")
