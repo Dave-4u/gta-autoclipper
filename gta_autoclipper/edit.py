@@ -412,7 +412,11 @@ def render_clip(
         if fontsdir:
             ass_filter = f"ass='{ass_escaped}':fontsdir='{fontsdir}'"
 
-        font_opt = f":fontfile={font.replace(':', '\\:')}" if font else ""
+        if font:
+            _font_esc = font.replace(":", "\:")
+            font_opt = f":fontfile={_font_esc}"
+        else:
+            font_opt = ""
 
         commentary_text = ""
         if commentary_on:
