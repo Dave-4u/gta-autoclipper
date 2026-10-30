@@ -202,3 +202,145 @@ def self_review(
         fail.append("blank_face")
     return {"ok": not fail, "desc": desc or raw[:300], "overlap": 1.0 if not fail else 0.0,
             "reasons": fail, "emotion": emotion, "raw": raw[:500]}
+
+
+def confirm_reaction_moment(
+    path: Path,
+    start: float,
+    end: float,
+    *,
+    cfg: dict[str, Any] | None = None,
+    title: str = "",
+    require_trailer: bool = True,
+) -> dict[str, Any]:
+    """Gemini gate: strong visible reaction (+ trailer/game footage if required)."""
+    from .gemini_client import generate, has_gemini
+    if not has_gemini(cfg):
+        return {"ok": True, "emotion": "unknown", "trailer_visible": True, "raw": "no_key"}
+    dur = max(0.8, end - start)
+    times = [start + dur * x for x in (0.15, 0.4, 0.65, 0.9)]
+    frames = grab_frame_files(path, times, width=512)
+    if not frames:
+        return {"ok": False, "emotion": "none", "trailer_visible": False, "raw": "no_frames"}
+    prompt = (
+        "These frames are from a streamer reaction video.\n"
+        f"Title: {title[:140]}\n"
+        "Answer EXACTLY in this format:\n"
+        "TRAILER: yes OR no  (is ANY game/trailer/cinematic/gameplay footage visible, even in part of the frame?)\n"
+        "FACE: yes OR no  (is a reactor face-cam visible?)\n"
+        "EMOTION: laughing|shocked|excited|blank|talking|none\n"
+        "STRENGTH: strong|mild|none\n"
+        "DESC: <one factual sentence>\n"
+        "Rules: EMOTION=talking if they are just speaking to chat with a calm face and no big expression change. "
+        "STRENGTH=strong for clear laughter, jaw-drop shock, yelling, hands-on-face, or hype. "
+        "STRENGTH=mild for a small smile/eyebrow raise. "
+        "TRAILER=no ONLY if the frames are purely a talking head / room with zero game pixels."
+    )
+    raw = ""
+    try:
+        raw = generate(prompt=prompt, images=frames, cfg=cfg)
+    except Exception as e:
+        print(f"[vlm] confirm failed: {e}")
+        _cleanup(frames)
+        return {"ok": False, "emotion": "unknown", "trailer_visible": False, "raw": str(e)[:120]}
+    _cleanup(frames)
+    trailer = face = emotion = strength = desc = ""
+    for ln in (raw or "").splitlines():
+        s = ln.strip()
+        low = s.lower()
+        if low.startswith("trailer:"):
+            trailer = s.split(":", 1)[1].strip().lower()
+        elif low.startswith("face:"):
+            face = s.split(":", 1)[1].strip().lower()
+        elif low.startswith("emotion:"):
+            emotion = s.split(":", 1)[1].strip().lower()
+        elif low.startswith("strength:"):
+            strength = s.split(":", 1)[1].strip().lower()
+        elif low.startswith("desc:"):
+            desc = s.split(":", 1)[1].strip()
+    trailer_ok = trailer.startswith("y")
+    face_ok = face.startswith("y")
+    strong = emotion in {"laughing", "shocked", "excited"} and (
+        strength.startswith("strong") or strength.startswith("mild")
+    )
+    ok = face_ok and strong and (trailer_ok if require_trailer else True)
+    reasons = []
+    if require_trailer and not trailer_ok:
+        reasons.append("no_trailer_footage")
+    if not face_ok:
+        reasons.append("no_face_cam")
+    if not strong:
+        reasons.append(f"weak_reaction:{emotion}/{strength}")
+    return {
+        "ok": ok,
+        "emotion": emotion or "none",
+        "strength": strength or "none",
+        "trailer_visible": trailer_ok,
+        "face_visible": face_ok,
+        "desc": desc,
+        "reasons": reasons,
+        "raw": (raw or "")[:400],
+    }
+
+
+def find_confirmed_reaction_moments(
+    path: Path,
+    *,
+    cfg: dict[str, Any] | None = None,
+    title: str = "",
+    heatmap: list | None = None,
+    window: float = 12.0,
+    max_checks: int = 10,
+    require_trailer: bool = True,
+) -> list[tuple[float, float, dict[str, Any]]]:
+    """Probe heatmap peaks / timeline for Gemini-confirmed reaction+trailer moments."""
+    # duration
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
+        capture_output=True, text=True, check=False,
+    )
+    try:
+        dur = float(json.loads(proc.stdout)["format"]["duration"])
+    except Exception:
+        dur = 120.0
+    centers: list[float] = []
+    # Heatmap intensities
+    for h in heatmap or []:
+        try:
+            if isinstance(h, dict):
+                c = float(h.get("start_time") or h.get("start") or 0)
+                intensity = float(h.get("value") or h.get("intensity") or 0)
+            else:
+                c, intensity = float(h[0]), float(h[1]) if len(h) > 1 else 0.5
+            centers.append((intensity, c))
+        except Exception:
+            pass
+    centers_sorted = [c for _, c in sorted(centers, reverse=True)]
+    # Uniform fallback samples (skip first 20s chatter, last 10s)
+    span = max(30.0, dur - 30.0)
+    for i in range(8):
+        centers_sorted.append(20.0 + span * (i + 0.5) / 8.0)
+    # Dedupe close centers
+    picked: list[float] = []
+    for c in centers_sorted:
+        if c < 15 or c > dur - 8:
+            continue
+        if any(abs(c - p0) < 10 for p0 in picked):
+            continue
+        picked.append(c)
+        if len(picked) >= max_checks:
+            break
+    hits: list[tuple[float, float, dict[str, Any]]] = []
+    for c in picked:
+        start = max(0.0, c - window * 0.35)
+        end = min(dur, start + window)
+        gate = confirm_reaction_moment(
+            path, start, end, cfg=cfg, title=title, require_trailer=require_trailer,
+        )
+        print(f"[scan] {start:.1f}-{end:.1f} ok={gate.get('ok')} emo={gate.get('emotion')} "
+              f"trailer={gate.get('trailer_visible')} {gate.get('reasons')}")
+        if gate.get("ok"):
+            hits.append((start, end, gate))
+            if len(hits) >= 3:
+                break
+    return hits

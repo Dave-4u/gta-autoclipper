@@ -475,14 +475,15 @@ def _render_title_card(
     cfg: dict[str, Any],
     *,
     seconds: float = 3.0,
+    footage: Path | None = None,
+    footage_t: float = 0.0,
 ) -> tuple[Path, Path | None]:
-    """Generate a solid-color title card mp4 + optional intro VO wav."""
+    """Title card over blurred #N footage (not a plain black screen)."""
     width = int((cfg.get("clips") or {}).get("width", 1080))
     height = int((cfg.get("clips") or {}).get("height", 1920))
     card = out_wav_dir / "title_card.mp4"
     topic_fit = _fit_header(topic, 40)
     topic_esc = _escape_drawtext(topic_fit)
-    # VO
     vo_wav = out_wav_dir / "topic_intro.wav"
     intro = make_intro_vo(topic_fit, cfg, vo_wav)
     vo_path = intro.wav_path if intro and intro.wav_path and intro.wav_path.is_file() else None
@@ -494,35 +495,44 @@ def _render_title_card(
                 dur = max(2.5, min(4.5, w.getnframes() / float(w.getframerate() or 1) + 0.4))
         except Exception:
             pass
-    font = ""
-    # Simple black card with yellow topic
-    vf = (
-        f"color=c=black:s={width}x{height}:d={dur:.2f},"
-        f"drawtext=text='{topic_esc}':fontsize=52:fontcolor=yellow:"
-        f"borderw=4:bordercolor=black:x=(w-text_w)/2:y=(h*0.42)"
+    draw = (
+        f"drawtext=text='{topic_esc}':fontsize=48:fontcolor=yellow:"
+        f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=(h*0.40)"
     )
+    if footage and Path(footage).is_file():
+        vf = (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},gblur=sigma=18,eq=brightness=-0.08:saturation=0.85,{draw}"
+        )
+        cmd = ["ffmpeg", "-y", "-ss", f"{max(0.0, footage_t):.2f}", "-t", f"{dur:.2f}",
+               "-i", str(footage)]
+        if vo_path:
+            cmd += ["-i", str(vo_path)]
+        cmd += ["-vf", vf, "-t", f"{dur:.2f}",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30"]
+        if vo_path:
+            cmd += ["-c:a", "aac", "-shortest"]
+        else:
+            cmd += ["-an"]
+        cmd.append(str(card))
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode == 0 and card.is_file():
+            return card, vo_path
+        print(f"[ranking] footage title card failed: {(proc.stderr or '')[-200:]}")
+    # Fallback black
     cmd = [
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:d={dur:.2f}",
-        "-vf", f"drawtext=text='{topic_esc}':fontsize=52:fontcolor=yellow:borderw=4:bordercolor=black:x=(w-text_w)/2:y=(h*0.42)",
-        "-t", f"{dur:.2f}",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
-        str(card),
     ]
     if vo_path:
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:d={dur:.2f}",
-            "-i", str(vo_path),
-            "-vf", f"drawtext=text='{topic_esc}':fontsize=48:fontcolor=yellow:borderw=4:bordercolor=black:x=(w-text_w)/2:y=(h*0.40)",
-            "-t", f"{dur:.2f}",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
-            "-c:a", "aac", "-shortest",
-            str(card),
-        ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if proc.returncode != 0 or not card.is_file():
-        # Fallback without drawtext quirks
+        cmd += ["-i", str(vo_path)]
+    cmd += ["-vf", draw, "-t", f"{dur:.2f}",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30"]
+    if vo_path:
+        cmd += ["-c:a", "aac", "-shortest"]
+    cmd.append(str(card))
+    subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if not card.is_file():
         subprocess.run(
             ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:d=3",
              "-c:v", "libx264", "-pix_fmt", "yuv420p", str(card)],
@@ -622,20 +632,96 @@ def build_ranking_video(
     work = out_root / f"_work_{stamp}"
     work.mkdir(parents=True, exist_ok=True)
 
-    title_card, _ = _render_title_card(topic, work, cfg)
-    parts: list[Path] = [title_card]
+    # Gate every item (retry alt segments); then assign contiguous ranks and render once
+    from .analyze import find_highlights
+    from .scene_vlm import confirm_reaction_moment
+
+    survivors: list[RankItem] = []
     for item in items:
+        _log(f"[ranking] gate {item.candidate.title[:50]} ({_format_views(item.views)})")
+        segs = [item.segment]
+        try:
+            more = find_highlights(item.path, cfg) or []
+            more = sorted(more, key=lambda s: (
+                ("heatmap" in s.reason) * 5 + ("face_react" in s.reason) * 4 +
+                ("laugh" in s.reason) * 3 + s.score
+            ), reverse=True)
+            for s in more:
+                if abs(s.start - item.segment.start) > 1.0:
+                    segs.append(s)
+        except Exception as e:
+            _log(f"[ranking] highlight refresh failed: {e}")
+        picked = None
+        # Prefer already Gemini-confirmed segments from upstream scan
+        pre = [s for s in segs if "gemini" in (s.reason or "")]
+        ordered = pre + [s for s in segs if s not in pre]
+        for s in ordered[:6]:
+            try:
+                # Trust a prior gemini_* reason after a quick confirm; skip if already confirmed
+                if "gemini" in (s.reason or "") and getattr(item, "_preconfirmed", False):
+                    item.segment = s
+                    picked = s
+                    _log(f"[ranking] trust preconfirmed @{s.start:.1f}")
+                    break
+                gate = confirm_reaction_moment(
+                    item.path, s.start, s.end, cfg=cfg,
+                    title=item.candidate.title, require_trailer=True,
+                )
+                _log(f"[ranking] gate @{s.start:.1f}: ok={gate.get('ok')} emo={gate.get('emotion')} {gate.get('reasons')}")
+                if gate.get("ok"):
+                    item.segment = s
+                    extra = dict(item.candidate.extra or {})
+                    extra["gate_emotion"] = gate.get("emotion")
+                    extra["gate_desc"] = gate.get("desc")
+                    item.candidate.extra = extra
+                    picked = s
+                    break
+            except Exception as e:
+                _log(f"[ranking] gate err: {e}")
+        if picked is None:
+            _log(f"[ranking] DROPPED {item.candidate.id} (no strong reaction+trailer segment)")
+            continue
+        survivors.append(item)
+
+    if len(survivors) < 3:
+        _log(f"[ranking] too few survivors ({len(survivors)})")
+        return None
+
+    total = len(survivors)
+    # Assign contiguous ranks: first survivor = #total (lowest), last = #1 (best)
+    # Preserve existing order (collect_rank_items sorts ascending views → worst first)
+    for i, item in enumerate(survivors):
+        item.rank = total - i
+
+    import re as _re
+    topic = _re.sub(r"(?i)\btop\s*\d+\b", f"Top {total}", topic)
+    if not _re.search(r"(?i)\btop\s*\d+", topic):
+        topic = f"Top {total} {topic}" if topic else f"Top {total} reactions"
+    _log(f"[ranking] final topic={topic!r} count={total}")
+
+    bg_item = survivors[-1]
+    title_card, _ = _render_title_card(
+        topic, work, cfg,
+        footage=bg_item.path,
+        footage_t=float(getattr(bg_item.segment, "start", 0.0) or 0.0),
+    )
+    parts: list[Path] = [title_card]
+    for item in survivors:
         _log(f"[ranking] render #{item.rank} {item.candidate.title[:50]} ({_format_views(item.views)})")
         seg = _render_rank_segment(item, cfg, work, with_vo=with_vo)
         if seg:
             parts.append(seg)
+        else:
+            _log(f"[ranking] render failed for #{item.rank} {item.candidate.id}")
 
-    if len(parts) < 3:
-        _log("[ranking] too few rendered parts")
+    # If a late render failed, drop title mismatches by rebuilding ranks from successful parts
+    # (title already uses survivor count; prefer failing closed if <3)
+    if len(parts) < 4:  # title + >=3
+        _log(f"[ranking] too few rendered parts ({len(parts)-1})")
         return None
 
     # Normalize AV then concat (avoids sample-rate / stream mismatches)
-    final = out_root / f"{niche_id}_top{len(items)}_{stamp}.mp4"
+    final = out_root / f"{niche_id}_top{total}_{stamp}.mp4"
     width = int((cfg.get("clips") or {}).get("width", 1080))
     height = int((cfg.get("clips") or {}).get("height", 1920))
     norm_parts: list[Path] = []
@@ -719,7 +805,7 @@ def build_ranking_video(
                 "url": it.candidate.url,
                 "id": it.candidate.id,
             }
-            for it in items
+            for it in survivors
         ],
         "hashtags": hashtags,
         "created": datetime.now().isoformat(),
@@ -730,7 +816,7 @@ def build_ranking_video(
             f"MODE: ranking\nNICHE: {niche_id}\nTOPIC: {topic}\n"
             + "\n".join(
                 f"#{it.rank} {it.candidate.title} — {_format_views(it.views)} — {it.label}"
-                for it in items
+                for it in survivors
             )
             + f"\nHASHTAGS: {hashtags}\n"
         ),

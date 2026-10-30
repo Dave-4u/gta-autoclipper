@@ -254,17 +254,22 @@ def _video_chain(
     drawtext_extra: str = "",
     in_label: str = "0:v",
     out_label: str = "vout",
+    base_filter: str | None = None,
 ) -> str:
     z = max(1.0, float(zoom))
     speed = max(0.5, min(2.0, float(speed)))
-    parts = [
-        f"[{in_label}]split[bg][fg]",
-        f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},gblur=sigma=20[bg]",
-        f"[fg]scale=iw*{z}:ih*{z},crop=iw/{z}:ih/{z},"
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease[fg]",
-        f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setpts=PTS/{speed}[base]",
-    ]
+    if base_filter:
+        # Caller already produced [base] (e.g. face-cam split layout)
+        parts = [base_filter]
+    else:
+        parts = [
+            f"[{in_label}]split[bg][fg]",
+            f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},gblur=sigma=20[bg]",
+            f"[fg]scale=iw*{z}:ih*{z},crop=iw/{z}:ih/{z},"
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease[fg]",
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setpts=PTS/{speed}[base]",
+        ]
     cur = "base"
     if ass_filter:
         parts.append(f"[{cur}]{ass_filter}[cap]")
@@ -403,19 +408,60 @@ def render_clip(
         print("[hooks] pool sample: " + " | ".join(hook_res.candidates[:5]))
 
     # --- Gemini scene understanding + writing (primary); templates if no key ---
-    from .scene_vlm import describe_moment, self_review
+    from .scene_vlm import describe_moment, self_review, confirm_reaction_moment
     from .write_llm import write_header_vo
     from .hooks import HookResult
+    from .face_layout import detect_at_segment, split_filter_complex
+
+    # Face-cam split for reaction niches
+    face_layout = None
+    split_base = None
+    is_reactionish = niche_id in {"gta6", "reactions"} or "react" in (title or "").lower()
+    if is_reactionish:
+        try:
+            face_layout = detect_at_segment(source, segment.start, segment.end)
+            if face_layout and face_layout.face:
+                split_base = split_filter_complex(
+                    face_layout, width=width, height=height, speed=speed, out_label="base",
+                )
+                print(f"[layout] face_cam={face_layout.face} chat={face_layout.chat_side} split={bool(split_base)}")
+            else:
+                print("[layout] no face-cam detected — default framing")
+        except Exception as e:
+            print(f"[layout] detect failed: {e}")
+
+    # Gate: require trailer + strong reaction for reaction niches
+    reaction_meta = {"ok": True, "emotion": "", "desc": ""}
+    if is_reactionish:
+        try:
+            reaction_meta = confirm_reaction_moment(
+                source, segment.start, segment.end, cfg=cfg, title=title, require_trailer=True,
+            )
+            print(f"[gate] ok={reaction_meta.get('ok')} emo={reaction_meta.get('emotion')} "
+                  f"trailer={reaction_meta.get('trailer_visible')} reasons={reaction_meta.get('reasons')}")
+            if not reaction_meta.get("ok"):
+                print("[gate] FAIL — discarding (no strong on-screen reaction / trailer)")
+                return None
+        except Exception as e:
+            print(f"[gate] error: {e}")
 
     vlm_desc = ""
     llm_vo = ""
+    llm_say = ""
     try:
         t0 = __import__("time").time()
         vlm_desc = describe_moment(
             source, segment.start, segment.end, n_frames=4,
             transcript=snippet, title=title,
             channel=str(meta.get("channel") or ""), cfg=cfg,
+            extra_prompt=(
+                "Focus on what is visibly happening IN THESE FRAMES only. "
+                "Name the reactor emotion if a face-cam is visible. "
+                "Mention whether trailer/game footage is on screen."
+            ),
         )
+        if reaction_meta.get("desc") and not vlm_desc:
+            vlm_desc = reaction_meta["desc"]
         print(f"[vlm] {__import__('time').time()-t0:.1f}s: {vlm_desc[:220]}")
     except Exception as e:
         print(f"[vlm] describe failed: {e}")
@@ -424,11 +470,12 @@ def render_clip(
             niche_id=niche_id,
             title=title,
             channel=str(meta.get("channel") or ""),
-            vlm_desc=vlm_desc,
+            vlm_desc=vlm_desc or reaction_meta.get("desc") or "",
             transcript=snippet,
             event=ev,
             entities=es,
             cfg=cfg,
+            emotion=str(reaction_meta.get("emotion") or ""),
         )
         if written.get("header"):
             hook_res = HookResult(
@@ -440,7 +487,8 @@ def render_clip(
                 candidates=[written["header"]],
             )
             llm_vo = written.get("vo") or ""
-            print(f"[llm] header={hook_res.text!r} vo={llm_vo!r} via={written.get('via')}")
+            llm_say = written.get("say") or ""
+            print(f"[llm] header={hook_res.text!r} vo={llm_vo!r} via={written.get('via')} say={llm_say!r}")
     except Exception as e:
         print(f"[llm] write failed: {e}")
     ctx.header_text = hook_res.text
@@ -482,7 +530,17 @@ def render_clip(
             if llm_vo:
                 from .voiceover import _synthesize_with_fallback, VoiceoverResult, _estimate_words, _wav_duration, _punctuate_for_speech
                 from .entities import normalize_pronunciation
-                line = _punctuate_for_speech(normalize_pronunciation(llm_vo))
+                line = llm_vo
+                # Apply Gemini SAY phonetic hints first
+                if llm_say and llm_say.lower() != "none":
+                    import re as _re
+                    for part in llm_say.split(","):
+                        if "=" in part:
+                            a, b = part.split("=", 1)
+                            a, b = a.strip(), b.strip()
+                            if a and b:
+                                line = _re.sub(_re.escape(a), b, line, flags=_re.I)
+                line = _punctuate_for_speech(normalize_pronunciation(line))
                 path_v, engine_v, voice_v = _synthesize_with_fallback(line, vo_wav, cfg, niche_id)
                 if path_v:
                     dur_v = _wav_duration(path_v)
@@ -567,8 +625,10 @@ def render_clip(
                 line = " ".join(line.split()[:10]) + "…"
             commentary_text = _escape_drawtext(line)
 
-        # Animated header: bigger for intro_dur then settle
+        # Animated header: bigger for intro_dur then settle — keep visible most of the clip
+        clip_len = max(0.5, float(segment.end - segment.start) / max(speed, 0.5))
         hook_dur = max(hook_dur, intro_dur if intro_result and intro_result.wav_path else hook_dur)
+        hook_dur = max(hook_dur, min(clip_len - 0.3, max(5.0, clip_len * 0.85)))
 
         atempo = speed if abs(speed - 1.0) > 0.001 else 1.0
         src_af = f"atempo={atempo}" if abs(atempo - 1.0) > 0.001 else "anull"
@@ -587,13 +647,44 @@ def render_clip(
         if voice_inputs:
             combined_vo = td_path / "voice_mix.wav"
             if len(voice_inputs) == 1:
-                combined_vo.write_bytes(voice_inputs[0].read_bytes())
+                only = voice_inputs[0]
+                # If it's commentary-only (no intro), delay to payoff window
+                if not (intro_result and intro_result.wav_path and intro_result.wav_path.is_file()):
+                    clip_len = max(0.5, float(segment.end - segment.start) / max(speed, 0.5))
+                    try:
+                        import wave as _wave
+                        with _wave.open(str(only), "rb") as _w:
+                            com_dur = _w.getnframes() / float(_w.getframerate() or 1)
+                    except Exception:
+                        com_dur = 1.5
+                    payoff_at = max(0.3, clip_len - com_dur - 0.35)
+                    delay_ms = int(payoff_at * 1000)
+                    print(f"[edit] single VO payoff delay={payoff_at:.2f}s")
+                    cmd_d = [
+                        "ffmpeg", "-y", "-i", str(only),
+                        "-af", f"adelay={delay_ms}|{delay_ms}",
+                        str(combined_vo),
+                    ]
+                    pr = subprocess.run(cmd_d, capture_output=True, check=False)
+                    if pr.returncode != 0 or not combined_vo.is_file():
+                        combined_vo.write_bytes(only.read_bytes())
+                else:
+                    combined_vo.write_bytes(only.read_bytes())
             else:
-                # intro then commentary with tiny gap; pad intro to intro_dur
+                # intro at start; commentary near the END (payoff) so it does not talk over the streamer
                 intro_p = voice_inputs[0]
                 com_p = voice_inputs[1]
-                # adelay commentary by intro_dur ms
-                delay_ms = int(intro_dur * 1000)
+                clip_len = max(0.5, float(segment.end - segment.start) / max(speed, 0.5))
+                # Estimate commentary duration ~1.5s; place so it finishes ~0.3s before end
+                try:
+                    import wave as _wave
+                    with _wave.open(str(com_p), "rb") as _w:
+                        com_dur = _w.getnframes() / float(_w.getframerate() or 1)
+                except Exception:
+                    com_dur = 1.5
+                payoff_at = max(intro_dur + 0.4, clip_len - com_dur - 0.35)
+                delay_ms = int(payoff_at * 1000)
+                print(f"[edit] VO payoff delay={payoff_at:.2f}s (clip={clip_len:.2f}s)")
                 cmd_mix = [
                     "ffmpeg", "-y",
                     "-i", str(intro_p),
@@ -638,11 +729,12 @@ def render_clip(
                 font_opt=font_opt,
                 hook_dur=0.01,
                 speed=speed,
-                zoom=zoom,
+                zoom=1.0 if split_base else zoom,
                 commentary=commentary_text,
                 commentary_on=commentary_on and bool(commentary_text),
                 drawtext_extra=(anim + (("," + dt) if dt else "")),
                 out_label="vout",
+                base_filter=split_base,
             )
             # Remove tiny placeholder drawtext if present — keep chain working
             has_vo = combined_vo is not None and combined_vo.is_file()
@@ -651,8 +743,8 @@ def render_clip(
                     achain = (
                         f"[0:a]{src_af}[a0];"
                         f"[1:a]volume=1.0,apad=whole_dur=3600,asplit=2[sc][voice];"
-                        f"[a0][sc]sidechaincompress=threshold=0.012:ratio=8:"
-                        f"attack=40:release=280:makeup=1[ducked];"
+                        f"[a0][sc]sidechaincompress=threshold=0.008:ratio=12:"
+                        f"attack=20:release=220:makeup=1[ducked];"
                         f"[ducked][voice]amix=inputs=2:duration=first:"
                         f"dropout_transition=0:normalize=0,"
                         f"loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"

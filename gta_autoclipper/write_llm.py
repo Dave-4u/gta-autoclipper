@@ -68,6 +68,7 @@ def _template_fallback(*, niche_id, title, channel, vlm_desc, event, entities) -
 def write_header_vo(
     *, niche_id: str, title: str, channel: str, vlm_desc: str, transcript: str,
     event: str, entities: Any = None, cfg: dict[str, Any] | None = None,
+    emotion: str = "",
 ) -> dict[str, str]:
     from .entities import validate_copy, extract_entities, detect_reactor
     from .gemini_client import generate, has_gemini
@@ -78,19 +79,26 @@ def write_header_vo(
         return _template_fallback(niche_id=niche_id, title=title, channel=channel,
                                   vlm_desc=vlm_desc, event=event, entities=es)
 
+    emo = (emotion or "").strip().lower()
     prompt = (
         f"Niche: {niche_id}\nTitle: {title[:140]}\nChannel: {channel}\n"
         f"Reactor (only if title says X reacts): {reactor or 'unknown'}\n"
-        f"Event hint: {event}\nScene description (trusted): {vlm_desc[:500]}\n"
-        f"Transcript snippet: {transcript[:220]}\n"
+        f"Event hint: {event}\n"
+        f"VISIBLE emotion label (trusted): {emo or 'unknown'}\n"
+        f"Scene description from THIS clip's frames (trusted): {vlm_desc[:500]}\n"
+        f"Transcript snippet (may be unrelated chatter — do NOT invent from it): {transcript[:180]}\n"
         f"Allowed names: {', '.join((es.streamers or [])[:3] + (es.characters or [])[:4]) or 'none'}\n\n"
-        "Write exactly two lines:\n"
+        "Write exactly these lines:\n"
         "HEADER: <=6 words, catchy, factual, no ellipsis, no 'WAIT FOR', never truncate mid-word\n"
-        "VO: one short punchline (<=8 words) that does NOT restate the header, "
-        "OR write VO: SKIP if nothing real to add.\n"
-        "Use only names that appear in Scene description or Reactor.\n"
-        "Perfect English grammar. No hashtags.\n"
-        "Example:\nHEADER: Tengen vs Gyutaro\nVO: Blades everywhere.\n"
+        "VO: <=8 words. ONLY describe what is visible in the Scene description / emotion label. "
+        "If emotion is laughing/shocked/excited you may comment on that face. "
+        "If emotion is blank/talking/none/unknown, write a NEUTRAL fact from the scene "
+        "(e.g. what game footage shows) — NEVER invent reactions like 'losing his mind' or actions not described.\n"
+        "OR VO: SKIP if nothing solid.\n"
+        "SAY: phonetic hints for proper nouns in the header/VO (e.g. Gyutaro=Gyoo-tah-roh). "
+        "One comma-separated list, or SAY: none\n"
+        "Use only names in Scene description or Reactor. Perfect grammar. No hashtags.\n"
+        "Example:\nHEADER: Tengen vs Gyutaro\nVO: Blades everywhere.\nSAY: Gyutaro=Gyoo-tah-roh, Tengen=Ten-gen\n"
     )
     try:
         raw = generate(prompt=prompt, images=None, cfg=cfg)
@@ -99,7 +107,7 @@ def write_header_vo(
         return _template_fallback(niche_id=niche_id, title=title, channel=channel,
                                   vlm_desc=vlm_desc, event=event, entities=es)
 
-    header = vo = ""
+    header = vo = say = ""
     for ln in (raw or "").splitlines():
         s = ln.strip().strip('"')
         low = s.lower()
@@ -107,10 +115,20 @@ def write_header_vo(
             header = s.split(":", 1)[1].strip().strip('"')
         elif low.startswith("vo:"):
             vo = s.split(":", 1)[1].strip().strip('"')
+        elif low.startswith("say:"):
+            say = s.split(":", 1)[1].strip().strip('"')
     header = _fit_six_words(header)
     if vo.upper() == "SKIP" or vo.lower() in {"none", "n/a", "-"}:
         vo = ""
     vo = re.sub(r"\s+", " ", vo).strip()
+    # Block reaction-hallucination when emotion is not strong
+    _hype = re.compile(r"(?i)\b(losing (his|her|their) mind|absolutely hilarious|goes crazy|meltdown|broke|cooked|unhinged)\b")
+    if emo not in {"laughing", "shocked", "excited"} and vo and _hype.search(vo):
+        vo = ""
+    if emo in {"blank", "talking", "none"} and vo and re.search(r"(?i)\b(react|face|laugh|shock|scream)\b", vo):
+        # Force neutral: keep only if clearly factual about footage
+        if not re.search(r"(?i)\b(trailer|footage|game|fight|blade|scene|shows?)\b", vo):
+            vo = ""
     ok_h, _ = validate_copy(header, es) if header else (False, "empty")
     if (not header) or (not ok_h) or (not grammar_ok(header)):
         fb = _template_fallback(niche_id=niche_id, title=title, channel=channel,
@@ -136,4 +154,4 @@ def write_header_vo(
             vo = ""
     if vo and not vo.endswith((".", "!", "?")):
         vo += "."
-    return {"header": header, "vo": vo, "via": "gemini", "raw": (raw or "")[:300]}
+    return {"header": header, "vo": vo, "via": "gemini", "raw": (raw or "")[:300], "say": say, "emotion": emo}

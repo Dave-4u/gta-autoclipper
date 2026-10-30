@@ -131,6 +131,22 @@ PRONUNCIATION_MAP = [
     (r"(?i)\bgta\s*vi\b", "G T A six"),
     (r"(?i)\bgta\s*6\b", "G T A six"),
     (r"(?i)\bgta6\b", "G T A six"),
+    # Generic spoken forms
+    (r"(?i)\bvs\.?\b", "versus"),
+    (r"(?i)\bv\.s\.?\b", "versus"),
+    # Anime / Demon Slayer etc.
+    (r"(?i)\bgyutaro\b", "Gyoo-tah-roh"),
+    (r"(?i)\bgyuutaro\b", "Gyoo-tah-roh"),
+    (r"(?i)\btengen\b", "Ten-gen"),
+    (r"(?i)\buzui\b", "Oo-zoo-ee"),
+    (r"(?i)\btanjiro\b", "Tahn-jee-roh"),
+    (r"(?i)\bnezuko\b", "Neh-zoo-koh"),
+    (r"(?i)\brengoku\b", "Ren-goh-koo"),
+    (r"(?i)\binosuke\b", "Ee-no-skay"),
+    (r"(?i)\bzenitsu\b", "Zeh-neet-soo"),
+    (r"(?i)\bmuzan\b", "Moo-zahn"),
+    (r"(?i)\bkagurabachi\b", "Kah-goo-rah-bah-chee"),
+    (r"(?i)\bcinna\b", "Sin-nah"),
 ]
 
 

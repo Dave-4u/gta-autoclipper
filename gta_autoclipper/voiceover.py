@@ -583,21 +583,32 @@ def make_voiceover(ctx: HookContext, cfg: dict[str, Any], out_wav: Path, *, head
 
 
 def make_intro_vo(text: str, cfg: dict[str, Any], out_wav: Path) -> VoiceoverResult:
+    """Spoken hook VARIANT of the header — never read the header verbatim.
+
+    Pass skip_if_weak=True via cfg voiceover.intro_skip_weak to drop empty intros.
+    """
     from .entities import normalize_pronunciation
-    # Prefer a short punchy intro that is NOT a full restatement of a long header
-    clean = re.sub(r"\s+", " ", (text or "").strip())
-    words = clean.split()
-    # If header is long/awkward, speak a short hype instead of reading it verbatim
-    if len(words) > 5 or any(w.lower() in ("reaction", "reacts") for w in words):
-        clean = random.choice([
-            "Wait for this.",
-            "Look.",
-            "Here we go.",
-            "Watch closely.",
-            "Don't blink.",
-        ])
-    elif len(words) > 8:
-        clean = " ".join(words[:6])
+    header = re.sub(r"\s+", " ", (text or "").strip())
+    vo_cfg = cfg.get("voiceover") or {}
+    # Always use a short spoken hook, never the raw header text
+    hooks = [
+        "Wait for this.",
+        "Look at this.",
+        "Here we go.",
+        "Watch closely.",
+        "Don't blink.",
+        "This is the one.",
+        "Pay attention.",
+    ]
+    # Lightly specialize from header keywords without reading it
+    hl = header.lower()
+    if "versus" in hl or " vs " in f" {hl} ":
+        hooks = ["This fight goes crazy.", "Watch this clash.", "Here we go."] + hooks
+    elif any(k in hl for k in ("react", "kai", "cinna", "streamer")):
+        hooks = ["Watch the face cam.", "Look at the face.", "Here we go."] + hooks
+    clean = random.choice(hooks[:5])
+    if vo_cfg.get("intro_skip_weak") and not header:
+        return VoiceoverResult(text="", style="intro", via="skipped", wav_path=None, words=[], engine="skip", voice="")
     clean = normalize_pronunciation(clean)
     clean = _punctuate_for_speech(clean)
     niche = str(cfg.get("niche_id") or (cfg.get("niche") or {}).get("id") or "gta6")
