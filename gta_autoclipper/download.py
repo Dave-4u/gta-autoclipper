@@ -38,6 +38,9 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
         candidate.url,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+    if proc.returncode != 0:
+        print("[download] retrying once…")
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
     # Prefer printed filepath
     path_line = (proc.stdout or "").strip().splitlines()
     if path_line:

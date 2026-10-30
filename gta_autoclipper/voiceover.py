@@ -50,42 +50,58 @@ def _pick_script_style(ctx: HookContext, cfg_style: str, recent: list[str]) -> s
     return preferred[0]
 
 
-def _rule_script(style: str, ctx: HookContext, scene: str) -> str:
+def _rule_script(style: str, ctx: HookContext, scene: str, vocab: list[str] | None = None) -> str:
     clean = _clean_title(ctx.title)
     short = _truncate(clean, 32) if clean else ""
+    niche = (ctx.niche_id or "gta6").lower()
+    v = ""
+    if vocab:
+        v = random.choice(vocab)
+    # Niche-flavored subject line
+    subjects = {
+        "gta6": short or "GTA 6",
+        "anime": short or "this anime fight",
+        "animation": short or "this cartoon beat",
+        "reactions": short or "this reaction",
+        "gaming": short or "this clutch",
+        "funny": short or "this clip",
+        "movies": short or "this trailer",
+        "custom": short or "this moment",
+    }
+    subj = subjects.get(niche, short or "this clip")
     snippets = {
         "hype": [
-            f"Yo check this out. {short or 'GTA 6'} hits different. Lock in for the drop.",
-            "Bro this GTA 6 clip is unreal. Rockstar cooked hard and the streets are not ready.",
-            "Insane energy right here. GTA 6 is about to break the internet. Watch this.",
-            f"This is the moment. {short or 'Vice City vibes'} going crazy. Do not scroll.",
+            f"Yo check this out. {subj} hits different. Lock in for the drop.",
+            f"Bro this {subj} is unreal. Absolute cinema. Do not scroll.",
+            f"Insane energy right here. {subj} is about to break the internet.",
+            f"This is the moment. {v or subj} going crazy. Watch this.",
         ],
         "commentary": [
-            f"Okay so here's the play. {short or 'This scene'} shows why GTA 6 looks next level.",
-            "Watch the detail in this shot. The world already feels alive.",
-            f"Quick take: {short or 'this trailer moment'} is pure cinema.",
-            "See that? That's why everyone is talking about GTA 6 right now.",
+            f"Okay so here is the play. {subj} shows why everyone is talking.",
+            f"Watch the detail in this shot. {subj} already feels next level.",
+            f"Quick take: {subj} is pure cinema.",
+            f"See that? That is why {subj} is everywhere right now.",
         ],
         "reaction": [
             "Bro I was not ready for this. Look at that.",
             "Wait wait wait. Did you catch that detail?",
-            "My honest reaction: this looks too real for a trailer.",
-            f"No way. {short or 'That scene'} just hit different.",
+            "My honest reaction: this looks too real.",
+            f"No way. {subj} just hit different.",
         ],
         "news": [
-            f"GTA 6 update: {short or 'new footage dropped'} and people are melting down.",
-            "Here's what you need to know from this GTA 6 clip.",
-            "Quick rundown: Rockstar keeps feeding the hype with moments like this.",
-            f"News flash: {short or 'this leak or trailer beat'} is everywhere.",
+            f"Update: {subj} and people are melting down.",
+            f"Here is what you need to know from this {niche} clip.",
+            f"Quick rundown: new {subj} just dropped.",
+            f"News flash: {subj} is everywhere.",
         ],
     }
     options = snippets.get(style) or snippets["hype"]
     text = random.choice(options)
-    # Keep short enough for ~8–14s of speech
     words = text.split()
     if len(words) > 36:
         text = " ".join(words[:36])
     return text.strip()
+
 
 
 def _try_ollama_script(
@@ -158,7 +174,8 @@ def generate_script(ctx: HookContext, cfg: dict[str, Any]) -> tuple[str, str, st
         if text:
             via = "ollama"
     if not text:
-        text = _rule_script(style, ctx, scene)
+        vocab = list((cfg.get("hooks") or {}).get("vocab") or [])
+        text = _rule_script(style, ctx, scene, vocab=vocab)
         via = "rules"
     recent.append(style)
     hist_path.write_text(json.dumps({"recent": recent[-24:]}, indent=2), encoding="utf-8")
@@ -311,6 +328,11 @@ def make_intro_vo(text: str, cfg: dict[str, Any], out_wav: Path) -> VoiceoverRes
     if not models_dir.is_absolute():
         models_dir = root / models_dir
     clean = re.sub(r"\s+", " ", (text or "").strip())
+    # Keep intros snappy (~1–2s speech)
+    words = clean.split()
+    if len(words) > 8:
+        clean = " ".join(words[:8])
+        # intro max words
     # Strip style prefixes that sound awkward spoken? Keep POV etc — they slap
     used = "none"
     err = None

@@ -25,10 +25,28 @@ def _find_font(cfg: dict[str, Any]) -> str:
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
         "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/tahomabd.ttf",
+        "C:/Windows/Fonts/Tahoma.ttf",
+        "C:/Windows/Fonts/impact.ttf",
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
     ]
+    # Also scan Windows Fonts dir for any bold-ish TTF if explicit paths missed
+    try:
+        import os
+        windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot")
+        if windir:
+            fontdir = Path(windir) / "Fonts"
+            for name in ("arialbd.ttf", "segoeuib.ttf", "calibrib.ttf", "verdanab.ttf", "arial.ttf"):
+                candidates.append(str(fontdir / name))
+    except Exception:
+        pass
     for c in candidates:
         if Path(c).is_file():
             return c
@@ -40,13 +58,25 @@ def _escape_drawtext(text: str) -> str:
     text = text.replace(chr(92), " ")
     text = text.replace("'", "")
     text = text.replace(chr(34), "")
-    text = text.replace(":", " -")
+    # Fullwidth colon — looks like ":" but does not break ffmpeg drawtext option parsing
+    text = text.replace(":", "：")
     text = text.replace("%", "%%")
     text = text.replace(",", " ")
     text = text.replace("[", "(").replace("]", ")")
     text = text.replace(";", ",")
     text = text.replace(chr(8230), "...")
     return text
+
+
+
+def _fit_header(text: str, max_chars: int = 30) -> str:
+    """Keep headers short so they do not clip off the 9:16 frame."""
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if len(text) <= max_chars:
+        return text
+    # Prefer cutting at word boundary
+    cut = text[: max_chars - 1].rsplit(" ", 1)[0]
+    return (cut or text[: max_chars - 1]).rstrip(" .,:;-") + "…"
 
 
 def _ass_escape(text: str) -> str:
@@ -233,7 +263,7 @@ def _video_chain(
         cur = "cap"
     parts.append(
         f"[{cur}]drawtext=text='{hook}'{font_opt}:fontsize=72:fontcolor=yellow:"
-        f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.12:"
+        f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.15:"
         f"enable='lte(t\\,{hook_dur})'[hooked]"
     )
     cur = "hooked"
@@ -337,7 +367,8 @@ def render_clip(
     )
     if hook_res.candidates:
         print("[hooks] pool sample: " + " | ".join(hook_res.candidates[:5]))
-    hook = _escape_drawtext(hook_res.text)
+    hook_display = _fit_header(hook_res.text, 30)
+    hook = _escape_drawtext(hook_display)
     intro_result = None
     vo_result = None
     caption_words: list[dict[str, Any]] = []
@@ -404,22 +435,23 @@ def render_clip(
             ass_path.read_text(encoding="utf-8"), encoding="utf-8"
         )
 
-        ass_escaped = str(ass_path).replace("\\", "/").replace(":", "\\:")
+        ass_escaped = str(ass_path).replace("\\", "/").replace(":", chr(92) + ":")
         fontsdir = ""
         if font:
-            fontsdir = str(Path(font).parent).replace("\\", "/").replace(":", "\\:")
+            fontsdir = str(Path(font).parent).replace("\\", "/").replace(":", chr(92) + ":")
         ass_filter = f"ass='{ass_escaped}'"
         if fontsdir:
             ass_filter = f"ass='{ass_escaped}':fontsdir='{fontsdir}'"
 
         if font:
-            _font_esc = font.replace(":", "\:")
+            _font_esc = font.replace(":", chr(92) + ":")
             font_opt = f":fontfile={_font_esc}"
         else:
             font_opt = ""
 
         commentary_text = ""
-        if commentary_on:
+        # Avoid stacking commentary banner on top of karaoke captions/VO
+        if commentary_on and not (burn_captions and (vo_enabled or intro_cfg_on)):
             raw = vo_result.text if vo_result else hook_res.text
             line = raw.split(".")[0].strip() or raw
             if len(line.split()) > 10:
@@ -471,12 +503,14 @@ def render_clip(
         def run_ffmpeg(use_ass: bool, use_dt_fallback: bool = False) -> bool:
             dt = _drawtext_caption_fallback(words_for_burn if burn_captions else [], font_opt) if use_dt_fallback else ""
             # Extra animated header layer: large then normal via two drawtexts
+            header_fs_big = 54 if len(hook_display) > 20 else 68
+            header_fs = 46 if len(hook_display) > 20 else 56
             anim = (
-                f"drawtext=text='{hook}'{font_opt}:fontsize=92:fontcolor=yellow:"
-                f"borderw=6:bordercolor=black:x=(w-text_w)/2:y=h*0.10:"
+                f"drawtext=text='{hook}'{font_opt}:fontsize={header_fs_big}:fontcolor=yellow:"
+                f"borderw=6:bordercolor=black:x=(w-text_w)/2:y=h*0.14:"
                 f"enable='lte(t\\,{intro_dur:.3f})',"
-                f"drawtext=text='{hook}'{font_opt}:fontsize=72:fontcolor=yellow:"
-                f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.12:"
+                f"drawtext=text='{hook}'{font_opt}:fontsize={header_fs}:fontcolor=yellow:"
+                f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.15:"
                 f"enable='gte(t\\,{intro_dur:.3f})*lte(t\\,{hook_dur:.3f})'"
             )
             # Use animated hook instead of single hook inside _video_chain — pass empty hook and append anim

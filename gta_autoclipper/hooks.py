@@ -48,7 +48,7 @@ def _clean_title(title: str) -> str:
     t = re.sub(r"\s+", " ", title or "").strip()
     t = re.sub(
         r"(?i)\b(gta\s*5|gta\s*v|gta\s*vi|gta\s*6|gta\s*online|"
-        r"anime|manga|reaction|shorts?|tiktok|#\w+|official|hd|4k|"
+        r"anime|manga|reaction|shorts?|tiktok|#\w+|official|hd|4k|launch trailer|gameplay|"
         r"trailer|edit|compilation|movie|film)\b",
         " ",
         t,

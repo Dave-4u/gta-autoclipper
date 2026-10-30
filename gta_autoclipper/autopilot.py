@@ -18,7 +18,7 @@ from .discover import discover
 from .download import download_video, probe_duration
 from .edit import probe_clip, render_clip
 from .history import History
-from .niches import apply_niche_to_config, list_niche_ids
+from .niches import apply_niche_to_config, list_niche_ids, niche_relevance
 
 
 LogFn = Callable[[str], None]
@@ -103,6 +103,17 @@ def run_niche_pass(
         with _LOCK:
             _STATE.current_niche = niche_id
         _log(f"[auto] === [{niche_id}] {cand.title} ({cand.id}) score={cand.rank_score:.2f}", log)
+        ok, rel, reason = niche_relevance(
+            niche_id,
+            title=cand.title,
+            description=str((cand.extra or {}).get("description") or ""),
+            channel=str((cand.extra or {}).get("channel") or ""),
+            tags=list((cand.extra or {}).get("tags") or []),
+            custom_keywords=custom_keywords,
+        )
+        if not ok:
+            _log(f"[auto] skip off-niche ({reason}): {cand.title[:80]}", log)
+            continue
         try:
             path = download_video(cand, niche_cfg)
             if not path:

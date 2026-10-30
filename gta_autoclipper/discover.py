@@ -188,6 +188,11 @@ def _entry_to_candidate(e: dict[str, Any], source: str) -> Candidate | None:
         upload_date=_parse_upload(e),
         like_count=_parse_int(e, "like_count", "likes"),
         comment_count=_parse_int(e, "comment_count", "comments"),
+        extra={
+            "channel": e.get("channel") or e.get("uploader") or "",
+            "description": (e.get("description") or "")[:500],
+            "tags": list(e.get("tags") or [])[:30],
+        },
     )
 
 
@@ -340,4 +345,11 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
         searched = picked + searched[top_n:]
 
     print(f"[discover] {len(links)+len(searched)} candidates after smart rank")
-    return links + searched
+    result = links + searched
+    niche_id = cfg.get("niche_id")
+    if niche_id:
+        from .niches import filter_candidates_for_niche
+        custom = list((cfg.get("search") or {}).get("custom_keywords") or [])
+        # links from user bypass soft filter but still hard-reject cross-niche
+        result = filter_candidates_for_niche(str(niche_id), result, custom_keywords=custom or None)
+    return result
