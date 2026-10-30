@@ -51,56 +51,94 @@ def _pick_script_style(ctx: HookContext, cfg_style: str, recent: list[str]) -> s
 
 
 def _rule_script(style: str, ctx: HookContext, scene: str, vocab: list[str] | None = None) -> str:
-    clean = _clean_title(ctx.title)
-    short = _truncate(clean, 32) if clean else ""
+    """Original commentary from scene/transcript/actions — never echo the source title."""
     niche = (ctx.niche_id or "gta6").lower()
-    v = ""
-    if vocab:
-        v = random.choice(vocab)
-    # Niche-flavored subject line
-    subjects = {
-        "gta6": short or "GTA 6",
-        "anime": short or "this anime fight",
-        "animation": short or "this cartoon beat",
-        "reactions": short or "this reaction",
-        "gaming": short or "this clutch",
-        "funny": short or "this clip",
-        "movies": short or "this trailer",
-        "custom": short or "this moment",
+    v = random.choice(vocab) if vocab else ""
+    # Scene / action cues (not title)
+    reason = (ctx.reason or "").lower()
+    actions = []
+    for key, label in (
+        ("laugh", "the laugh"),
+        ("scream", "the scream"),
+        ("face", "the face cam"),
+        ("loud", "that volume spike"),
+        ("motion", "the movement"),
+        ("cut", "the cut"),
+        ("react", "the reaction"),
+        ("keyword", "that line"),
+        ("hype_speech", "that line"),
+        ("audio_spike", "the spike"),
+    ):
+        if key in reason:
+            actions.append(label)
+    # Transcript keywords (content words only)
+    stop = {
+        "this", "that", "with", "from", "have", "been", "were", "they", "them",
+        "your", "what", "when", "where", "just", "like", "really", "about", "into",
+        "because", "there", "their", "would", "could", "should", "gonna", "look",
     }
-    subj = subjects.get(niche, short or "this clip")
+    toks = [
+        w.lower() for w in re.findall(r"[A-Za-z']+", ctx.transcript_snippet or "")
+        if len(w) > 3 and w.lower() not in stop
+    ]
+    # Drop tokens that look like title leftovers
+    title_bits = set(re.findall(r"[a-z0-9]+", (ctx.title or "").lower()))
+    toks = [t for t in toks if t not in title_bits or len(t) <= 4][:8]
+    cue = actions[0] if actions else (toks[0] if toks else "")
+    detail = " ".join(toks[:3]) if toks else ""
+
+    niche_openers = {
+        "gta6": ["Vice City energy", "Wanted-level chaos", "Rockstar cooked here", "Lucia energy"],
+        "anime": ["Aura overload", "Sakuga frame one", "That power-up hit", "Shonen beat"],
+        "reactions": ["Face cam carried", "Chat is melting", "The mic caught it", "Streamer broke"],
+        "gaming": ["Cleanest clip", "Clutch timing", "Ranked trauma", "Boss phase"],
+        "funny": ["The fail was personal", "Joke writes itself", "I can't breathe"],
+        "movies": ["Cinema lighting", "Trailer cooked", "Theater reaction"],
+        "animation": ["Frame one cinema", "Toon force", "Inbetweening cooked"],
+    }
+    flavor = random.choice(niche_openers.get(niche, ["This moment hits"]))
+    if v and random.random() < 0.45:
+        flavor = v[0].upper() + v[1:] if v else flavor
+
     snippets = {
         "hype": [
-            f"Yo check this out. {subj} hits different. Lock in for the drop.",
-            f"Bro this {subj} is unreal. Absolute cinema. Do not scroll.",
-            f"Insane energy right here. {subj} is about to break the internet.",
-            f"This is the moment. {v or subj} going crazy. Watch this.",
+            f"Yo lock in. {flavor}. Watch {cue or 'this beat'}." if cue else f"Yo lock in. {flavor}. Do not scroll.",
+            f"Insane. {flavor} right here. Feel {cue or 'that hit'}." if cue else f"Insane. {flavor}. Absolute cinema.",
+            f"Bro. {flavor}. {('Catch ' + detail) if detail else 'This is the drop'}.",
+            f"No way. {flavor}. {(cue[0].upper()+cue[1:] if cue else 'Peak moment')} goes crazy.",
         ],
         "commentary": [
-            f"Okay so here is the play. {subj} shows why everyone is talking.",
-            f"Watch the detail in this shot. {subj} already feels next level.",
-            f"Quick take: {subj} is pure cinema.",
-            f"See that? That is why {subj} is everywhere right now.",
+            f"Okay watch the detail. {('See ' + detail) if detail else flavor}. That is the shot.",
+            f"Quick take: {flavor}. {('Focus on ' + cue) if cue else 'Stay for the ending'}.",
+            f"Here is why it hits. {flavor}. {('Listen for ' + cue) if cue else 'Do not blink'}.",
+            f"See that? {flavor}. {('The ' + cue + ' sells it') if cue else 'Pure cinema'}." ,
         ],
         "reaction": [
             "Bro I was not ready for this. Look at that.",
-            "Wait wait wait. Did you catch that detail?",
+            f"Wait. Did you catch {cue or 'that detail'}?",
             "My honest reaction: this looks too real.",
-            f"No way. {subj} just hit different.",
+            f"No way. {flavor} just hit different.",
         ],
         "news": [
-            f"Update: {subj} and people are melting down.",
-            f"Here is what you need to know from this {niche} clip.",
-            f"Quick rundown: new {subj} just dropped.",
-            f"News flash: {subj} is everywhere.",
+            f"Update: {flavor} and people are melting down.",
+            f"Quick rundown: new {niche} drop, watch {cue or 'the peak'}.",
+            f"Here is what matters: {flavor}. {('Hit is ' + cue) if cue else 'Stay locked in'}.",
+            f"News flash: {flavor} is everywhere right now.",
         ],
     }
     options = snippets.get(style) or snippets["hype"]
-    text = random.choice(options)
-    words = text.split()
+    text_out = random.choice(options)
+    # Hard strip any leftover title echo
+    clean_title = _clean_title(ctx.title).lower()
+    if clean_title:
+        bits = [w for w in clean_title.split() if len(w) > 3]
+        low = text_out.lower()
+        if bits and sum(1 for b in bits if b in low) >= max(2, int(0.5 * len(bits))):
+            text_out = f"Yo lock in. {flavor}. Do not scroll."
+    words = text_out.split()
     if len(words) > 36:
-        text = " ".join(words[:36])
-    return text.strip()
+        text_out = " ".join(words[:36])
+    return text_out.strip()
 
 
 
@@ -117,10 +155,12 @@ def _try_ollama_script(
         "You write short TikTok/Shorts voiceover scripts for GTA 6 clips.\n"
         f"Style: {style}\n"
         f"Scene: {scene}\n"
-        f"Title: {ctx.title}\n"
-        f"Transcript: {ctx.transcript_snippet[:280]}\n"
-        "Rules: 1-3 short spoken sentences, max 36 words total, energetic, no hashtags, "
-        "no stage directions, no quotes. Output ONLY the spoken script."
+        f"Niche: {ctx.niche_id}\n"
+        f"Transcript keywords: {ctx.transcript_snippet[:220]}\n"
+        f"Scene reason: {ctx.reason}\n"
+        "Rules: 1-3 short spoken sentences, max 36 words, energetic, no hashtags, "
+        "NEVER quote or paraphrase the video title, write original lines from the scene. "
+        "No stage directions. Output ONLY the spoken script."
     )
     body = json.dumps({
         "model": model,

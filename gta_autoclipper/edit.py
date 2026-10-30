@@ -397,12 +397,13 @@ def render_clip(
                 except Exception:
                     intro_dur = min(2.0, max(1.0, intro_dur))
 
+        # Captions start AFTER intro VO (header already shows the spoken intro).
+        # Never burn intro VO words as bottom karaoke while the header is up.
+        shift = intro_dur if (intro_result and intro_result.wav_path) else 0.0
         if vo_enabled:
             vo_wav = td_path / "voiceover.wav"
             vo_result = make_voiceover(ctx, cfg, vo_wav)
             if vo_result.words:
-                # Shift commentary captions after intro
-                shift = intro_dur if (intro_result and intro_result.wav_path) else 0.0
                 caption_words = [
                     {
                         "word": w["word"],
@@ -412,7 +413,6 @@ def render_clip(
                     for w in vo_result.words
                 ]
             elif vo_result.text:
-                shift = intro_dur if (intro_result and intro_result.wav_path) else 0.0
                 caption_words = [
                     {
                         "word": tok,
@@ -421,12 +421,25 @@ def render_clip(
                     }
                     for i, tok in enumerate(vo_result.text.split()[:24])
                 ]
-
-        # Prefer intro words as early captions when present
-        if intro_result and intro_result.words and burn_captions:
-            caption_words = list(intro_result.words) + [
-                w for w in caption_words if float(w.get("start", 0)) >= intro_dur - 0.05
+            else:
+                caption_words = []
+        else:
+            # Dialogue captions: drop anything that overlaps the intro window
+            caption_words = [
+                {
+                    "word": w["word"],
+                    "start": float(w["start"]),
+                    "end": float(w["end"]),
+                }
+                for w in words
+                if float(w.get("end", 0)) > shift + 0.05
             ]
+            # Nudge remaining dialogue so first readable caption starts after intro
+            for w in caption_words:
+                if float(w["start"]) < shift:
+                    dur = max(0.08, float(w["end"]) - float(w["start"]))
+                    w["start"] = shift + 0.05
+                    w["end"] = w["start"] + dur
 
         ass_path = td_path / "captions.ass"
         words_for_burn = caption_words if burn_captions else []

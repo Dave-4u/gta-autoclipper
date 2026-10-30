@@ -126,7 +126,36 @@ def _title_hook_score(title: str) -> float:
     return min(2.0, score)
 
 
-def smart_rank_score(c: Candidate, *, sort_by: str = "recent_views") -> float:
+
+def _gta_source_quality(title: str, channel: str = "", description: str = "") -> float:
+    """Boost official trailers / gameplay / reactions; demote leak/meme commentary."""
+    blob = f"{title} {channel} {description}".lower()
+    score = 0.0
+    # Strong positives
+    if any(k in blob for k in ("official trailer", "rockstar games", "rockstar")):
+        score += 2.2
+    if "trailer" in blob and "leak" not in blob and "leaks" not in blob:
+        score += 1.4
+    if any(k in blob for k in ("gameplay", "walkthrough", "playthrough", "first look")):
+        score += 1.3
+    if any(k in blob for k in ("reaction", "reacts", "reacting", "watching")):
+        score += 1.1
+    # Mild positives
+    if any(k in blob for k in ("lucia", "jason", "vice city", "leonida", "gta vi", "gta 6")):
+        score += 0.3
+    # Demote leak / meme / commentary farms
+    if any(k in blob for k in ("leak", "leaks", "leaked", "datamine", "rumor")):
+        score -= 1.6
+    if any(k in blob for k in ("meme", "shitpost", "cats", "barber", "tiktok compilation", "ai generated")):
+        score -= 1.4
+    if any(k in blob for k in ("explained", "theory", "everything we know", "customization features")):
+        score -= 0.8
+    if "gta rp" in blob or "roleplay" in blob:
+        score -= 0.6
+    return score
+
+
+def smart_rank_score(c: Candidate, *, sort_by: str = "recent_views", niche_id: str | None = None) -> float:
     """Combine view velocity, freshness, engagement, title hook + jitter."""
     age = _age_days(c.upload_date)
     if age is None:
@@ -149,11 +178,21 @@ def smart_rank_score(c: Candidate, *, sort_by: str = "recent_views") -> float:
     jitter = random.uniform(0.0, 0.35)
 
     if sort_by == "views":
-        return view_score * 2.0 + velocity * 0.5 + hook * 0.4 + jitter
-    if sort_by == "recent":
-        return recency * 2.2 + velocity * 0.8 + hook * 0.5 + jitter
+        base = view_score * 2.0 + velocity * 0.5 + hook * 0.4 + jitter
+    elif sort_by == "recent":
+        base = recency * 2.2 + velocity * 0.8 + hook * 0.5 + jitter
+    else:
+        base = None
+    if base is not None:
+        niche = (niche_id or "").lower()
+        if niche in ("gta6", "gta", "gta_6"):
+            extra = getattr(c, "extra", None) or {}
+            ch = str((extra.get("channel") if isinstance(extra, dict) else "") or "")
+            desc = str((extra.get("description") if isinstance(extra, dict) else "") or "")
+            base += _gta_source_quality(c.title, ch, desc)
+        return base
     # recent_views / smart default
-    return (
+    base = (
         velocity * 1.4
         + recency * 1.1
         + view_score * 0.9
@@ -161,6 +200,19 @@ def smart_rank_score(c: Candidate, *, sort_by: str = "recent_views") -> float:
         + hook * 0.8
         + jitter
     )
+    niche = (niche_id or "").lower()
+    if niche in ("gta6", "gta", "gta_6"):
+        ch = ""
+        desc = ""
+        extra = getattr(c, "extra", None) or {}
+        if isinstance(extra, dict):
+            ch = str(extra.get("channel") or extra.get("uploader") or "")
+            desc = str(extra.get("description") or "")
+        base += _gta_source_quality(c.title, ch, desc)
+        # Also demote "leak" hook word that _title_hook_score rewarded
+        if "leak" in (c.title or "").lower():
+            base -= 0.35
+    return base
 
 
 def _entry_to_candidate(e: dict[str, Any], source: str) -> Candidate | None:
@@ -322,7 +374,7 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
                 age = _age_days(c.upload_date)
                 if age is not None and age > max_age:
                     continue
-            c.rank_score = smart_rank_score(c, sort_by=sort_by)
+            c.rank_score = smart_rank_score(c, sort_by=sort_by, niche_id=str(cfg.get("niche_id") or "") or None)
             seen_ids.add(c.id)
             candidates.append(c)
 
