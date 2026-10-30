@@ -87,4 +87,4 @@ voiceover:
 
 gemini:
   api_key: ''
-  model: gemini-2.5-flash
+  model: gemini-flash-lite-latest

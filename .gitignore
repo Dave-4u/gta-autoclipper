@@ -70,3 +70,4 @@ history_ranking.json
 **/GEMINI_API_KEY
 
 secrets/
+/home/box/agent-data/secrets/

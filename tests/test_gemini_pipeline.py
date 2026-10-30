@@ -39,16 +39,17 @@ def test_event_vs_from_title():
 
 
 def test_write_fallback_without_key():
-    assert not has_gemini({})
-    out = write_header_vo(
-        niche_id="anime",
-        title="Demon Slayer Tengen vs Gyutaro Fight",
-        channel="Crunchyroll",
-        vlm_desc="Tengen Uzui clashes with Gyutaro with spinning blades.",
-        transcript="",
-        event="fight",
-        cfg={},
-    )
+    with patch("gta_autoclipper.gemini_client.resolve_api_key", return_value=""):
+        assert not has_gemini({})
+        out = write_header_vo(
+            niche_id="anime",
+            title="Demon Slayer Tengen vs Gyutaro Fight",
+            channel="Crunchyroll",
+            vlm_desc="Tengen Uzui clashes with Gyutaro with spinning blades.",
+            transcript="",
+            event="fight",
+            cfg={},
+        )
     assert out["via"] == "fallback"
     assert "Tengen" in out["header"]
 

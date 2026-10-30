@@ -496,7 +496,7 @@ def render_clip(
             else:
                 print("[voiceover] skip commentary VO (nothing real to add)")
                 vo_result = None
-            if vo_result.words:
+            if vo_result and vo_result.words:
                 caption_words = [
                     {
                         "word": w["word"],
@@ -505,7 +505,7 @@ def render_clip(
                     }
                     for w in vo_result.words
                 ]
-            elif vo_result.text:
+            elif vo_result and vo_result.text:
                 caption_words = [
                     {
                         "word": tok,
