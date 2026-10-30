@@ -11,7 +11,7 @@ from typing import Any
 
 from .analyze import Segment, get_word_timestamps
 from .hooks import HookContext, generate_hook
-from .voiceover import make_voiceover
+from .voiceover import make_intro_vo, make_voiceover
 
 COLOR_ACTIVE = "H0000FFFF"
 COLOR_DIM = "H00FFFFFF"
@@ -328,29 +328,71 @@ def render_clip(
         transcript_snippet=snippet,
         boost_hits=boost,
         duration=segment.end - segment.start,
+        niche_id=str(cfg.get("niche_id") or (cfg.get("niche") or {}).get("id") or "gta6"),
     )
     hook_res = generate_hook(ctx, cfg)
-    print(f"[hooks] style={hook_res.style} via={hook_res.via}: {hook_res.text}")
+    print(
+        f"[hooks] style={hook_res.style} via={hook_res.via} "
+        f"score={hook_res.score:.2f} pool={hook_res.pool_size}: {hook_res.text}"
+    )
+    if hook_res.candidates:
+        print("[hooks] pool sample: " + " | ".join(hook_res.candidates[:5]))
     hook = _escape_drawtext(hook_res.text)
+    intro_result = None
+    vo_result = None
+    caption_words: list[dict[str, Any]] = []
+    intro_dur = float((cfg.get("voiceover") or {}).get("intro_seconds", 1.8))
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
         vo_result = None
+        intro_result = None
         caption_words = list(words)
+
+        intro_cfg_on = bool(vo_cfg.get("intro_header", True))
+        intro_dur = float(vo_cfg.get("intro_seconds", 1.8))
+        if intro_cfg_on and hook_res.text:
+            intro_wav = td_path / "intro.wav"
+            intro_result = make_intro_vo(hook_res.text, cfg, intro_wav)
+            if intro_result.wav_path and intro_result.wav_path.is_file():
+                # Cap spoken intro conceptually; actual wav may be shorter/longer
+                try:
+                    import wave
+                    with wave.open(str(intro_result.wav_path), "rb") as w:
+                        intro_dur = min(2.2, max(0.9, w.getnframes() / float(w.getframerate() or 1)))
+                except Exception:
+                    intro_dur = min(2.0, max(1.0, intro_dur))
+
         if vo_enabled:
             vo_wav = td_path / "voiceover.wav"
             vo_result = make_voiceover(ctx, cfg, vo_wav)
             if vo_result.words:
-                caption_words = vo_result.words
-            elif vo_result.text:
+                # Shift commentary captions after intro
+                shift = intro_dur if (intro_result and intro_result.wav_path) else 0.0
                 caption_words = [
                     {
-                        "word": t,
-                        "start": 0.2 + i * 0.35,
-                        "end": 0.55 + i * 0.35,
+                        "word": w["word"],
+                        "start": float(w["start"]) + shift,
+                        "end": float(w["end"]) + shift,
                     }
-                    for i, t in enumerate(vo_result.text.split()[:24])
+                    for w in vo_result.words
                 ]
+            elif vo_result.text:
+                shift = intro_dur if (intro_result and intro_result.wav_path) else 0.0
+                caption_words = [
+                    {
+                        "word": tok,
+                        "start": shift + 0.2 + i * 0.35,
+                        "end": shift + 0.55 + i * 0.35,
+                    }
+                    for i, tok in enumerate(vo_result.text.split()[:24])
+                ]
+
+        # Prefer intro words as early captions when present
+        if intro_result and intro_result.words and burn_captions:
+            caption_words = list(intro_result.words) + [
+                w for w in caption_words if float(w.get("start", 0)) >= intro_dur - 0.05
+            ]
 
         ass_path = td_path / "captions.ass"
         words_for_burn = caption_words if burn_captions else []
@@ -380,39 +422,81 @@ def render_clip(
                 line = " ".join(line.split()[:10]) + "…"
             commentary_text = _escape_drawtext(line)
 
+        # Animated header: bigger for intro_dur then settle
+        hook_dur = max(hook_dur, intro_dur if intro_result and intro_result.wav_path else hook_dur)
+
         atempo = speed if abs(speed - 1.0) > 0.001 else 1.0
         src_af = f"atempo={atempo}" if abs(atempo - 1.0) > 0.001 else "anull"
         vo_vol = float(vo_cfg.get("volume", 1.0))
         duck = float(vo_cfg.get("duck_level", 0.22))
         use_sidechain = bool(vo_cfg.get("sidechain", True))
 
+        # Build optional combined voice track: intro + delayed commentary
+        voice_inputs: list[Path] = []
+        if intro_result and intro_result.wav_path and intro_result.wav_path.is_file():
+            voice_inputs.append(intro_result.wav_path)
+        if vo_enabled and vo_result and vo_result.wav_path and vo_result.wav_path.is_file():
+            voice_inputs.append(vo_result.wav_path)
+
+        combined_vo = None
+        if voice_inputs:
+            combined_vo = td_path / "voice_mix.wav"
+            if len(voice_inputs) == 1:
+                combined_vo.write_bytes(voice_inputs[0].read_bytes())
+            else:
+                # intro then commentary with tiny gap; pad intro to intro_dur
+                intro_p = voice_inputs[0]
+                com_p = voice_inputs[1]
+                # adelay commentary by intro_dur ms
+                delay_ms = int(intro_dur * 1000)
+                cmd_mix = [
+                    "ffmpeg", "-y",
+                    "-i", str(intro_p),
+                    "-i", str(com_p),
+                    "-filter_complex",
+                    f"[0:a]apad=pad_dur={intro_dur:.3f},atrim=0:{intro_dur:.3f},volume={vo_vol}[intro];"
+                    f"[1:a]adelay={delay_ms}|{delay_ms},volume={vo_vol}[com];"
+                    f"[intro][com]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]",
+                    "-map", "[aout]", str(combined_vo),
+                ]
+                proc_m = subprocess.run(cmd_mix, capture_output=True, text=True, check=False)
+                if proc_m.returncode != 0 or not combined_vo.is_file():
+                    print("[edit] voice mix failed, using intro only")
+                    combined_vo.write_bytes(intro_p.read_bytes())
+
         def run_ffmpeg(use_ass: bool, use_dt_fallback: bool = False) -> bool:
             dt = _drawtext_caption_fallback(words_for_burn if burn_captions else [], font_opt) if use_dt_fallback else ""
+            # Extra animated header layer: large then normal via two drawtexts
+            anim = (
+                f"drawtext=text='{hook}'{font_opt}:fontsize=92:fontcolor=yellow:"
+                f"borderw=6:bordercolor=black:x=(w-text_w)/2:y=h*0.10:"
+                f"enable='lte(t\\,{intro_dur:.3f})',"
+                f"drawtext=text='{hook}'{font_opt}:fontsize=72:fontcolor=yellow:"
+                f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.12:"
+                f"enable='gte(t\\,{intro_dur:.3f})*lte(t\\,{hook_dur:.3f})'"
+            )
+            # Use animated hook instead of single hook inside _video_chain — pass empty hook and append anim
             vchain = _video_chain(
                 width=width,
                 height=height,
                 ass_filter=ass_filter if use_ass else None,
-                hook=hook,
+                hook=" ",  # placeholder tiny; replaced below
                 font_opt=font_opt,
-                hook_dur=hook_dur,
+                hook_dur=0.01,
                 speed=speed,
                 zoom=zoom,
                 commentary=commentary_text,
                 commentary_on=commentary_on and bool(commentary_text),
-                drawtext_extra=dt,
+                drawtext_extra=(anim + (("," + dt) if dt else "")),
                 out_label="vout",
             )
-            has_vo = (
-                vo_enabled
-                and vo_result
-                and vo_result.wav_path
-                and vo_result.wav_path.is_file()
-            )
+            # Remove tiny placeholder drawtext if present — keep chain working
+            has_vo = combined_vo is not None and combined_vo.is_file()
             if has_vo:
                 if use_sidechain:
                     achain = (
                         f"[0:a]{src_af}[a0];"
-                        f"[1:a]volume={vo_vol},apad=whole_dur=3600,asplit=2[sc][voice];"
+                        f"[1:a]volume=1.0,apad=whole_dur=3600,asplit=2[sc][voice];"
                         f"[a0][sc]sidechaincompress=threshold=0.012:ratio=8:"
                         f"attack=40:release=280:makeup=1[ducked];"
                         f"[ducked][voice]amix=inputs=2:duration=first:"
@@ -422,7 +506,7 @@ def render_clip(
                 else:
                     achain = (
                         f"[0:a]{src_af},volume={duck}[a0];"
-                        f"[1:a]volume={vo_vol},apad=whole_dur=3600[voice];"
+                        f"[1:a]volume=1.0,apad=whole_dur=3600[voice];"
                         f"[a0][voice]amix=inputs=2:duration=first:"
                         f"dropout_transition=0:normalize=0,"
                         f"loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
@@ -433,7 +517,7 @@ def render_clip(
                     "-ss", str(segment.start),
                     "-to", str(segment.end),
                     "-i", str(source),
-                    "-i", str(vo_result.wav_path),
+                    "-i", str(combined_vo),
                     "-filter_complex", fc,
                     "-map", "[vout]",
                     "-map", "[aout]",
@@ -445,8 +529,6 @@ def render_clip(
                     str(out_path),
                 ]
             else:
-                # Single-input: use -vf / -af for simplicity
-                # Convert labeled chain to unlabeled -vf is messy; keep filter_complex
                 achain = (
                     f"[0:a]{src_af},loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
                     if src_af != "anull"
@@ -491,8 +573,18 @@ def render_clip(
                 "hook": hook_res.text,
                 "style": hook_res.style,
                 "via": hook_res.via,
-                "caption_words": len(caption_words),
+                "score": hook_res.score,
+                "pool": hook_res.candidates[:8],
+                "niche": cfg.get("niche_id"),
+                "caption_words": len(caption_words) if "caption_words" in dir() else 0,
                 "real_dialogue_words": len(real_words),
+                "intro_vo": None
+                if not intro_result
+                else {
+                    "text": intro_result.text,
+                    "engine": intro_result.engine,
+                    "seconds": intro_dur if "intro_dur" in dir() else None,
+                },
                 "voiceover": None
                 if not vo_result
                 else {

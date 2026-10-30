@@ -299,3 +299,39 @@ def make_voiceover(
     return VoiceoverResult(
         text=text, style=style, via=via, wav_path=out_wav, words=words, engine=used_engine
     )
+
+
+def make_intro_vo(text: str, cfg: dict[str, Any], out_wav: Path) -> VoiceoverResult:
+    """Speak the header/hook for the clip intro (1–2s typical)."""
+    vo = cfg.get("voiceover") or {}
+    voice = str(vo.get("voice", "en_US-ryan-high"))
+    fallback = str(vo.get("fallback_voice", "en_US-lessac-high"))
+    root = Path(cfg.get("_root") or ".")
+    models_dir = Path(vo.get("models_dir") or (root / "models" / "piper"))
+    if not models_dir.is_absolute():
+        models_dir = root / models_dir
+    clean = re.sub(r"\s+", " ", (text or "").strip())
+    # Strip style prefixes that sound awkward spoken? Keep POV etc — they slap
+    used = "none"
+    err = None
+    for v in (voice, fallback):
+        try:
+            synthesize_piper(clean, out_wav, v, models_dir)
+            used = f"piper:{v}"
+            break
+        except Exception as e:
+            err = e
+            print(f"[intro-vo] piper {v} failed: {e}")
+    if used == "none" and vo.get("allow_edge_fallback", True):
+        try:
+            synthesize_edge(clean, out_wav, str(vo.get("edge_voice", "en-US-GuyNeural")))
+            used = "edge-tts"
+        except Exception as e:
+            err = e
+    if used == "none" or not out_wav.is_file():
+        print(f"[intro-vo] failed ({err})")
+        return VoiceoverResult(text=clean, style="intro", via="failed", wav_path=None, words=[], engine="failed")
+    dur = _wav_duration(out_wav)
+    words = _estimate_words(clean, dur)
+    print(f"[intro-vo] engine={used} duration={dur:.2f}s: {clean}")
+    return VoiceoverResult(text=clean, style="intro", via="intro", wav_path=out_wav, words=words, engine=used)

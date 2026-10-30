@@ -1,107 +1,24 @@
-# GTA AutoClipper
+# AutoClipper (GTA + multi-niche)
 
-**Free, self-hosted** Python tool that finds GTA 6 / GTA RP content, picks highlights, and renders **ready-to-post 9:16 Shorts/TikTok clips** (blurred background, smart header text, burned-in captions, **AI voiceover**, loudness normalize).
+**Free, self-hosted, CPU-only** Shorts/TikTok clipper. Discovers trending clips across niches (GTA 6, anime, animation, reactions, gaming, funny/viral, movies), picks peak moments, writes catchy headers with intro voiceover, burns captions, and can run fully hands-free.
 
-No paid APIs. Optional local [Ollama](https://ollama.com) for smarter headers/scripts; rule-based fallback if Ollama is offline. Voiceover uses **Piper TTS** on CPU (auto-downloads a voice on first run) with optional **edge-tts** online fallback.
-
-> Built for clipping **GTA 6 trailers, news, leaks, streamer reactions, and GTA RP** for YouTube Shorts / TikTok-style posting.
+No paid APIs. Optional local [Ollama](https://ollama.com) for smarter headers. Voiceover uses **Piper TTS** on CPU (auto-downloads voices) with optional **edge-tts** fallback.
 
 ---
 
-## What it does
+## What’s new (smart autopilot)
 
-1. **Finds** videos via `yt-dlp` search using keywords in `config.yaml`, ranked by **recency + views**. Also reads URLs from `links.txt`.
-2. **Downloads** with `yt-dlp` (skips IDs already in `history.json`).
-3. **Picks highlights** using free signals: loudness, scene changes, motion, optional **faster-whisper** keywords.
-4. **Renders** 1080×1920 MP4s with **copyright-safer defaults** (~18s source, slight zoom/crop, 1.05× speed, commentary text layer), smart hook, **colored word-by-word captions**, optional **AI voiceover** (ducks original audio), loudnorm.
-5. **Writes** a `.txt` / `.json` sidecar per clip with caption + hashtags.
-6. **Optional loop**: `--every 6` to re-run every 6 hours.
-
-### Smart header styles (not only POV)
-
-Each clip picks a style from transcript + title + scene type (POV / When you / Hot take / Question / Hype / Reaction / Info). Styles are varied. If **Ollama** is running locally, it drafts the line; otherwise rules generate it.
-
-### AI voiceover (free, CPU)
-
-On by default. Generates a short hype/commentary script that matches the clip, speaks it with **Piper** (`en_US-ryan-high` by default), ducks the original track under the voice, and burns **karaoke captions for the voiceover lines**.
-
-```bat
-REM Voiceover on (default)
-run.bat --once --max-videos 1
-
-REM Turn voiceover off for one run
-run.bat --once --no-voiceover --max-videos 1
-
-REM Force voiceover on even if config disabled it
-run.bat --once --voiceover --max-videos 1
-```
-
-Config knobs in `config.yaml` → `voiceover:` (`enabled`, `voice`, `volume`, `script_style`, `sidechain`, …).
-
-First voiceover run downloads the Piper model into `models/piper/` (~60MB). Needs no GPU.
-
-### Copyright-safer defaults
-
-To reduce YouTube Content ID “exceeds length limits” blocks, each clip by default:
-
-- Uses **at most ~18 seconds** of source footage
-- Applies a **slight zoom/crop** and **1.05× speed**
-- Adds a **commentary text layer** under the hook
-
-Turn off with `--no-copyright-safe` or `clips.copyright_safe.enabled: false`. This does **not** guarantee fair use — see legal notes below.
+1. **Multi-niche presets** — `gta6`, `anime`, `animation`, `reactions`, `gaming`, `funny`, `movies`, plus `custom` keywords. Each has search queries, header styles, Piper voice, hashtags, and vocab.
+2. **Smart discovery** — yt-dlp search + date-sorted / “new / trending” queries. Scores by **view velocity**, **freshness**, **engagement**, and **title hook**, with jitter so runs vary. Dedupes via `history.json`.
+3. **Smart moments** — audio energy, scene-change density, motion, transcript keywords / hype speech. Builds a pool of peaks and **randomly samples varied top moments**.
+4. **Header pool** — many catchy candidates (POV / When you / hot take / question / hype / reaction / news + niche lines). Scores and picks (soft-random among top). Ollama if present, else rich templates.
+5. **Intro VO** — Piper **speaks the header** over the first ~1–2s with a larger→smaller header animation, then the clip continues. Optional commentary VO + ducking + captions still work.
+6. **Autopilot** — CLI `--auto` and Gradio **Autopilot** tab: loop niches, render N clips each into `outputs/<niche>/` with metadata `.txt`. Optional schedule interval.
+7. **Copyright-safer defaults** — ~18s source, slight zoom, 1.05× speed, commentary text layer.
 
 ---
 
-## Requirements
-
-- **Python 3.10+**
-- **ffmpeg** + **ffprobe** on PATH
-- ~2 GB disk for whisper + Piper models on first run
-- (Optional) [Ollama](https://ollama.com) + a small model e.g. `ollama pull llama3.2`
-
----
-
-## Install (Windows)
-
-1. Install **Python** from https://www.python.org/downloads/  
-   - Check **“Add python.exe to PATH”**.
-2. Install **ffmpeg**:
-   - Download a release from https://www.gyan.dev/ffmpeg/builds/ (essentials zip).
-   - Unzip, add the `bin` folder to system PATH.
-   - Open a **new** Command Prompt and run: `ffmpeg -version`
-3. Clone or unzip this project, e.g. `%USERPROFILE%\gta-autoclipper`
-4. Double-click **`run.bat`** once (creates `.venv` and installs deps), **or**:
-
-```bat
-cd %USERPROFILE%\gta-autoclipper
-run.bat --once --max-videos 1
-```
-
-### Update an existing install
-
-```bat
-cd %USERPROFILE%\gta-autoclipper
-git pull
-run.bat
-```
-
-`run.bat` re-runs `pip install -r requirements.txt` so new packages (Piper / edge-tts) install automatically.
-
-### Install (Linux)
-
-```bash
-sudo apt update && sudo apt install -y python3 python3-venv python3-pip ffmpeg
-cd gta-autoclipper
-chmod +x run.sh
-./run.sh --once --max-videos 1
-```
-
-
----
-
-## Web UI (Gradio, free, local)
-
-Double-click **`ui.bat`** (Windows) or run **`./ui.sh`** (Linux). That creates/uses `.venv`, installs deps, and opens **http://127.0.0.1:7860** in your browser.
+## Quick start (Windows)
 
 ```bat
 cd %USERPROFILE%\gta-autoclipper
@@ -109,121 +26,123 @@ git pull
 ui.bat
 ```
 
-Or from the CLI:
+Or CLI autopilot (no UI):
 
 ```bat
-run.bat --ui
+cd %USERPROFILE%\gta-autoclipper
+git pull
+run.bat --auto --niche gta6 --niche anime --clips-per-niche 2 --fast
 ```
 
-In the UI you can:
+Linux:
 
-1. Paste one or more YouTube (or TikTok/Facebook) URLs — or tick **Auto-discover** for GTA 6 search keywords from `config.yaml`
-2. Toggle **AI voiceover** (pick a Piper voice), **captions**, **copyright-safe mode**, **fast mode**, **join all clips**
-3. Set how many clips per video / source videos
-4. Click **Make Clips** and watch the live log
-5. Preview finished files in the gallery, download them, or click **Open outputs folder**
-
-The UI never needs a GPU. Keep the terminal/cmd window open while you use it (Ctrl+C to stop).
+```bash
+./ui.sh
+# or
+./run.sh --auto --niche gta6 --niche anime --clips-per-niche 2 --fast
+```
 
 ---
 
-## Usage
+## Web UI
+
+`ui.bat` / `./ui.sh` / `run.bat --ui` opens **http://127.0.0.1:7860**.
+
+- **Manual** tab — paste URLs or auto-discover, toggles for commentary VO / captions / copyright-safe / fast / join-all.
+- **Autopilot** tab — multi-select niches, clips count, optional repeat interval, **Start / Stop**, live log + gallery.
+
+Keep the terminal open while the UI runs.
+
+---
+
+## CLI cheatsheet
 
 ```bash
-# One pass, process up to 2 new videos
-./run.sh --once --max-videos 2
+# Autopilot once across niches
+python -m gta_autoclipper --auto --niche gta6 --niche anime --clips-per-niche 2 --fast
 
-# Faster whisper (tiny model)
-./run.sh --once --fast --max-videos 1
+# Autopilot every 6 hours
+python -m gta_autoclipper --auto --niche gaming --niche funny --interval 6
 
-# Disable whisper (placeholders only — not recommended)
-./run.sh --once --no-whisper --max-videos 1
+# Single niche pass
+python -m gta_autoclipper --once --niche anime --max-videos 1 --fast
 
-# Voiceover off / on
-./run.sh --once --no-voiceover --max-videos 1
-./run.sh --once --voiceover --max-videos 1
+# Custom keywords
+python -m gta_autoclipper --auto --niche custom --custom-keywords "one piece edit, jjk fight"
 
-# Only URLs in links.txt
-./run.sh --once --links-only
-
-# Auto-repeat every 6 hours
-./run.sh --every 6 --max-videos 2
+# Disable intro header VO
+python -m gta_autoclipper --once --no-intro-vo --max-videos 1
 ```
 
-Windows: same flags with `run.bat`.
+Outputs land in **`outputs/<niche>/`** as:
 
-Outputs land in **`outputs/`** as:
+- `VIDEOID_clip01.mp4`
+- `.txt` / `.json` caption sidecars
+- `.hook.json` — picked header, score, pool samples, intro VO meta
+- `.meta.txt` — niche, title, header, caption, hashtags, source
 
-- `VIDEOID_clip01.mp4` — vertical edited clip  
-- `VIDEOID_clip01.txt` — title / caption / hashtags to paste  
-- `VIDEOID_clip01.json` — same as structured data  
-- `VIDEOID_clip01.hook.json` — header + voiceover metadata  
+---
 
-Downloaded sources stay in **`downloads/`**. Processed IDs are stored in **`history.json`**.
+## Niches
+
+| Id | Focus |
+|----|--------|
+| `gta6` | GTA 6 / RP / Rockstar |
+| `anime` | Anime fights, trailers, edits |
+| `animation` | Cartoons / Pixar / animated |
+| `reactions` | Streamer / reaction meltdowns |
+| `gaming` | Clutch / fails / trailers |
+| `funny` | Viral / comedy / fails |
+| `movies` | Trailers / cinema moments |
+| `custom` | Your keywords |
 
 ---
 
 ## Config
 
-Edit **`config.yaml`**:
+See `config.yaml`:
 
-- `search.keywords` — GTA 6 trailer / news / leaks / reactions / RP queries  
-- `clips.copyright_safe` — short / zoom / speed / commentary layer  
-- `voiceover.*` — enable, Piper voice, volume, script style, ducking  
-- `hooks.use_ollama` — set `false` to force rule-based headers/scripts  
-- `hashtags` — appended to each sidecar caption  
-
-Paste source links (one per line) into **`links.txt`**.
+- `search.*` — age window, trending, keywords-per-run  
+- `clips.copyright_safe` — short / zoom / speed  
+- `hooks.pool_size` / Ollama  
+- `voiceover.intro_header` / `intro_seconds` / Piper voice  
+- `autopilot.*` — default niches for unattended runs  
 
 ---
 
-## Reposting rights / legal (read this)
+## Requirements
 
-This tool is for **personal automation and learning**. Uploading clipped gameplay or someone else’s trailer/reaction to monetized Shorts/TikTok can violate:
+- Python 3.10+
+- ffmpeg + ffprobe on PATH
+- ~2 GB disk for whisper + Piper voices on first runs
+- (Optional) Ollama + small model
 
-- **Copyright** (Rockstar / Take-Two; the original uploader)
-- Platform **reuse / fair use** rules (fair use is narrow and not automatic)
-- Creator **rights** if you re-upload their reaction or RP stream without permission
-
-**You** are responsible for what you post. Prefer:
-
-- Content you own or have a license to use  
-- Transformative commentary with clear added value (voiceover + text help, but are not a guarantee)  
-- Checking each platform’s monetization and copyright policies  
-- Giving credit / linking originals when appropriate  
-
-The authors of this tool provide **no warranty** and accept **no liability** for strikes, takedowns, or demonetization.
+`run.bat` / `ui.bat` create `.venv` and `pip install -r requirements.txt` automatically.
 
 ---
 
-## Troubleshooting
+## Legal
 
-| Problem | Fix |
-|---------|-----|
-| `yt-dlp` fails on Facebook/TikTok | Update: `pip install -U yt-dlp`. Prefer YouTube search or public links. |
-| Whisper slow | First run downloads the model. Or use `--fast` / `--no-whisper`. |
-| Piper voice download slow | First voiceover run only. Voice is cached in `models/piper/`. |
-| No ffmpeg | Install ffmpeg and reopen the terminal. |
-| Empty results | Clear `history.json`, or add URLs to `links.txt`. |
-| Ollama unused | Normal if Ollama isn’t running — rule-based hooks/scripts still work. |
-| Content ID length block | Keep `copyright_safe` on; prefer reactions/news; add your own commentary. |
+For personal automation and learning. Uploading others’ footage to monetized Shorts/TikTok can violate copyright and platform rules. Copyright-safer defaults and commentary **do not guarantee** fair use. **You** are responsible for what you post.
 
 ---
 
-## Project layout
+## Layout
 
 ```
 gta-autoclipper/
-  config.yaml          # keywords, clip settings, voiceover, hooks
-  links.txt            # optional source URLs
-  requirements.txt
+  config.yaml
   run.bat / run.sh
-  ui.bat / ui.sh        # Gradio web UI
-  gta_autoclipper/     # Python package
-  downloads/           # sources
-  outputs/             # finished vertical clips
-  models/piper/        # Piper voices (auto-downloaded)
-  history.json         # created on first run
+  ui.bat / ui.sh
+  gta_autoclipper/
+    niches.py      # presets
+    discover.py    # smart search + scoring
+    analyze.py     # varied peak moments
+    hooks.py       # header pool + scoring
+    voiceover.py   # intro + commentary TTS
+    autopilot.py   # hands-free loop
+    ui.py          # Gradio Manual + Autopilot
+  downloads/
+  outputs/<niche>/
+  models/piper/
 ```
-
-No paid cloud APIs. No account required beyond whatever `yt-dlp` needs for a given site.

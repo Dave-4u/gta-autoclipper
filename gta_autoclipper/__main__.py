@@ -1,4 +1,4 @@
-"""CLI entry: python -m gta_autoclipper [--ui|--once|--every N] ..."""
+"""CLI: python -m gta_autoclipper [--ui|--auto|--once] ..."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from .discover import discover
 from .download import download_video, probe_duration
 from .edit import probe_clip, render_clip
 from .history import History
+from .niches import apply_niche_to_config, list_niche_ids
 
 
 def run_once(cfg: dict, *, max_videos: int = 2, skip_whisper: bool | None = None) -> list[Path]:
@@ -90,83 +91,42 @@ def run_once(cfg: dict, *, max_videos: int = 2, skip_whisper: bool | None = None
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="GTA AutoClipper — free GTA 6 Shorts/TikTok clipper"
+        description="AutoClipper — free multi-niche Shorts/TikTok clipper"
+    )
+    parser.add_argument("--config", default=None, help="Path to config.yaml")
+    parser.add_argument("--ui", action="store_true", help="Launch Gradio web UI")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Autopilot: discover + clip niches with no babysitting",
     )
     parser.add_argument(
-        "--config",
+        "--niche",
+        action="append",
         default=None,
-        help="Path to config.yaml (default: next to package)",
+        help="Niche id (repeatable): " + ", ".join(list_niche_ids()),
     )
     parser.add_argument(
-        "--ui",
-        action="store_true",
-        help="Launch the free local Gradio web UI in your browser",
+        "--custom-keywords",
+        default="",
+        help="Comma-separated keywords when using --niche custom",
     )
-    parser.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="UI bind host (default 127.0.0.1)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=7860,
-        help="UI port (default 7860)",
-    )
-    parser.add_argument(
-        "--no-browser",
-        action="store_true",
-        help="With --ui, do not auto-open a browser tab",
-    )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Run a single pass and exit (default if --every not set)",
-    )
-    parser.add_argument(
-        "--every",
-        type=float,
-        default=None,
-        metavar="HOURS",
-        help="Repeat every N hours (e.g. 6)",
-    )
-    parser.add_argument(
-        "--max-videos",
-        type=int,
-        default=2,
-        help="Max source videos to process per pass (default 2)",
-    )
-    parser.add_argument(
-        "--no-whisper",
-        action="store_true",
-        help="Skip faster-whisper (faster; placeholders only — not recommended)",
-    )
-    parser.add_argument(
-        "--fast",
-        action="store_true",
-        help="Use whisper 'tiny' instead of 'base' (faster, less accurate under music)",
-    )
-    parser.add_argument(
-        "--links-only",
-        action="store_true",
-        help="Only process URLs from links.txt (no YouTube search)",
-    )
+    parser.add_argument("--clips-per-niche", type=int, default=2)
+    parser.add_argument("--interval", type=float, default=0.0, help="Autopilot hours between loops (0=once)")
+    parser.add_argument("--once", action="store_true", help="Single pass (CLI default)")
+    parser.add_argument("--every", type=float, default=None, metavar="HOURS")
+    parser.add_argument("--max-videos", type=int, default=2)
+    parser.add_argument("--no-whisper", action="store_true")
+    parser.add_argument("--fast", action="store_true")
+    parser.add_argument("--links-only", action="store_true")
     vo_group = parser.add_mutually_exclusive_group()
-    vo_group.add_argument(
-        "--voiceover",
-        action="store_true",
-        help="Force AI voiceover on (overrides config)",
-    )
-    vo_group.add_argument(
-        "--no-voiceover",
-        action="store_true",
-        help="Disable AI voiceover for this run",
-    )
-    parser.add_argument(
-        "--no-copyright-safe",
-        action="store_true",
-        help="Disable short/zoom/speed transformative defaults",
-    )
+    vo_group.add_argument("--voiceover", action="store_true")
+    vo_group.add_argument("--no-voiceover", action="store_true")
+    parser.add_argument("--no-copyright-safe", action="store_true")
+    parser.add_argument("--no-intro-vo", action="store_true", help="Disable header intro TTS")
     args = parser.parse_args(argv)
 
     if args.ui:
@@ -180,23 +140,47 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    if args.auto:
+        from .autopilot import run_autopilot
+
+        niches = args.niche or ["gta6", "anime"]
+        custom = [k.strip() for k in args.custom_keywords.split(",") if k.strip()]
+        run_autopilot(
+            niches=niches,
+            clips_per_niche=args.clips_per_niche,
+            max_videos=args.max_videos,
+            interval_hours=float(args.interval or 0),
+            custom_keywords=custom or None,
+            config_path=args.config,
+            once=True if not args.interval else False,
+        )
+        return 0
+
     cfg = load_config(args.config)
+    if args.niche and len(args.niche) == 1:
+        custom = [k.strip() for k in args.custom_keywords.split(",") if k.strip()]
+        cfg = apply_niche_to_config(cfg, args.niche[0], custom_keywords=custom or None)
+        # force outputs/<niche>
+        from pathlib import Path as P
+        root = P(cfg.get("_root") or ".")
+        cfg["clips"]["output_dir"] = str((root / "outputs" / cfg["niche_id"]).resolve())
+
     if args.links_only:
         cfg.setdefault("search", {})["keywords"] = []
-
     if args.voiceover:
         cfg.setdefault("voiceover", {})["enabled"] = True
     if args.no_voiceover:
         cfg.setdefault("voiceover", {})["enabled"] = False
+    if args.no_intro_vo:
+        cfg.setdefault("voiceover", {})["intro_header"] = False
     if args.no_copyright_safe:
         cfg.setdefault("clips", {}).setdefault("copyright_safe", {})["enabled"] = False
+    if args.fast:
+        cfg.setdefault("analysis", {})["whisper_model"] = "tiny"
 
     interval = args.every
     if interval is None and not args.once:
         interval = None
-
-    if getattr(args, "fast", False):
-        cfg.setdefault("analysis", {})["whisper_model"] = "tiny"
 
     def pass_once() -> None:
         run_once(
@@ -209,10 +193,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[scheduler] running every {interval} hours (Ctrl+C to stop)")
         while True:
             pass_once()
-            sleep_s = interval * 3600
             print(f"[scheduler] sleeping {interval}h…")
             try:
-                time.sleep(sleep_s)
+                time.sleep(interval * 3600)
             except KeyboardInterrupt:
                 print("\n[scheduler] stopped")
                 return 0

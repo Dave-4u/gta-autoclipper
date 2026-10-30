@@ -1,9 +1,11 @@
-"""Discover GTA 6 / GTA RP content via yt-dlp search and links.txt."""
+"""Smart discovery: yt-dlp search + trending/new, velocity/freshness/engagement scoring."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
+import random
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -18,10 +20,12 @@ class Candidate:
     title: str
     url: str
     duration: float | None
-    source: str  # "search" | "links"
+    source: str  # "search" | "links" | "trending"
     view_count: int = 0
     upload_date: str | None = None  # YYYYMMDD
     rank_score: float = 0.0
+    like_count: int = 0
+    comment_count: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -32,9 +36,7 @@ def _run_ytdlp_json(args: list[str], timeout: int = 180) -> list[dict[str, Any]]
             cmd, capture_output=True, text=True, timeout=timeout, check=False
         )
     except FileNotFoundError as e:
-        raise RuntimeError(
-            "yt-dlp not found. Install with: pip install yt-dlp"
-        ) from e
+        raise RuntimeError("yt-dlp not found. Install with: pip install yt-dlp") from e
     if proc.returncode != 0 and not proc.stdout.strip():
         return []
     lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
@@ -57,6 +59,18 @@ def _run_ytdlp_json(args: list[str], timeout: int = 180) -> list[dict[str, Any]]
 
 def _parse_views(e: dict[str, Any]) -> int:
     for key in ("view_count", "views", "play_count"):
+        v = e.get(key)
+        if v is None:
+            continue
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            pass
+    return 0
+
+
+def _parse_int(e: dict[str, Any], *keys: str) -> int:
+    for key in keys:
         v = e.get(key)
         if v is None:
             continue
@@ -90,43 +104,99 @@ def _age_days(upload_date: str | None) -> float | None:
         return None
 
 
-def _rank_score(
-    views: int, upload_date: str | None, sort_by: str
-) -> float:
-    """Higher is better. Combines recency + views for Shorts clipping."""
-    age = _age_days(upload_date)
-    # Recency score: 1.0 if today, decays over ~90 days
+def _title_hook_score(title: str) -> float:
+    t = (title or "").lower()
+    score = 0.0
+    hooks = (
+        "wait", "insane", "crazy", "omg", "no way", "gone wrong", "vs", "fail",
+        "clutch", "reaction", "leak", "trailer", "twist", "secret", "you won't",
+        "pov", "caught", "exposed", "final", "boss", "edit", "new",
+    )
+    for h in hooks:
+        if h in t:
+            score += 0.35
+    if "!" in (title or "") or "?" in (title or ""):
+        score += 0.25
+    if re.search(r"\d{4}", title or ""):
+        score += 0.1
+    # Length sweet spot
+    n = len((title or "").split())
+    if 4 <= n <= 14:
+        score += 0.3
+    return min(2.0, score)
+
+
+def smart_rank_score(c: Candidate, *, sort_by: str = "recent_views") -> float:
+    """Combine view velocity, freshness, engagement, title hook + jitter."""
+    age = _age_days(c.upload_date)
     if age is None:
         recency = 0.35
+        age_safe = 14.0
     else:
-        recency = max(0.0, 1.0 - (age / 90.0))
-    # Views: log-scale
-    import math
+        recency = max(0.0, 1.0 - (age / 45.0))  # stronger recent bias
+        age_safe = max(0.5, age)
 
-    view_score = math.log10(max(views, 1) + 1) / 8.0  # ~1.0 at 100M
-    view_score = min(1.5, view_score)
+    views = max(c.view_count, 0)
+    view_score = min(1.6, math.log10(views + 1) / 7.5)
+    velocity = min(2.0, math.log10((views / age_safe) + 1) / 5.0)  # views per day
+
+    likes = max(c.like_count, 0)
+    comments = max(c.comment_count, 0)
+    eng_raw = (likes + comments * 3) / max(views, 1)
+    engagement = min(1.5, eng_raw * 80.0)  # typical YT ratios are small
+
+    hook = _title_hook_score(c.title)
+    jitter = random.uniform(0.0, 0.35)
+
     if sort_by == "views":
-        return view_score * 2 + recency * 0.3
+        return view_score * 2.0 + velocity * 0.5 + hook * 0.4 + jitter
     if sort_by == "recent":
-        return recency * 2 + view_score * 0.3
-    # recent_views (default): both matter — good for clipping payouts
-    return recency * 1.2 + view_score * 1.0
+        return recency * 2.2 + velocity * 0.8 + hook * 0.5 + jitter
+    # recent_views / smart default
+    return (
+        velocity * 1.4
+        + recency * 1.1
+        + view_score * 0.9
+        + engagement * 0.7
+        + hook * 0.8
+        + jitter
+    )
 
 
-def search_youtube(
-    keyword: str, n: int = 8, *, prefer_date: bool = True
-) -> list[Candidate]:
-    """Search YouTube via ytsearchN (yt-dlp). Recency applied in rank_score.
+def _entry_to_candidate(e: dict[str, Any], source: str) -> Candidate | None:
+    vid = e.get("id") or ""
+    if not vid:
+        return None
+    url = e.get("url") or e.get("webpage_url") or ""
+    if url and not str(url).startswith("http"):
+        url = f"https://www.youtube.com/watch?v={vid}"
+    if not url:
+        url = f"https://www.youtube.com/watch?v={vid}"
+    title = e.get("title") or vid
+    dur = e.get("duration")
+    try:
+        dur_f = float(dur) if dur is not None else None
+    except (TypeError, ValueError):
+        dur_f = None
+    return Candidate(
+        id=str(vid),
+        title=str(title),
+        url=str(url),
+        duration=dur_f,
+        source=source,
+        view_count=_parse_views(e),
+        upload_date=_parse_upload(e),
+        like_count=_parse_int(e, "like_count", "likes"),
+        comment_count=_parse_int(e, "comment_count", "comments"),
+    )
 
-    Note: older `ytsearchdateN:` is not supported on all yt-dlp builds, so we
-    always use ytsearchN and sort ourselves by upload_date + views.
-    When prefer_date, also try a date-sorted YouTube results URL as a supplement.
-    """
+
+def search_youtube(keyword: str, n: int = 8, *, prefer_date: bool = True) -> list[Candidate]:
     query = f"ytsearch{n}:{keyword}"
     entries = _run_ytdlp_json([query])
     if prefer_date:
-        # CAI%253D = sort by upload date (YouTube sp param)
         from urllib.parse import quote_plus
+
         url = (
             "https://www.youtube.com/results?search_query="
             + quote_plus(keyword)
@@ -140,33 +210,28 @@ def search_youtube(
                 seen.add(e["id"])
     out: list[Candidate] = []
     for e in entries:
-        vid = e.get("id") or ""
-        if not vid:
-            continue
-        url = e.get("url") or e.get("webpage_url") or ""
-        if url and not url.startswith("http"):
-            url = f"https://www.youtube.com/watch?v={vid}"
-        if not url:
-            url = f"https://www.youtube.com/watch?v={vid}"
-        title = e.get("title") or vid
-        dur = e.get("duration")
-        try:
-            dur_f = float(dur) if dur is not None else None
-        except (TypeError, ValueError):
-            dur_f = None
-        views = _parse_views(e)
-        upload = _parse_upload(e)
-        out.append(
-            Candidate(
-                id=str(vid),
-                title=str(title),
-                url=url,
-                duration=dur_f,
-                source="search",
-                view_count=views,
-                upload_date=upload,
-            )
-        )
+        c = _entry_to_candidate(e, "search")
+        if c:
+            out.append(c)
+    return out
+
+
+def search_trending_related(keyword: str, n: int = 6) -> list[Candidate]:
+    """Approx 'new releases / trending' via date-sorted results + this week phrasing."""
+    variants = [
+        f"{keyword} this week",
+        f"{keyword} new",
+        f"trending {keyword}",
+    ]
+    out: list[Candidate] = []
+    seen: set[str] = set()
+    for kw in variants[:2]:
+        for c in search_youtube(kw, n=max(3, n // 2), prefer_date=True):
+            if c.id in seen:
+                continue
+            seen.add(c.id)
+            c.source = "trending"
+            out.append(c)
     return out
 
 
@@ -189,7 +254,7 @@ def read_links_file(path: str | Path) -> list[Candidate]:
                 source="links",
                 view_count=0,
                 upload_date=None,
-                rank_score=9999.0,  # user links always first
+                rank_score=9999.0,
             )
         )
     return out
@@ -210,17 +275,20 @@ def _url_to_id(url: str) -> str:
 
 def discover(cfg: dict[str, Any], history) -> list[Candidate]:
     search_cfg = cfg.get("search", {})
-    keywords = search_cfg.get("keywords") or [
+    keywords = list(search_cfg.get("keywords") or [
         "GTA 6 trailer",
-        "GTA 6 news",
-        "GTA RP funny moments",
-    ]
+        "anime fight scene",
+        "funny viral video",
+    ])
+    # Shuffle keywords so autopilot runs vary
+    random.shuffle(keywords)
     n = int(search_cfg.get("results_per_keyword", 8))
     min_d = float(search_cfg.get("min_source_duration", 15))
     max_d = float(search_cfg.get("max_source_duration", 900))
     sort_by = str(search_cfg.get("sort_by", "recent_views"))
-    max_age = float(search_cfg.get("max_age_days", 90) or 0)
-    prefer_date = sort_by in ("recent", "recent_views")
+    max_age = float(search_cfg.get("max_age_days", 45) or 0)
+    prefer_date = sort_by in ("recent", "recent_views", "smart")
+    use_trending = bool(search_cfg.get("use_trending", True))
 
     seen_ids: set[str] = set()
     candidates: list[Candidate] = []
@@ -231,9 +299,16 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
         seen_ids.add(c.id)
         candidates.append(c)
 
-    for kw in keywords:
+    # Sample a subset of keywords each run for variety
+    k_take = min(len(keywords), max(3, int(search_cfg.get("keywords_per_run", 5))))
+    chosen_kw = keywords[:k_take]
+
+    for kw in chosen_kw:
         print(f"[discover] searching: {kw}")
-        for c in search_youtube(kw, n=n, prefer_date=prefer_date):
+        batch = search_youtube(kw, n=n, prefer_date=prefer_date)
+        if use_trending:
+            batch.extend(search_trending_related(kw, n=max(3, n // 2)))
+        for c in batch:
             if history.seen(c.id) or c.id in seen_ids:
                 continue
             if c.duration is not None and (c.duration < min_d or c.duration > max_d):
@@ -242,12 +317,27 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
                 age = _age_days(c.upload_date)
                 if age is not None and age > max_age:
                     continue
-            c.rank_score = _rank_score(c.view_count, c.upload_date, sort_by)
+            c.rank_score = smart_rank_score(c, sort_by=sort_by)
             seen_ids.add(c.id)
             candidates.append(c)
 
-    # links (score 9999) stay on top; rest by rank_score desc
     links = [c for c in candidates if c.source == "links"]
     searched = [c for c in candidates if c.source != "links"]
     searched.sort(key=lambda c: c.rank_score, reverse=True)
+
+    # Soft random among top tier so autopilot doesn't always pick #1
+    if len(searched) > 3:
+        top_n = min(12, len(searched))
+        head = searched[:top_n]
+        weights = [max(0.05, c.rank_score) for c in head]
+        # Weighted shuffle: repeatedly pick without replacement
+        picked: list[Candidate] = []
+        pool = list(zip(head, weights))
+        while pool:
+            ws = [w for _, w in pool]
+            choice = random.choices(range(len(pool)), weights=ws, k=1)[0]
+            picked.append(pool.pop(choice)[0])
+        searched = picked + searched[top_n:]
+
+    print(f"[discover] {len(links)+len(searched)} candidates after smart rank")
     return links + searched

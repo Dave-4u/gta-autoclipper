@@ -22,6 +22,8 @@ from .discover import Candidate, discover, _url_to_id
 from .download import download_video, probe_duration
 from .edit import probe_clip, render_clip
 from .history import History
+from .niches import list_niche_ids
+from .autopilot import get_state, request_stop, start_autopilot_background
 
 PIPER_VOICES = [
     "en_US-ryan-high",
@@ -423,58 +425,136 @@ def build_app(config_path: str | None = None):
         paths, _ = result_holder.get("out", ([], log.text()))
         yield paths, log.text(), refresh_gallery()
 
-    with gr.Blocks(title="GTA AutoClipper") as demo:
+    niche_ids = list_niche_ids()
+
+    def refresh_gallery_all():
+        root = project_root() / "outputs"
+        paths = []
+        if root.is_dir():
+            for pth in sorted(root.rglob("*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True):
+                if pth.stat().st_size > 1000:
+                    paths.append(str(pth))
+                if len(paths) >= 40:
+                    break
+        return paths
+
+    def on_auto_start(niches, clips_n, max_vids, interval, custom_kw):
+        niches = niches or ["gta6"]
+        custom = [k.strip() for k in (custom_kw or "").replace("\n", ",").split(",") if k.strip()]
+        start_autopilot_background(
+            niches=list(niches),
+            clips_per_niche=int(clips_n or 2),
+            max_videos=int(max_vids or 1),
+            interval_hours=float(interval or 0),
+            custom_keywords=custom or None,
+            config_path=config_path,
+            once=float(interval or 0) <= 0,
+        )
+        return "Autopilot started…", "\n".join(get_state().log_lines[-50:]) or "Starting…"
+
+    def on_auto_stop():
+        request_stop()
+        return "Stop requested…", "\n".join(get_state().log_lines[-80:])
+
+    def on_auto_poll():
+        st = get_state()
+        status = (
+            f"running={st.running} niche={st.current_niche or '-'} "
+            f"produced={len(st.produced)} stop={st.stop_requested}"
+        )
+        return status, "\n".join(st.log_lines[-120:]), refresh_gallery_all(), st.produced[-20:]
+
+    with gr.Blocks(title="AutoClipper") as demo:
         gr.Markdown(
             """
-# GTA AutoClipper
-Free local UI — paste YouTube links or auto-discover GTA 6 clips, then render Shorts-ready vertical videos (voiceover, captions, copyright-safer cuts).
+# AutoClipper
+Free local multi-niche Shorts clipper — smart discovery, catchy headers, intro VO, captions, copyright-safer cuts. Fully automated autopilot available.
 """
         )
-        with gr.Row():
-            with gr.Column(scale=2):
-                urls = gr.Textbox(
-                    label="YouTube / TikTok / Facebook URLs (one per line)",
-                    placeholder="https://www.youtube.com/watch?v=…\nhttps://youtu.be/…",
-                    lines=4,
-                )
-                auto = gr.Checkbox(
-                    label="Auto-discover GTA 6 trending / search (uses config keywords)",
-                    value=False,
-                )
+        with gr.Tabs():
+            with gr.Tab("Manual"):
                 with gr.Row():
-                    voiceover = gr.Checkbox(label="AI voiceover", value=True)
-                    voice = gr.Dropdown(voices, value=default_voice, label="Voice (Piper)")
-                with gr.Row():
-                    captions = gr.Checkbox(label="Burn captions", value=True)
-                    copyright_safe = gr.Checkbox(label="Copyright-safe mode (~18s / zoom / 1.05x)", value=True)
-                with gr.Row():
-                    fast = gr.Checkbox(label="Fast mode (whisper tiny)", value=True)
-                    join_all = gr.Checkbox(label="Join all clips into one video", value=False)
-                with gr.Row():
-                    max_clips = gr.Slider(1, 5, value=2, step=1, label="Clips per video")
-                    max_videos = gr.Slider(1, 3, value=1, step=1, label="Source videos to process")
-                make_btn = gr.Button("Make Clips", variant="primary")
-                open_btn = gr.Button("Open outputs folder")
-                open_status = gr.Textbox(label="Folder", interactive=False)
-            with gr.Column(scale=3):
-                log_box = gr.Textbox(label="Live progress / log", lines=18, interactive=False)
-                gallery = gr.Gallery(
-                    label="Finished clips in outputs/",
-                    columns=3,
-                    height=360,
-                    object_fit="contain",
-                    value=refresh_gallery(),
-                )
-                refresh_btn = gr.Button("Refresh gallery")
-                download_files = gr.Files(label="Download produced clips")
+                    with gr.Column(scale=2):
+                        urls = gr.Textbox(
+                            label="YouTube / TikTok / Facebook URLs (one per line)",
+                            placeholder="https://www.youtube.com/watch?v=…",
+                            lines=4,
+                        )
+                        auto = gr.Checkbox(
+                            label="Auto-discover (trending + search keywords)",
+                            value=False,
+                        )
+                        with gr.Row():
+                            voiceover = gr.Checkbox(label="Commentary AI voiceover", value=True)
+                            voice = gr.Dropdown(voices, value=default_voice, label="Voice (Piper)")
+                        with gr.Row():
+                            captions = gr.Checkbox(label="Burn captions", value=True)
+                            copyright_safe = gr.Checkbox(
+                                label="Copyright-safe mode (~18s / zoom / 1.05x)", value=True
+                            )
+                        with gr.Row():
+                            fast = gr.Checkbox(label="Fast mode (whisper tiny)", value=True)
+                            join_all = gr.Checkbox(label="Join all clips into one video", value=False)
+                        with gr.Row():
+                            max_clips = gr.Slider(1, 5, value=2, step=1, label="Clips per video")
+                            max_videos = gr.Slider(1, 3, value=1, step=1, label="Source videos")
+                        make_btn = gr.Button("Make Clips", variant="primary")
+                        open_btn = gr.Button("Open outputs folder")
+                        open_status = gr.Textbox(label="Folder", interactive=False)
+                    with gr.Column(scale=3):
+                        log_box = gr.Textbox(label="Live progress / log", lines=18, interactive=False)
+                        gallery = gr.Gallery(
+                            label="Finished clips",
+                            columns=3,
+                            height=360,
+                            object_fit="contain",
+                            value=refresh_gallery_all(),
+                        )
+                        refresh_btn = gr.Button("Refresh gallery")
+                        download_files = gr.Files(label="Download produced clips")
 
-        make_btn.click(
-            on_make,
-            inputs=[urls, auto, voiceover, voice, captions, copyright_safe, fast, join_all, max_clips, max_videos],
-            outputs=[download_files, log_box, gallery],
-        )
-        refresh_btn.click(lambda: refresh_gallery(), outputs=[gallery])
-        open_btn.click(on_open_folder, outputs=[open_status])
+                make_btn.click(
+                    on_make,
+                    inputs=[urls, auto, voiceover, voice, captions, copyright_safe, fast, join_all, max_clips, max_videos],
+                    outputs=[download_files, log_box, gallery],
+                )
+                refresh_btn.click(lambda: refresh_gallery_all(), outputs=[gallery])
+                open_btn.click(on_open_folder, outputs=[open_status])
+
+            with gr.Tab("Autopilot"):
+                gr.Markdown(
+                    "Hands-free loop: discover best videos per niche → pick peak moments → "
+                    "catchy header + intro VO → render into `outputs/<niche>/`."
+                )
+                niche_select = gr.CheckboxGroup(
+                    choices=niche_ids,
+                    value=["gta6", "anime"],
+                    label="Niches",
+                )
+                custom_kw = gr.Textbox(
+                    label="Custom keywords (for 'custom' niche, comma-separated)",
+                    placeholder="one piece edit, jjk fight, ...",
+                )
+                with gr.Row():
+                    ap_clips = gr.Slider(1, 5, value=2, step=1, label="Clips per niche")
+                    ap_videos = gr.Slider(1, 3, value=1, step=1, label="Source videos per niche")
+                    ap_interval = gr.Number(value=0, label="Repeat every N hours (0 = once)")
+                with gr.Row():
+                    start_btn = gr.Button("Start Autopilot", variant="primary")
+                    stop_btn = gr.Button("Stop")
+                    poll_btn = gr.Button("Refresh status")
+                ap_status = gr.Textbox(label="Status", interactive=False)
+                ap_log = gr.Textbox(label="Autopilot log", lines=16, interactive=False)
+                ap_gallery = gr.Gallery(label="Autopilot outputs", columns=3, height=320)
+                ap_files = gr.Files(label="Latest produced files")
+
+                start_btn.click(
+                    on_auto_start,
+                    inputs=[niche_select, ap_clips, ap_videos, ap_interval, custom_kw],
+                    outputs=[ap_status, ap_log],
+                )
+                stop_btn.click(on_auto_stop, outputs=[ap_status, ap_log])
+                poll_btn.click(on_auto_poll, outputs=[ap_status, ap_log, ap_gallery, ap_files])
 
     return demo
 

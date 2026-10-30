@@ -1,23 +1,16 @@
-# GTA AutoClipper — tuned for GTA 6 Shorts/TikTok clipping (free, self-hosted)
-# Edit keywords, durations, and paths to taste.
+# AutoClipper — free multi-niche Shorts/TikTok clipper (CPU)
+
+active_niche: gta6  # gta6 | anime | animation | reactions | gaming | funny | movies | custom
 
 search:
-  # yt-dlp search queries. Prefer recent + high-view GTA 6 / GTA RP content.
-  keywords:
-    - "GTA 6 trailer"
-    - "GTA VI trailer reaction"
-    - "GTA 6 news"
-    - "GTA 6 leaks"
-    - "GTA 6 gameplay"
-    - "GTA 6 streamer reaction"
-    - "GTA RP funny moments"
-    - "GTA 5 RP highlights shorts"
-    - "GTA VI rockstar"
+  keywords: []  # filled from niche preset when using --niche / autopilot
   results_per_keyword: 8
+  keywords_per_run: 5
   max_source_duration: 900
   min_source_duration: 15
-  sort_by: recent_views
-  max_age_days: 90
+  sort_by: recent_views  # recent_views | views | recent | smart
+  max_age_days: 45
+  use_trending: true
 
 download:
   links_file: links.txt
@@ -30,7 +23,6 @@ history:
 clips:
   width: 1080
   height: 1920
-  # Copyright-safer defaults: short source windows (see copyright_safe)
   min_duration: 8
   max_duration: 18
   target_duration: 15
@@ -40,7 +32,6 @@ clips:
   font: ""
   output_dir: outputs
   burn_captions: true
-  # Transformative / shorter cuts to reduce Content ID length-limit blocks
   copyright_safe:
     enabled: true
     max_source_seconds: 18
@@ -55,65 +46,50 @@ analysis:
     motion: 0.8
     keyword: 1.5
   transcript_boost_words:
-    - gta 6
-    - gta vi
-    - trailer
-    - leak
-    - rockstar
-    - lucia
-    - leonida
-    - vice city
-    - reaction
-    - oh my god
     - crazy
     - insane
     - wait
     - look
-    - police
-    - chase
-    - crash
-    - fail
-    - funny
+    - oh my god
   use_whisper: true
-  whisper_model: base  # use 'tiny' for faster/low-RAM
+  whisper_model: tiny
   scene_threshold: 27.0
   vocal_prefilter: true
 
 scheduler:
   default_hours: 6
 
+autopilot:
+  niches:
+    - gta6
+    - anime
+  clips_per_niche: 2
+  max_videos: 2
+  interval_hours: 0
+
 hashtags:
-  - "#GTA6"
-  - "#GTAVI"
-  - "#GTA"
-  - "#GTA6Trailer"
-  - "#GTARp"
-  - "#Gaming"
-  - "#GamingClips"
   - "#Shorts"
-  - "#TikTok"
   - "#FYP"
   - "#Viral"
-  - "#RockstarGames"
-  - "#GTA6News"
 
 hooks:
-  # Optional local Ollama for smarter headers (free). Falls back to rules if offline.
   use_ollama: true
   ollama_host: "http://127.0.0.1:11434"
   ollama_model: "llama3.2"
   ollama_timeout: 8
+  pool_size: 16
 
-# Free local AI voiceover (Piper TTS on CPU). Optional edge-tts online fallback.
 voiceover:
   enabled: true
-  engine: piper          # piper | edge-tts | auto
-  voice: en_US-ryan-high # Piper voice (auto-downloads on first run)
+  intro_header: true   # Piper speaks the header for ~1–2s at the start
+  intro_seconds: 1.8
+  engine: piper
+  voice: en_US-ryan-high
   fallback_voice: en_US-lessac-high
   edge_voice: en-US-GuyNeural
   allow_edge_fallback: true
   volume: 1.0
-  duck_level: 0.22       # bed volume when sidechain=false
-  sidechain: true        # duck original under VO via ffmpeg sidechaincompress
+  duck_level: 0.22
+  sidechain: true
   models_dir: models/piper
-  script_style: auto     # auto | hype | commentary | reaction | news
+  script_style: auto

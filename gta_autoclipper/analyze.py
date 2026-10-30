@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -230,23 +231,23 @@ def find_highlights(
     kernel = np.ones(5) / 5.0
     smooth = np.convolve(score, kernel, mode="same")
 
-    # Pick peaks: greedy non-overlapping windows of ~target length
+    # Build many peak windows, then randomly sample varied top moments
     half = target / 2.0
-    candidates: list[Segment] = []
+    pool: list[Segment] = []
     used = np.zeros(n, dtype=bool)
     order = np.argsort(smooth)[::-1]
+    pool_target = max(max_clips * 4, 8)
 
     for idx in order:
-        if len(candidates) >= max_clips:
+        if len(pool) >= pool_target:
             break
         if used[idx]:
             continue
-        if smooth[idx] < 0.05 and len(candidates) > 0:
+        if smooth[idx] < 0.05 and len(pool) > 0:
             break
         start = max(0.0, idx - half)
         end = min(duration, start + target)
         start = max(0.0, end - target)
-        # Clamp to [min_d, max_d]
         length = end - start
         if length < min_d:
             end = min(duration, start + min_d)
@@ -257,7 +258,6 @@ def find_highlights(
             length = max_d
         if length < min_d * 0.8:
             continue
-        # Mark used region with padding
         pad = 3
         for j in range(max(0, int(start) - pad), min(n, int(end) + pad)):
             used[j] = True
@@ -270,12 +270,38 @@ def find_highlights(
             reasons.append("motion")
         if any(s <= idx <= e + 1 for s, e, _ in transcript_hits):
             reasons.append("keyword")
-        candidates.append(
+        # Speech-excitement proxy: loud + keyword together
+        if "loud" in reasons and "keyword" in reasons:
+            reasons.append("hype_speech")
+        pool.append(
             Segment(start=round(start, 2), end=round(end, 2),
                     score=float(smooth[idx]), reason="+".join(reasons) or "peak")
         )
 
-    candidates.sort(key=lambda s: s.start)
+    pool.sort(key=lambda s: s.score, reverse=True)
+    candidates: list[Segment] = []
+    if pool:
+        top = pool[: max(max_clips * 3, max_clips)]
+        weights = [max(0.05, s.score) ** 1.5 for s in top]
+        chosen_idx: set[int] = set()
+        while len(candidates) < max_clips and len(chosen_idx) < len(top):
+            i = random.choices(range(len(top)), weights=weights, k=1)[0]
+            if i in chosen_idx:
+                # try next best unused
+                for j, _ in sorted(enumerate(top), key=lambda x: -x[1].score):
+                    if j not in chosen_idx:
+                        i = j
+                        break
+            chosen_idx.add(i)
+            candidates.append(top[i])
+            # discourage nearby windows already picked
+            for j, seg in enumerate(top):
+                if j in chosen_idx:
+                    continue
+                if abs(seg.start - top[i].start) < target * 0.6:
+                    weights[j] *= 0.15
+        candidates.sort(key=lambda s: s.start)
+        print(f"[analyze] picked {len(candidates)}/{len(pool)} varied peak windows")
 
     # If source is already short vertical-friendly, also offer full (capped)
     if duration <= max_d and not candidates:
