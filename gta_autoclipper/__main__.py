@@ -1,4 +1,4 @@
-"""CLI entry: python -m gta_autoclipper [--once|--every N] [--max-videos N] ..."""
+"""CLI entry: python -m gta_autoclipper [--ui|--once|--every N] ..."""
 
 from __future__ import annotations
 
@@ -98,6 +98,27 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to config.yaml (default: next to package)",
     )
     parser.add_argument(
+        "--ui",
+        action="store_true",
+        help="Launch the free local Gradio web UI in your browser",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="UI bind host (default 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=7860,
+        help="UI port (default 7860)",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="With --ui, do not auto-open a browser tab",
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="Run a single pass and exit (default if --every not set)",
@@ -147,6 +168,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Disable short/zoom/speed transformative defaults",
     )
     args = parser.parse_args(argv)
+
+    if args.ui:
+        from .ui import launch_ui
+
+        launch_ui(
+            config_path=args.config,
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_browser,
+        )
+        return 0
 
     cfg = load_config(args.config)
     if args.links_only:

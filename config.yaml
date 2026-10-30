@@ -39,6 +39,7 @@ clips:
   hook_duration: 2.0
   font: ""
   output_dir: outputs
+  burn_captions: true
   # Transformative / shorter cuts to reduce Content ID length-limit blocks
   copyright_safe:
     enabled: true

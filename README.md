@@ -96,6 +96,35 @@ chmod +x run.sh
 ./run.sh --once --max-videos 1
 ```
 
+
+---
+
+## Web UI (Gradio, free, local)
+
+Double-click **`ui.bat`** (Windows) or run **`./ui.sh`** (Linux). That creates/uses `.venv`, installs deps, and opens **http://127.0.0.1:7860** in your browser.
+
+```bat
+cd %USERPROFILE%\gta-autoclipper
+git pull
+ui.bat
+```
+
+Or from the CLI:
+
+```bat
+run.bat --ui
+```
+
+In the UI you can:
+
+1. Paste one or more YouTube (or TikTok/Facebook) URLs — or tick **Auto-discover** for GTA 6 search keywords from `config.yaml`
+2. Toggle **AI voiceover** (pick a Piper voice), **captions**, **copyright-safe mode**, **fast mode**, **join all clips**
+3. Set how many clips per video / source videos
+4. Click **Make Clips** and watch the live log
+5. Preview finished files in the gallery, download them, or click **Open outputs folder**
+
+The UI never needs a GPU. Keep the terminal/cmd window open while you use it (Ctrl+C to stop).
+
 ---
 
 ## Usage
@@ -189,6 +218,7 @@ gta-autoclipper/
   links.txt            # optional source URLs
   requirements.txt
   run.bat / run.sh
+  ui.bat / ui.sh        # Gradio web UI
   gta_autoclipper/     # Python package
   downloads/           # sources
   outputs/             # finished vertical clips

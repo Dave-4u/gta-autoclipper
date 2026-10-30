@@ -295,6 +295,7 @@ def render_clip(
     use_whisper = ana.get("use_whisper", True)
     vo_cfg = cfg.get("voiceover") or {}
     vo_enabled = bool(vo_cfg.get("enabled", True))
+    burn_captions = bool(clips.get("burn_captions", True))
 
     words: list[dict[str, Any]] = []
     if use_whisper:
@@ -352,8 +353,9 @@ def render_clip(
                 ]
 
         ass_path = td_path / "captions.ass"
+        words_for_burn = caption_words if burn_captions else []
         n_events = _write_ass_captions(
-            caption_words, ass_path, width, height, font_name=font_name
+            words_for_burn, ass_path, width, height, font_name=font_name
         )
         print(f"[edit] ASS events: {n_events}")
         out_path.with_suffix(".ass").write_text(
@@ -385,7 +387,7 @@ def render_clip(
         use_sidechain = bool(vo_cfg.get("sidechain", True))
 
         def run_ffmpeg(use_ass: bool, use_dt_fallback: bool = False) -> bool:
-            dt = _drawtext_caption_fallback(caption_words, font_opt) if use_dt_fallback else ""
+            dt = _drawtext_caption_fallback(words_for_burn if burn_captions else [], font_opt) if use_dt_fallback else ""
             vchain = _video_chain(
                 width=width,
                 height=height,
