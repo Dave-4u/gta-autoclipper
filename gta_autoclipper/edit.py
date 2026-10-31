@@ -108,12 +108,43 @@ def _ts(t: float) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
+
+_PROFANITY = {
+    "fuck": "f***", "fucking": "f***ing", "fucked": "f***ed", "fucker": "f***er",
+    "motherfucking": "m***********", "motherfucker": "m***********",
+    "shit": "s***", "bullshit": "bulls***", "bitch": "b****", "bitches": "b****es",
+    "asshole": "a******", "dick": "d***", "cock": "c***", "pussy": "p****",
+    "cunt": "c***", "nigger": "n*****", "nigga": "n****",
+}
+
+
+def mask_profanity(word: str, *, enabled: bool = True) -> str:
+    """Mask swear tokens for on-screen captions; audio unchanged."""
+    if not enabled or not word:
+        return word
+    # Preserve leading/trailing punctuation
+    m = re.match(r"^(\W*)(.*?)(\W*)$", word, flags=re.UNICODE)
+    if not m:
+        return word
+    lead, core, trail = m.group(1), m.group(2), m.group(3)
+    key = core.lower()
+    if key in _PROFANITY:
+        return f"{lead}{_PROFANITY[key]}{trail}"
+    # mild stemming: fucks, fucker already covered; fuckin
+    for src, dst in list(_PROFANITY.items()):
+        if key.startswith(src) and len(key) <= len(src) + 2:
+            return f"{lead}{dst}{key[len(src):]}{trail}"
+    return word
+
+
 def _write_ass_captions(
     words: list[dict[str, Any]],
     ass_path: Path,
     width: int,
     height: int,
     font_name: str = "DejaVu Sans",
+    *,
+    mask_swears: bool = True,
 ) -> int:
     header = f"""[Script Info]
 ScriptType: v4.00+
@@ -135,6 +166,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         token = (w.get("word") or "").strip()
         if not token:
             continue
+        token = mask_profanity(token, enabled=mask_swears)
         start = float(w["start"])
         end = float(w["end"])
         if end <= start:
@@ -345,6 +377,7 @@ def render_clip(
             # NEVER soft-pass a static logo / flat grey trailer panel
             hard = any(
                 ("static_logo" in str(r)) or ("flat_panel" in str(r)) or ("low_trailer_motion" in str(r))
+                or ("player_ui" in str(r))
                 for r in reasons
             )
             if hard:
@@ -386,6 +419,7 @@ def render_clip(
     vo_cfg = cfg.get("voiceover") or {}
     vo_enabled = bool(vo_cfg.get("enabled", True))
     burn_captions = bool(clips.get("burn_captions", True))
+    mask_swears = bool(clips.get("mask_profanity", True))
 
     niche_id = str(cfg.get("niche_id") or (cfg.get("niche") or {}).get("id") or "gta6")
     words: list[dict[str, Any]] = []
@@ -650,7 +684,7 @@ def render_clip(
         # so we never double-layer VO karaoke over streamer speech.
         words_for_burn = []
         n_events = _write_ass_captions(
-            words_for_burn, ass_path, width, height, font_name=font_name
+            words_for_burn, ass_path, width, height, font_name=font_name, mask_swears=mask_swears
         )
         print(f"[edit] ASS events (pre-final): {n_events}; will whisper final audio")
         out_path.with_suffix(".ass").write_text(
@@ -978,7 +1012,7 @@ def render_clip(
                     final_words = []
                 if final_words:
                     ass2 = td_path / "captions_final.ass"
-                    n2 = _write_ass_captions(final_words, ass2, width, height, font_name=font_name)
+                    n2 = _write_ass_captions(final_words, ass2, width, height, font_name=font_name, mask_swears=mask_swears)
                     print(f"[edit] final-audio whisper captions: {n2} events / {len(final_words)} words")
                     tmp_out = td_path / "reburn.mp4"
                     ass_esc = str(ass2).replace("\\", "/").replace(":", chr(92) + ":")

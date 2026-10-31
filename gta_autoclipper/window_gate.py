@@ -220,6 +220,247 @@ def longest_silence(path: Path, start: float, end: float, **kw: Any) -> float:
 
 
 
+
+
+def _make_pause_play_templates(size: int = 64):
+    """Generate simple white-on-transparent pause bars and play triangle templates."""
+    import numpy as np
+    from PIL import Image, ImageDraw
+    templates = []
+    # Pause: two vertical white bars in dark circle
+    for s in (size, int(size * 0.75), int(size * 1.25)):
+        im = Image.new("L", (s, s), 0)
+        d = ImageDraw.Draw(im)
+        # dark circle
+        d.ellipse([2, 2, s - 3, s - 3], fill=40)
+        bar_w = max(2, s // 8)
+        gap = max(2, s // 10)
+        h = int(s * 0.45)
+        y0 = (s - h) // 2
+        x1 = s // 2 - gap - bar_w
+        x2 = s // 2 + gap
+        d.rectangle([x1, y0, x1 + bar_w, y0 + h], fill=255)
+        d.rectangle([x2, y0, x2 + bar_w, y0 + h], fill=255)
+        templates.append(("pause", np.array(im, dtype=np.float32)))
+        # Play triangle
+        im2 = Image.new("L", (s, s), 0)
+        d2 = ImageDraw.Draw(im2)
+        d2.ellipse([2, 2, s - 3, s - 3], fill=40)
+        pad = s // 4
+        d2.polygon([(pad, pad), (pad, s - pad), (s - pad // 2, s // 2)], fill=255)
+        templates.append(("play", np.array(im2, dtype=np.float32)))
+    return templates
+
+
+def _center_glyph_score(gray_center) -> dict:
+    """Heuristic: bright white glyph on darker disk near center."""
+    import numpy as np
+    g = gray_center.astype(np.float32)
+    h, w = g.shape[:2]
+    cy, cx = h // 2, w // 2
+    yy, xx = np.ogrid[:h, :w]
+    r = min(h, w) * 0.35
+    disk = (yy - cy) ** 2 + (xx - cx) ** 2 <= r ** 2
+    ring = ((yy - cy) ** 2 + (xx - cx) ** 2 <= (r * 1.35) ** 2) & ~disk
+    if disk.sum() < 20:
+        return {"score": 0.0, "bright_frac": 0.0, "disk_mean": 0.0, "ring_mean": 0.0}
+    disk_vals = g[disk]
+    ring_vals = g[ring] if ring.any() else disk_vals
+    bright = float((disk_vals > 180).mean())
+    disk_mean = float(disk_vals.mean())
+    ring_mean = float(ring_vals.mean())
+    # Pause/play: bright bars/triangle on semi-dark circle → disk not too bright overall,
+    # but has high-contrast white pixels; ring similar or slightly brighter/darker.
+    contrast = disk_mean - ring_mean
+    score = bright * 3.0 + max(0.0, 0.15 - abs(contrast) / 255.0) * bright
+    # Two-bar vertical structure proxy: left/right mid columns brighter than center column
+    mid = g[int(h * 0.3):int(h * 0.7), int(w * 0.35):int(w * 0.65)]
+    if mid.size > 10:
+        cols = mid.mean(axis=0)
+        third = max(1, len(cols) // 3)
+        left, cen, right = cols[:third].mean(), cols[third:2 * third].mean(), cols[2 * third:].mean()
+        if left > cen + 15 and right > cen + 15 and (left + right) / 2 > 140:
+            score += 0.8  # pause bars signature
+    return {"score": float(score), "bright_frac": bright, "disk_mean": disk_mean, "ring_mean": ring_mean}
+
+
+def player_ui_visible(
+    path: Path,
+    start: float,
+    end: float,
+    game_box: tuple[float, float, float, float] = (0.28, 0.05, 0.50, 0.90),
+    *,
+    n_samples: int = 10,
+    cfg: dict[str, Any] | None = None,
+    use_gemini: bool = True,
+) -> dict[str, Any]:
+    """Detect YouTube/player play/pause overlay or progress bar in the game crop.
+
+    Template-match + center glyph heuristic; optional Gemini confirm on flagged frames.
+    """
+    import numpy as np
+    from PIL import Image
+
+    gx, gy, gw, gh = game_box
+    dur = max(0.5, float(end) - float(start))
+    templates = _make_pause_play_templates(64)
+    hits = []
+    gemini_yes = False
+    gemini_raw = ""
+    flagged_paths: list[Path] = []
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        times = [start + dur * (i + 0.5) / n_samples for i in range(n_samples)]
+        for i, t in enumerate(times):
+            out = td_path / f"g{i:02d}.png"
+            vf = f"crop=iw*{gw}:ih*{gh}:iw*{gx}:ih*{gy},scale=480:-2"
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", f"{t:.2f}", "-i", str(path),
+                 "-frames:v", "1", "-vf", vf, "-q:v", "3", str(out)],
+                capture_output=True, check=False,
+            )
+            if not out.is_file():
+                continue
+            im = np.array(Image.open(out).convert("RGB"))
+            gray = np.array(Image.open(out).convert("L"), dtype=np.float32)
+            h, w = gray.shape
+            # Wide mid band — YouTube ||/> often sits left-of-center, not dead center
+            y0, y1 = int(h * 0.22), int(h * 0.78)
+            x0, x1 = int(w * 0.12), int(w * 0.88)
+            center = gray[y0:y1, x0:x1]
+            glyph = _center_glyph_score(center)
+            # Template match via normalized cross-correlation (numpy)
+            best_tm = 0.0
+            best_kind = ""
+            for kind, tmpl in templates:
+                th, tw = tmpl.shape
+                if center.shape[0] < th or center.shape[1] < tw:
+                    continue
+                # coarse slide
+                step = max(2, min(th, tw) // 8)
+                c = center
+                # normalize template
+                tn = tmpl - tmpl.mean()
+                tnorm = np.sqrt((tn ** 2).sum()) + 1e-6
+                for yy in range(0, c.shape[0] - th + 1, step):
+                    for xx in range(0, c.shape[1] - tw + 1, step):
+                        patch = c[yy:yy + th, xx:xx + tw]
+                        pn = patch - patch.mean()
+                        pnorm = np.sqrt((pn ** 2).sum()) + 1e-6
+                        corr = float((tn * pn).sum() / (tnorm * pnorm))
+                        if corr > best_tm:
+                            best_tm = corr
+                            best_kind = kind
+            # Bottom progress-bar band: thin bright horizontal line
+            bot = gray[int(h * 0.88):, :]
+            prog = False
+            if bot.size > 0:
+                row_means = bot.mean(axis=1)
+                # a bright thin row among darker neighbors
+                if row_means.max() > 160 and (row_means.max() - np.median(row_means)) > 40:
+                    prog = True
+            # Pause bars signature: scan center + left-center + right-center strips
+            pause_bars = False
+            strips = [
+                center,
+                gray[y0:y1, int(w * 0.08):int(w * 0.50)],
+                gray[y0:y1, int(w * 0.35):int(w * 0.78)],
+            ]
+            for strip in strips:
+                if strip.size < 40:
+                    continue
+                mid = strip[int(strip.shape[0] * 0.28):int(strip.shape[0] * 0.72), :]
+                if mid.size < 30:
+                    continue
+                cols = mid.mean(axis=0)
+                # sliding window looking for || ridges
+                win = max(12, len(cols) // 5)
+                for i0 in range(0, max(1, len(cols) - win), max(2, win // 4)):
+                    seg = cols[i0:i0 + win]
+                    third = max(1, len(seg) // 3)
+                    left, cen, right = float(seg[:third].mean()), float(seg[third:2 * third].mean()), float(seg[2 * third:].mean())
+                    if left > cen + 25 and right > cen + 25 and left > 140 and right > 140 and cen < 160:
+                        pause_bars = True
+                        break
+                if pause_bars:
+                    break
+            # Dark translucent disk around center (YouTube overlay)
+            disk_dark = glyph["disk_mean"] < 90 and glyph["bright_frac"] > 0.04
+            strong_tm = best_tm >= 0.72
+            flagged = pause_bars or (disk_dark and glyph["bright_frac"] > 0.08) or (strong_tm and glyph["score"] >= 0.4) or prog
+            if flagged:
+                hits.append({
+                    "t": t, "corr": best_tm, "kind": best_kind,
+                    "glyph": glyph["score"], "progress": prog, "pause_bars": pause_bars,
+                })
+                if len(flagged_paths) < 4:
+                    keep = td_path / f"flag{len(flagged_paths)}.png"
+                    Image.fromarray(im).save(keep)
+                    flagged_paths.append(keep)
+
+        # Always ask Gemini on early/mid/late frames (off-center || often misses CV)
+        if use_gemini:
+            mid_png = sorted(td_path.glob("g*.png"))
+            if mid_png:
+                picks = []
+                for idx in (0, len(mid_png)//2, len(mid_png)-1):
+                    if mid_png[idx] not in picks:
+                        picks.append(mid_png[idx])
+                # Prefer flagged; fill with span samples up to 4
+                for p in picks:
+                    if p not in flagged_paths and len(flagged_paths) < 4:
+                        flagged_paths.append(p)
+
+        if use_gemini and flagged_paths:
+            try:
+                from .gemini_client import generate, has_gemini
+                if has_gemini(cfg):
+                    prompt = (
+                        "These crops are the CENTER of a streamer's game/trailer panel.\n"
+                        "Answer EXACTLY:\n"
+                        "PLAYER_UI: yes OR no\n"
+                        "DESC: <one short sentence>\n"
+                        "PLAYER_UI=yes ONLY if you see a YouTube/Vimeo-style overlay: "
+                        "a large semi-transparent dark circle with white pause bars (||) or a play triangle (>), "
+                        "or a horizontal video scrub/progress bar across the footage.\n"
+                        "PLAYER_UI=no for: streamer face-cam PiP, live chat, sub counters, mouse cursor, "
+                        "game logos/title cards, Rockstar watermarks, in-game HUD."
+                    )
+                    gemini_raw = generate(prompt=prompt, images=flagged_paths, cfg=cfg) or ""
+                    # ANY crop with PLAYER_UI: yes → visible (do not let a later "no" overwrite)
+                    for ln in gemini_raw.splitlines():
+                        low = ln.strip().lower()
+                        if "player_ui:" in low:
+                            ans = low.split("player_ui:", 1)[1].strip()
+                            if ans.startswith("y"):
+                                gemini_yes = True
+                                break
+                    if not gemini_yes:
+                        # fallback: single-line answers
+                        for ln in gemini_raw.splitlines():
+                            if ln.strip().lower().startswith("player_ui:"):
+                                gemini_yes = ln.split(":", 1)[1].strip().lower().startswith("y")
+            except Exception as e:
+                gemini_raw = str(e)[:160]
+
+    pause_hit = any(h.get("pause_bars") for h in hits)
+    # Hard yes: pause-bar geometry OR Gemini yes (prompt excludes stream chrome / logos).
+    # Gemini clear-no overrides weak template-only matches.
+    visible = bool(pause_hit or gemini_yes)
+    if not visible and len(hits) >= 3 and any(h.get("corr", 0) >= 0.78 for h in hits):
+        visible = True
+    if gemini_raw and (not gemini_yes) and (not pause_hit):
+        visible = False
+    return {
+        "ok": not visible,
+        "visible": visible,
+        "n_hits": len(hits),
+        "hits": hits[:6],
+        "gemini_yes": gemini_yes,
+        "gemini_raw": (gemini_raw or "")[:300],
+    }
+
+
 def speech_coverage(
     path: Path,
     start: float,
@@ -322,6 +563,11 @@ def window_ok(
     except Exception as e:
         print(f"[window-gate] panel stability skip: {e}")
         stab = {"jump": 0.0, "means": [], "ok": True}
+    ui = {"ok": True, "visible": False, "n_hits": 0}
+    try:
+        ui = player_ui_visible(path, start, end, box, cfg=None, use_gemini=True)
+    except Exception as e:
+        print(f"[window-gate] player_ui skip: {e}")
     # Trailer motion: streamers often pause to talk — allow near-static trailer
     # when speech is strong AND the game panel stays stable (not face-cam grey).
     min_motion = 6.0
@@ -336,6 +582,8 @@ def window_ok(
         reasons.append(f"game_frozen_{freeze:.1f}s")
     if not stab.get("ok", True):
         reasons.extend(stab.get("reasons") or [f"trailer_bad_jump_{stab.get('jump', 0):.0f}"])
+    if ui.get("visible"):
+        reasons.append(f"player_ui_hits_{ui.get('n_hits', 0)}")
     if sil > max_silence_s and speech["coverage"] < 0.15:
         reasons.append(f"silence_{sil:.1f}s")
     if require_speech and speech["coverage"] < min_speech_coverage:
@@ -354,6 +602,8 @@ def window_ok(
         "motion": motion,
         "silence_s": sil,
         "speech_coverage": speech["coverage"],
+        "player_ui": ui,
+        "player_ui_visible": bool(ui.get("visible")),
         "n_words": speech["n_words"],
         "sample_words": speech["words"][:12],
         "reasons": reasons,

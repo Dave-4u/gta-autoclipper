@@ -54,6 +54,14 @@ GTA6_TRAILER_LINES = (
     "the next grand theft auto",
     "grand theft auto six",
     "grand theft auto vi",
+    "coming november 19th",
+    "coming november",
+    "pre-order now",
+    "november 19th",
+    "ready and premature",  # whisper garble of trailer end-card VO
+    "end prematurely",
+    "their daughter says",
+    "daughter of six",
 )
 
 def _norm_caption_text(text: str) -> str:
@@ -198,7 +206,7 @@ def _segment_ok(
     *,
     niche_id: str | None = None,
     min_avg_logprob: float = -0.85,
-    max_no_speech: float = 0.50,
+    max_no_speech: float = 0.40,
     max_compression: float = 2.2,
 ) -> bool:
     """Quality gate for a faster-whisper segment."""
@@ -285,7 +293,7 @@ def _transcribe_wav(
         word_timestamps=True,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=400),
-        no_speech_threshold=0.55,
+        no_speech_threshold=0.45,
         compression_ratio_threshold=2.2,
         log_prob_threshold=-0.65,
         condition_on_previous_text=False,

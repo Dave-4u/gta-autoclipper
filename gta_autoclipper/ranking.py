@@ -676,7 +676,7 @@ def _ensure_part_captions(
         print(f"[ranking] WARN {label or clip.name}: no caption words after whisper")
         return clip
     ass2 = work / f"{clip.stem}_rankcaps.ass"
-    n2 = _write_ass_captions(words, ass2, 1080, 1920)
+    n2 = _write_ass_captions(words, ass2, 1080, 1920, mask_swears=bool((cfg.get("clips") or {}).get("mask_profanity", True)))
     print(f"[ranking] burned {n2} Dialogue events onto {label or clip.name} ({len(words)} words)")
     out = work / f"{clip.stem}_captioned.mp4"
     ass_esc = str(ass2).replace("\\", "/").replace(":", chr(92) + ":")

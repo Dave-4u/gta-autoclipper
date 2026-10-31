@@ -26,6 +26,7 @@ clips:
   font: ''
   output_dir: outputs
   burn_captions: true
+  mask_profanity: true
   copyright_safe:
     enabled: true
     max_source_seconds: 18
