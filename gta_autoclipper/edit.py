@@ -411,13 +411,45 @@ def render_clip(
     from .scene_vlm import describe_moment, self_review, confirm_reaction_moment
     from .write_llm import write_header_vo
     from .hooks import HookResult
-    from .face_layout import detect_at_segment, split_filter_complex
-
-    # Face-cam split for reaction niches
+    
+    # Layout: Gemini bboxes > detected face split > fill-crop (no letterbox)
+    from .face_layout import (
+        detect_at_segment, split_filter_complex, layout_from_gemini, fill_crop_filter,
+    )
     face_layout = None
     split_base = None
     is_reactionish = niche_id in {"gta6", "reactions"} or "react" in (title or "").lower()
-    if is_reactionish:
+    gem_layout = meta.get("gemini_layout") or {}
+    if gem_layout.get("face_bbox") and gem_layout.get("game_bbox"):
+        face_layout = layout_from_gemini(gem_layout)
+        if face_layout.face and face_layout.game:
+            split_base = split_filter_complex(
+                face_layout, width=width, height=height, speed=speed, out_label="base",
+            )
+            print(f"[layout] gemini split face={face_layout.face} game={face_layout.game}")
+        else:
+            split_base = fill_crop_filter(width=width, height=height, speed=speed, zoom=1.15, out_label="base")
+            print("[layout] gemini bboxes invalid — fill crop")
+    elif gem_layout.get("layout") == "multi_cam" or gem_layout.get("use_fill_crop"):
+        # Zoom toward face center if we have it
+        cx = cy = 0.5
+        fb = gem_layout.get("face_bbox")
+        if isinstance(fb, (list, tuple)) and len(fb) == 4:
+            cx = float(fb[0]) + float(fb[2]) / 2
+            cy = float(fb[1]) + float(fb[3]) / 2
+        split_base = fill_crop_filter(width=width, height=height, speed=speed, zoom=1.2, out_label="base", cx=cx, cy=cy)
+        print(f"[layout] multi_cam fill-crop center=({cx:.2f},{cy:.2f})")
+    elif gem_layout.get("face_bbox") or gem_layout.get("game_bbox"):
+        face_layout = layout_from_gemini(gem_layout)
+        if face_layout.face and face_layout.game:
+            split_base = split_filter_complex(
+                face_layout, width=width, height=height, speed=speed, out_label="base",
+            )
+            print(f"[layout] gemini split face={face_layout.face} game={face_layout.game}")
+        else:
+            split_base = fill_crop_filter(width=width, height=height, speed=speed, zoom=1.12, out_label="base")
+            print("[layout] gemini incomplete — fill crop")
+    elif is_reactionish:
         try:
             face_layout = detect_at_segment(source, segment.start, segment.end)
             if face_layout and face_layout.face:
@@ -426,9 +458,15 @@ def render_clip(
                 )
                 print(f"[layout] face_cam={face_layout.face} chat={face_layout.chat_side} split={bool(split_base)}")
             else:
-                print("[layout] no face-cam detected — default framing")
+                split_base = fill_crop_filter(width=width, height=height, speed=speed, zoom=1.12, out_label="base")
+                print("[layout] no face-cam — fill crop")
         except Exception as e:
             print(f"[layout] detect failed: {e}")
+            split_base = fill_crop_filter(width=width, height=height, speed=speed, zoom=1.12, out_label="base")
+    else:
+        # anime / gameplay: full-height crop-to-fill, never letterbox band
+        split_base = fill_crop_filter(width=width, height=height, speed=speed, zoom=1.14, out_label="base")
+        print("[layout] fill-crop for non-reaction niche")
 
     # Gate: require trailer + strong reaction for reaction niches
     reaction_meta = {"ok": True, "emotion": str(meta.get("gate_emotion") or ""), "desc": str(meta.get("gate_desc") or "")}
@@ -519,17 +557,20 @@ def render_clip(
 
         intro_cfg_on = bool(vo_cfg.get("intro_header", True))
         intro_dur = float(vo_cfg.get("intro_seconds", 1.8))
-        if intro_cfg_on and hook_res.text:
+        # Drop robotic intro when we already have a punchy commentary VO
+        if intro_cfg_on and hook_res.text and not llm_vo:
             intro_wav = td_path / "intro.wav"
             intro_result = make_intro_vo(hook_res.text, cfg, intro_wav)
-            if intro_result.wav_path and intro_result.wav_path.is_file():
-                # Cap spoken intro conceptually; actual wav may be shorter/longer
+            if intro_result and intro_result.wav_path and intro_result.wav_path.is_file():
                 try:
                     import wave
                     with wave.open(str(intro_result.wav_path), "rb") as w:
                         intro_dur = min(2.2, max(0.9, w.getnframes() / float(w.getframerate() or 1)))
                 except Exception:
                     intro_dur = min(2.0, max(1.0, intro_dur))
+        elif intro_cfg_on and llm_vo:
+            print("[intro-vo] skipped — commentary VO present")
+            intro_dur = 0.0
 
         # Captions start AFTER intro VO (header already shows the spoken intro).
         # Never burn intro VO words as bottom karaoke while the header is up.
@@ -541,8 +582,9 @@ def render_clip(
             if llm_vo:
                 from .voiceover import _synthesize_with_fallback, VoiceoverResult, _estimate_words, _wav_duration, _punctuate_for_speech
                 from .entities import normalize_pronunciation
-                line = llm_vo
-                # Apply Gemini SAY phonetic hints first
+                display_line = _punctuate_for_speech(llm_vo)
+                speak_line = display_line
+                # Phonetics for TTS only — captions keep readable spelling
                 if llm_say and llm_say.lower() != "none":
                     import re as _re
                     for part in llm_say.split(","):
@@ -550,38 +592,54 @@ def render_clip(
                             a, b = part.split("=", 1)
                             a, b = a.strip(), b.strip()
                             if a and b:
-                                line = _re.sub(_re.escape(a), b, line, flags=_re.I)
-                line = _punctuate_for_speech(normalize_pronunciation(line))
-                path_v, engine_v, voice_v = _synthesize_with_fallback(line, vo_wav, cfg, niche_id)
+                                speak_line = _re.sub(_re.escape(a), b, speak_line, flags=_re.I)
+                speak_line = normalize_pronunciation(speak_line)
+                path_v, engine_v, voice_v = _synthesize_with_fallback(speak_line, vo_wav, cfg, niche_id)
                 if path_v:
                     dur_v = _wav_duration(path_v)
                     vo_result = VoiceoverResult(
-                        text=line, style="llm", via="llm", wav_path=path_v,
-                        words=_estimate_words(line, dur_v), engine=engine_v, voice=voice_v,
+                        text=display_line, style="llm", via="llm", wav_path=path_v,
+                        words=_estimate_words(display_line, dur_v), engine=engine_v, voice=voice_v,
                     )
-                    print(f"[voiceover] llm line: {line}")
+                    print(f"[voiceover] llm line: {display_line} (tts={speak_line!r})")
                 else:
                     vo_result = None
             else:
                 print("[voiceover] skip commentary VO (nothing real to add)")
                 vo_result = None
+            # Align captions to where VO actually plays (payoff window if no intro)
+            clip_len_est = max(0.5, float(segment.end - segment.start) / max(speed, 0.5))
+            if vo_result and vo_result.words:
+                vo_dur = max((float(w["end"]) for w in vo_result.words), default=1.5)
+            elif vo_result and vo_result.text:
+                vo_dur = max(1.0, 0.32 * len(vo_result.text.split()))
+            else:
+                vo_dur = 1.5
+            if intro_result and intro_result.wav_path:
+                cap_shift = shift
+            else:
+                cap_shift = max(0.3, clip_len_est - vo_dur - 0.35)
+                print(f"[edit] caption/VO shift to payoff @{cap_shift:.2f}s")
             if vo_result and vo_result.words:
                 caption_words = [
                     {
                         "word": w["word"],
-                        "start": float(w["start"]) + shift,
-                        "end": float(w["end"]) + shift,
+                        "start": float(w["start"]) + cap_shift,
+                        "end": float(w["end"]) + cap_shift,
                     }
                     for w in vo_result.words
                 ]
             elif vo_result and vo_result.text:
+                # Even spacing from estimated VO duration (not fixed 0.35s which desyncs)
+                toks = vo_result.text.split()[:24]
+                step = max(0.18, vo_dur / max(1, len(toks)))
                 caption_words = [
                     {
                         "word": tok,
-                        "start": shift + 0.2 + i * 0.35,
-                        "end": shift + 0.55 + i * 0.35,
+                        "start": cap_shift + i * step,
+                        "end": cap_shift + (i + 0.85) * step,
                     }
-                    for i, tok in enumerate(vo_result.text.split()[:24])
+                    for i, tok in enumerate(toks)
                 ]
             else:
                 caption_words = []
@@ -879,14 +937,20 @@ def render_clip(
     except Exception:
         pass
 
-    # Self-review gate — never ship a clip that fails VLM header match / blank face
+    # Final VIDEO gate — upload rendered clip; require score >= 7
     try:
-        review = self_review(
-            out_path, hook_res.text, start=0.0, end=None,
-            cfg=cfg, title=title, transcript=snippet,
+        from .video_vlm import final_gate_video
+        review = final_gate_video(
+            out_path,
+            header=hook_res.text,
+            vo=(vo_result.text if vo_result else ""),
+            niche_id=niche_id,
+            title=title,
+            cfg=cfg,
+            min_score=7.0,
         )
-        print(f"[review] ok={review.get('ok')} reasons={review.get('reasons')} "
-              f"desc={str(review.get('desc',''))[:160]}")
+        print(f"[review] score={review.get('score')} ok={review.get('ok')} "
+              f"reasons={review.get('reasons')} desc={str(review.get('desc',''))[:160]}")
         rev_path = out_path.with_suffix(".review.json")
         rev_path.write_text(__import__("json").dumps(review, indent=2), encoding="utf-8")
         if not review.get("ok"):
@@ -897,7 +961,12 @@ def render_clip(
                 pass
             return None
     except Exception as e:
-        print(f"[review] error (allowing clip): {e}")
+        print(f"[review] error (discarding): {e}")
+        try:
+            out_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
 
     return out_path
 

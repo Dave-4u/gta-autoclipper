@@ -240,3 +240,46 @@ def detect_at_segment(path: Path, start: float, end: float) -> FaceCamLayout:
         if lay.face and (best is None or (lay.face[2] * lay.face[3]) > (best.face[2] * best.face[3] if best.face else 0)):
             best = lay
     return best or FaceCamLayout(None, None, None, 0)
+
+
+def layout_from_gemini(data: dict) -> FaceCamLayout:
+    """Build layout from Gemini JSON bboxes."""
+    def box(key):
+        b = (data or {}).get(key)
+        if not (isinstance(b, (list, tuple)) and len(b) == 4):
+            return None
+        try:
+            x, y, w, h = [float(v) for v in b]
+        except Exception:
+            return None
+        if w <= 0.05 or h <= 0.05:
+            return None
+        x, y = max(0.0, min(0.95, x)), max(0.0, min(0.95, y))
+        w, h = max(0.08, min(1.0 - x, w)), max(0.08, min(1.0 - y, h))
+        return (x, y, w, h)
+    face, game = box("face_bbox"), box("game_bbox")
+    return FaceCamLayout(face=face, game=game, chat_side=None, faces_found=1 if face else 0)
+
+
+def fill_crop_filter(
+    *,
+    width: int = 1080,
+    height: int = 1920,
+    speed: float = 1.0,
+    zoom: float = 1.12,
+    in_label: str = "0:v",
+    out_label: str = "base",
+    cx: float = 0.5,
+    cy: float = 0.5,
+) -> str:
+    """9:16 crop-to-fill (no letterbox/blur bars). Optional center bias cx/cy 0-1."""
+    z = max(1.05, float(zoom))
+    speed = max(0.5, min(2.0, float(speed)))
+    # Scale to cover, then crop centered (with optional bias via crop x/y expressions)
+    # Use force_original_aspect_ratio=increase then crop
+    return (
+        f"[{in_label}]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},scale=iw*{z}:ih*{z},"
+        f"crop={width}:{height}:(iw-{width})/2:(ih-{height})/2,"
+        f"setpts=PTS/{speed}[{out_label}]"
+    )

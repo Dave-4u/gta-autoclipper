@@ -135,3 +135,96 @@ def generate(
                 print(f"[gemini] backoff {sleep_s:.1f}s ({last_err[:100]})")
                 time.sleep(sleep_s)
     raise RuntimeError(f"gemini_failed:{last_err[:200]}")
+
+
+def generate_video(
+    *,
+    prompt: str,
+    video_path: Path,
+    cfg: dict[str, Any] | None = None,
+    model: str | None = None,
+    max_retries: int = 4,
+    max_output_tokens: int = 500,
+) -> str:
+    """Upload a video via Files API and generate content (free-tier friendly)."""
+    api_key = resolve_api_key(cfg)
+    if not api_key:
+        raise RuntimeError("no_gemini_key")
+    preferred = model or str(((cfg or {}).get("gemini") or {}).get("model") or DEFAULT_MODEL)
+    models = [preferred] + [m for m in FALLBACK_MODELS if m != preferred]
+    from google.genai import types
+
+    client = _client(api_key)
+    video_path = Path(video_path)
+    if not video_path.is_file():
+        raise FileNotFoundError(str(video_path))
+
+    uploaded = None
+    last_err = ""
+    try:
+        uploaded = client.files.upload(file=video_path)
+        # Wait until ACTIVE
+        for _ in range(40):
+            meta = client.files.get(name=uploaded.name)
+            state = str(getattr(meta, "state", "") or "")
+            if "ACTIVE" in state:
+                uploaded = meta
+                break
+            if "FAILED" in state:
+                raise RuntimeError(f"file_upload_failed:{state}")
+            time.sleep(1.5)
+        else:
+            raise RuntimeError("file_upload_timeout")
+
+        mime = getattr(uploaded, "mime_type", None) or "video/mp4"
+        uri = getattr(uploaded, "uri", None)
+        if not uri:
+            raise RuntimeError("no_file_uri")
+
+        contents = [types.Content(role="user", parts=[
+            types.Part.from_uri(file_uri=uri, mime_type=mime),
+            types.Part.from_text(text=prompt),
+        ])]
+
+        for model_name in models:
+            for attempt in range(max_retries):
+                try:
+                    resp = client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            temperature=0.2, max_output_tokens=max_output_tokens,
+                        ),
+                    )
+                    text = (getattr(resp, "text", None) or "").strip()
+                    if not text and getattr(resp, "candidates", None):
+                        chunks = []
+                        for c in resp.candidates or []:
+                            content = getattr(c, "content", None)
+                            for part in getattr(content, "parts", None) or []:
+                                tt = getattr(part, "text", None)
+                                if tt:
+                                    chunks.append(tt)
+                        text = "\n".join(chunks).strip()
+                    if model_name != preferred:
+                        print(f"[gemini] video used fallback {model_name}")
+                    return text
+                except Exception as e:
+                    last_err = str(e)
+                    msg = last_err.lower()
+                    if any(x in msg for x in ("per day", "not found", "no longer available")):
+                        print(f"[gemini] video switch model: {last_err[:120]}")
+                        break
+                    retryable = any(x in msg for x in ("429", "rate", "quota", "resource exhausted", "503", "unavailable"))
+                    if not retryable or attempt >= max_retries - 1:
+                        break
+                    sleep_s = min(45.0, (2 ** attempt) + random.uniform(0, 0.4))
+                    print(f"[gemini] video backoff {sleep_s:.1f}s")
+                    time.sleep(sleep_s)
+        raise RuntimeError(f"gemini_video_failed:{last_err[:200]}")
+    finally:
+        if uploaded is not None:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:
+                pass

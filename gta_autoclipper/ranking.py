@@ -271,9 +271,17 @@ def smart_rank_label(
                         show = "GTA 6"
                     return f"{show} {kind}"[:28]
                 return f"{kind} reaction"
+        if channel and channel.strip() and channel.strip().lower() not in {
+            "streamer", "reactor", "live", "gaming", "reacts", "reaction",
+        }:
+            return channel.strip()[:28]
+        # Known alias scan in title/channel
+        for alias, canon in STREAMER_ALIASES:
+            if alias in title_l or alias in (channel or "").lower():
+                return canon[:28]
         if es.franchises and any(f.startswith("gta") for f in es.franchises):
             return "GTA 6 reaction"
-        return "Streamer reaction"
+        return "Reaction"
 
     # Franchise + content type
     if es.franchises:
@@ -504,17 +512,18 @@ def _render_title_card(
             f"scale={width}:{height}:force_original_aspect_ratio=increase,"
             f"crop={width}:{height},gblur=sigma=18,eq=brightness=-0.08:saturation=0.85,{draw}"
         )
+        # Always mute source footage on title card (avoid stray chat audio)
         cmd = ["ffmpeg", "-y", "-ss", f"{max(0.0, footage_t):.2f}", "-t", f"{dur:.2f}",
                "-i", str(footage)]
         if vo_path:
             cmd += ["-i", str(vo_path)]
-        cmd += ["-vf", vf, "-t", f"{dur:.2f}",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30"]
-        if vo_path:
-            cmd += ["-c:a", "aac", "-shortest"]
+            cmd += ["-map", "0:v:0", "-map", "1:a:0"]
         else:
-            cmd += ["-an"]
-        cmd.append(str(card))
+            cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
+            cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+        cmd += ["-vf", vf, "-t", f"{dur:.2f}",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:a", "aac", "-shortest", str(card)]
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode == 0 and card.is_file():
             return card, vo_path
