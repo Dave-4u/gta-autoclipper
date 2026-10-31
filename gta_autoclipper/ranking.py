@@ -496,7 +496,7 @@ def _render_title_card(
     width = int((cfg.get("clips") or {}).get("width", 1080))
     height = int((cfg.get("clips") or {}).get("height", 1920))
     card = out_wav_dir / "title_card.mp4"
-    topic_fit = _fit_header(topic, 40)
+    topic_fit = _fit_header(topic, 56)
     topic_esc = _escape_drawtext(topic_fit)
     vo_wav = out_wav_dir / "topic_intro.wav"
     intro = make_intro_vo(topic_fit, cfg, vo_wav)
@@ -509,11 +509,11 @@ def _render_title_card(
                 dur = max(2.5, min(4.5, w.getnframes() / float(w.getframerate() or 1) + 0.4))
         except Exception:
             pass
-    # TikTok-style: huge bold title — wrap by ~14-char lines so nothing clips
+    # Huge centered title: fill ~60–70% of frame width, 2–3 bold outlined lines
     words = topic_fit.split()
     lines: list[str] = []
     cur: list[str] = []
-    max_chars = 14
+    max_chars = 16  # ~3 lines for "Top 5 hardest anime fight moments"
     for w in words:
         trial = (" ".join(cur + [w])).strip()
         if cur and len(trial) > max_chars:
@@ -525,21 +525,21 @@ def _render_title_card(
         lines.append(" ".join(cur))
     if not lines:
         lines = [topic_fit]
-    # Prefer 2–3 lines; bump fontsize when short
-    fs = 108 if len(lines) >= 3 else (118 if len(lines) == 2 else 128)
-    # If any line still too long for 1080 @ fs (~0.55*fs per glyph), drop fs
-    longest = max(len(L) for L in lines)
-    while longest * fs * 0.55 > 1000 and fs > 72:
-        fs -= 4
+    lines = lines[:3]
+    # Target text width ≈ 0.68 * 1080; glyph width ≈ 0.62*fs for bold
+    longest = max(len(L) for L in lines) or 1
+    fs = int(0.68 * width / max(0.62 * longest, 1))
+    fs = max(96, min(160, fs))
     parts = []
-    line_h = int(fs * 1.2)
-    base_y = int(1920 * (0.40 - 0.055 * (len(lines) - 1)))
+    line_h = int(fs * 1.22)
+    total_h = line_h * len(lines)
+    base_y = int((height - total_h) / 2)
     for i, line in enumerate(lines):
         esc = _escape_drawtext(line)
         y = base_y + i * line_h
         parts.append(
-            f"drawtext=text='{esc}':fontsize={fs}:fontcolor=yellow:borderw=14:bordercolor=black:"
-            f"shadowx=3:shadowy=3:shadowcolor=black@0.85:x=(w-text_w)/2:y={y}"
+            f"drawtext=text='{esc}':fontsize={fs}:fontcolor=yellow:borderw=16:bordercolor=black:"
+            f"shadowx=4:shadowy=4:shadowcolor=black@0.9:x=(w-text_w)/2:y={y}"
         )
     draw = ",".join(parts)
     if footage and Path(footage).is_file():
@@ -614,15 +614,14 @@ def _render_rank_segment(
     views = _escape_drawtext(_format_views(item.views))
     out = out_dir / f"rank_{item.rank:02d}_{item.candidate.id}.mp4"
 
-    # Cover baked-in center header so #N / label don't clash with it
+    # Persistent rank chrome in upper ~12% only (never center)
     vf = (
-        f""
-        f"drawtext=text='{rank_txt}':fontsize=96:fontcolor=yellow:"
-        f"borderw=6:bordercolor=black:x=40:y=60,"
-        f"drawtext=text='{label}':fontsize=44:fontcolor=white:"
-        f"borderw=4:bordercolor=black:x=40:y=170,"
-        f"drawtext=text='{views}':fontsize=36:fontcolor=yellow:"
-        f"borderw=3:bordercolor=black:x=40:y=230"
+        f"drawtext=text='{rank_txt}':fontsize=72:fontcolor=yellow:"
+        f"borderw=5:bordercolor=black:x=36:y=48,"
+        f"drawtext=text='{label}':fontsize=36:fontcolor=white:"
+        f"borderw=3:bordercolor=black:x=36:y=130,"
+        f"drawtext=text='{views}':fontsize=30:fontcolor=yellow:"
+        f"borderw=3:bordercolor=black:x=36:y=178"
     )
     cmd = [
         "ffmpeg", "-y", "-i", str(base),
@@ -723,9 +722,17 @@ def build_ranking_video(
     # Ranking clips should be short
     cfg.setdefault("clips", {})
     cfg["clips"]["max_clips_per_video"] = 1
-    cfg["clips"]["target_duration"] = 12
-    cfg["clips"]["min_duration"] = 8
-    cfg["clips"]["max_duration"] = 16
+    # Anime/animation ranking items: ~12–18s continuous action (config override below)
+    rank_dur = (cfg.get("clips") or {}).get("ranking_item_duration") or {}
+    niche_l = (niche_id or "").lower()
+    if niche_l in {"anime", "animation"}:
+        cfg["clips"]["target_duration"] = int(rank_dur.get("target", 15))
+        cfg["clips"]["min_duration"] = int(rank_dur.get("min", 12))
+        cfg["clips"]["max_duration"] = int(rank_dur.get("max", 18))
+    else:
+        cfg["clips"]["target_duration"] = 12
+        cfg["clips"]["min_duration"] = 8
+        cfg["clips"]["max_duration"] = 16
     # Assembled ranking length = title + all items; do not inherit quality.yaml's 30s clip cap as a total.
     cfg["clips"]["max_ranking_duration"] = 180
     cs = cfg["clips"].setdefault("copyright_safe", {})
@@ -889,12 +896,12 @@ def build_ranking_video(
         # Outline-only rank labels (no black box over faces)
         vf = (
             f""
-            f"drawtext=text='{rank_txt}':fontsize=96:fontcolor=yellow:"
-            f"borderw=6:bordercolor=black:x=40:y=60,"
-            f"drawtext=text='{label}':fontsize=44:fontcolor=white:"
-            f"borderw=4:bordercolor=black:x=40:y=170,"
-            f"drawtext=text='{views}':fontsize=36:fontcolor=yellow:"
-            f"borderw=3:bordercolor=black:x=40:y=230"
+            f"drawtext=text='{rank_txt}':fontsize=72:fontcolor=yellow:"
+            f"borderw=5:bordercolor=black:x=36:y=48,"
+            f"drawtext=text='{label}':fontsize=36:fontcolor=white:"
+            f"borderw=3:bordercolor=black:x=36:y=130,"
+            f"drawtext=text='{views}':fontsize=30:fontcolor=yellow:"
+            f"borderw=3:bordercolor=black:x=36:y=178"
         )
         pr = subprocess.run(
             ["ffmpeg", "-y", "-i", str(base), "-vf", vf,

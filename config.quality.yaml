@@ -20,6 +20,10 @@ clips:
   min_duration: 12
   max_duration: 30
   target_duration: 22
+  ranking_item_duration:
+    min: 12
+    target: 15
+    max: 18
   max_clips_per_video: 1
   loudness_lufs: -14
   hook_duration: 2.0
@@ -29,10 +33,15 @@ clips:
   mask_profanity: true
   copyright_safe:
     enabled: true
-    max_source_seconds: 18
-    speed: 1.05
+    max_source_seconds: 32
+    speed: 1.0
     zoom: 1.08
     commentary_layer: true
+    montage_cuts: 4
+    montage_segment_seconds: 8
+    color_grade: true
+    music_bed: true
+    trailer_duck: 0.35
 analysis:
   weights:
     loudness: 1.1
@@ -74,6 +83,7 @@ hooks:
   pool_size: 24
 voiceover:
   enabled: true
+  speed: 0.98
   intro_header: true
   intro_seconds: 1.8
   engine: auto

@@ -70,6 +70,7 @@ hooks:
   pool_size: 16
 voiceover:
   enabled: true
+  speed: 0.98
   intro_header: true
   intro_seconds: 1.8
   engine: auto

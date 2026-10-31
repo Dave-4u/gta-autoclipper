@@ -620,7 +620,7 @@ Free local multi-niche Shorts clipper — smart discovery, catchy headers, intro
                 rk_topic = gr.Textbox(
                     label="Topic",
                     placeholder="Top 5 hardest anime fights",
-                    value="Top 5 hardest anime fight moments",
+                    value="Top 5 hardest anime fights",
                 )
                 rk_make = gr.Button("Make Ranking Video", variant="primary")
                 rk_status = gr.Textbox(label="Status", interactive=False)

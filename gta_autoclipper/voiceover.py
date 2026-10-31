@@ -28,56 +28,56 @@ NICHE_VOICE_PROFILES: dict[str, dict[str, Any]] = {
         "kokoro": ["am_puck", "am_fenrir", "af_bella", "am_onyx"],  # expressive hype
         "edge": ["en-US-AndrewMultilingualNeural", "en-US-BrianNeural", "en-US-GuyNeural"],
         "piper": ["en_US-ryan-high", "en_US-lessac-high"],
-        "speed": (1.08, 1.14),
+        "speed": (0.95, 1.0),
         "style": "hype",
     },
     "anime": {
         "kokoro": ["af_bella", "am_puck", "af_nicole", "af_sky"],  # punchy energetic
         "edge": ["en-US-AvaMultilingualNeural", "en-US-JennyNeural", "en-US-AnaNeural"],
         "piper": ["en_US-amy-medium", "en_US-lessac-medium"],
-        "speed": (1.06, 1.16),
+        "speed": (0.95, 1.0),
         "style": "hype",
     },
     "reactions": {
         "kokoro": ["am_puck", "af_sky", "am_echo", "am_liam"],  # casual/fun punchy
         "edge": ["en-US-BrianNeural", "en-US-ChristopherNeural", "en-US-RogerNeural"],
         "piper": ["en_US-joe-medium", "en_US-ryan-medium"],
-        "speed": (1.05, 1.14),
+        "speed": (0.95, 1.0),
         "style": "reaction",
     },
     "ranking": {
         "kokoro": ["am_puck", "am_fenrir", "af_bella", "am_onyx"],  # countdown hype
         "edge": ["en-US-AndrewMultilingualNeural", "en-US-BrianNeural"],
         "piper": ["en_US-ryan-high"],
-        "speed": (1.0, 1.1),
+        "speed": (0.95, 1.0),
         "style": "hype",
     },
     "gaming": {
         "kokoro": ["am_adam", "am_echo", "am_liam"],
         "edge": ["en-US-BrianNeural", "en-US-GuyNeural"],
         "piper": ["en_US-ryan-high"],
-        "speed": (1.0, 1.08),
+        "speed": (0.95, 1.0),
         "style": "hype",
     },
     "funny": {
         "kokoro": ["am_puck", "af_sky", "am_echo"],
         "edge": ["en-US-ChristopherNeural", "en-US-AvaMultilingualNeural"],
         "piper": ["en_US-joe-medium"],
-        "speed": (1.02, 1.12),
+        "speed": (0.95, 1.0),
         "style": "reaction",
     },
     "movies": {
         "kokoro": ["bm_george", "am_michael", "af_bella"],
         "edge": ["en-US-AndrewMultilingualNeural", "en-GB-RyanNeural"],
         "piper": ["en_US-lessac-high"],
-        "speed": (0.95, 1.02),
+        "speed": (0.95, 1.0),
         "style": "commentary",
     },
     "animation": {
         "kokoro": ["af_nicole", "af_bella", "am_puck"],
         "edge": ["en-US-AvaMultilingualNeural", "en-US-JennyNeural"],
         "piper": ["en_US-lessac-high"],
-        "speed": (1.0, 1.08),
+        "speed": (0.95, 1.0),
         "style": "commentary",
     },
 }
@@ -319,18 +319,22 @@ def generate_script(ctx: HookContext, cfg: dict[str, Any], *, header_text: str =
 
 
 def _punctuate_for_speech(text: str) -> str:
-    """Ensure commas/dashes for natural pauses; emphasize short punchy clauses."""
+    """Natural pauses via commas/periods only — no em-dashes or stacked bangs."""
     t = re.sub(r"\s+", " ", (text or "").strip())
     if not t:
         return t
-    if not t.endswith((".", "!", "?")):
+    # Strip TTS artifacts: em/en dashes, trailing bang spam, spaced letters leftovers
+    t = t.replace("—", ",").replace("–", ",").replace(" - ", ", ")
+    t = re.sub(r"!{2,}", "!", t)
+    t = re.sub(r",\s*,+", ",", t)
+    t = re.sub(r"\s+,", ",", t)
+    # Prefer a single period for calm cadence unless already ?/!
+    if t[-1:] not in ".!?":
         t += "."
-    # Light emphasis: wrap key words with commas for pause (Kokoro/edge respect punctuation)
-    for kw in ("Wait", "No way", "Look", "Here"):
-        if "—" in t or " - " in t:
-            break
-        t = re.sub(rf"\b({kw})\b(?!\s*[—-])", r"\1 —", t, count=1)
-    t = t.replace("— —", "—").replace("--", "—")
+    elif t.endswith("!"):
+        # Soften obligatory bangs on short title reads
+        if len(t.split()) <= 8:
+            t = t[:-1] + "."
     return t
 
 
@@ -388,13 +392,13 @@ def synthesize_kokoro(
     from .entities import normalize_pronunciation
     text = normalize_pronunciation(text)
     kk = _kokoro_engine(str(model), str(voices))
-    # Per-line rate variation for livelier delivery
-    # Prefer lively ~1.1 delivery
-    base = float(speed) if speed else 1.1
-    if abs(base - 1.0) < 0.05:
-        base = 1.1
-    spd = base * random.uniform(0.97, 1.04)
-    samples, sr = kk.create(text=text, voice=voice, speed=spd, lang="en-us", sentence_pause=0.22, clause_pause=0.09)
+    # Slight micro-variation around the niche speed (~0.95–1.0) for expressive delivery
+    base = float(speed) if speed else 0.98
+    spd = max(0.90, min(1.05, base * random.uniform(0.98, 1.02)))
+    samples, sr = kk.create(
+        text=text, voice=voice, speed=spd, lang="en-us",
+        sentence_pause=0.28, clause_pause=0.12,
+    )
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     sf.write(str(out_wav), samples, sr)
     return out_wav
@@ -475,8 +479,18 @@ def polish_wav(path: Path) -> Path:
         "lowpass=f=10000,"
         "acompressor=threshold=-18dB:ratio=3:attack=10:release=80:makeup=2,"
         "treble=g=-2,"  # mild de-ess proxy
+        "afade=t=in:st=0:d=0.08,"
+        "afade=t=out:st=0:d=0.12,"  # duration patched below from wav len
         "loudnorm=I=-16:TP=-1.5:LRA=11"
     )
+    # Patch fade-out start from actual duration
+    try:
+        with wave.open(str(path), "rb") as w:
+            dur = w.getnframes() / float(w.getframerate() or 1)
+        fade_out_st = max(0.0, dur - 0.12)
+        af = af.replace("afade=t=out:st=0:d=0.12", f"afade=t=out:st={fade_out_st:.3f}:d=0.12")
+    except Exception:
+        pass
     cmd = ["ffmpeg", "-y", "-i", str(path), "-af", af, "-ar", "24000", "-ac", "1", str(tmp)]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 500:
@@ -496,6 +510,8 @@ def _resolve_voice_choice(cfg: dict[str, Any], niche_id: str) -> tuple[str, str,
     user_voice = str(vo.get("voice") or "").strip()
     speed_lo, speed_hi = prof.get("speed", (1.0, 1.05))
     speed = float(vo.get("speed") or random.uniform(speed_lo, speed_hi))
+    # Natural expressive pace (avoid chipmunk / robotic rush)
+    speed = max(0.92, min(1.02, speed))
     # Niche presets often stash a Piper id in voiceover.voice — ignore that when engine=auto/kokoro/edge
     if user_voice and ("en_US-" in user_voice or "en_GB-" in user_voice) and engine in ("auto", "kokoro", "edge", "edge-tts"):
         user_voice = ""
@@ -597,9 +613,11 @@ def make_intro_vo(text: str, cfg: dict[str, Any], out_wav: Path) -> VoiceoverRes
     words = header.split()
     if header and len(words) <= 14 and not vo_cfg.get("force_stock_intro"):
         clean = header
-        # Ensure it ends with punchy punctuation for TTS
-        if clean[-1:] not in ".!?":
-            clean = clean.rstrip(",;:") + "!"
+        # Natural end punctuation (period), never forced "!" or stray dashes
+        clean = clean.replace("—", " ").replace("–", " ").replace("!", "")
+        clean = re.sub(r"\s+", " ", clean).strip(" ,;:-")
+        if clean and clean[-1:] not in ".?":
+            clean = clean + "."
     else:
         hooks = [
             "Wait for this.",

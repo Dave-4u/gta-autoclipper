@@ -317,7 +317,7 @@ def _video_chain(
         cur = "cap"
     parts.append(
         f"[{cur}]drawtext=text='{hook}'{font_opt}:fontsize=72:fontcolor=yellow:"
-        f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.15:"
+        f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.06:"
         f"enable='lte(t\\,{hook_dur})'[hooked]"
     )
     cur = "hooked"
@@ -336,6 +336,149 @@ def _video_chain(
         if cur != out_label:
             parts.append(f"[{cur}]null[{out_label}]")
     return ";".join(parts)
+
+
+
+def _probe_duration(path: Path) -> float:
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, check=False,
+        )
+        return float((proc.stdout or "0").strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def build_transformative_montage(
+    source: Path,
+    cfg: dict[str, Any],
+    *,
+    out_path: Path | None = None,
+) -> Path | None:
+    """Multi-cut trailer/gameplay montage: hard cuts, zoom/pan, color grade, ducked audio.
+
+    Builds a 25–35s transformative source so the main render_clip pipeline can burn
+    header/captions/VO on top. Used for gta6 when copyright_safe.montage_cuts >= 2.
+    """
+    cs = _copyright_cfg(cfg)
+    n_cuts = int(cs.get("montage_cuts") or 0)
+    if n_cuts < 2:
+        return None
+    seg_len = float(cs.get("montage_segment_seconds") or 8)
+    target_lo, target_hi = 25.0, 35.0
+    # Fit cut count into 25–35s window
+    while n_cuts * seg_len > target_hi and seg_len > 5.5:
+        seg_len -= 0.5
+    while n_cuts * seg_len < target_lo and n_cuts < 6:
+        n_cuts += 1
+    src_dur = _probe_duration(source)
+    if src_dur < seg_len * 2 + 4:
+        print(f"[montage] source too short ({src_dur:.1f}s) — skip")
+        return None
+    # Spread cuts across the body of the trailer (skip open/close logos)
+    pad = min(8.0, src_dur * 0.08)
+    usable = max(1.0, src_dur - 2 * pad - seg_len)
+    starts = []
+    for i in range(n_cuts):
+        frac = (i + 0.5) / n_cuts
+        st = pad + usable * frac
+        st = max(pad, min(src_dur - seg_len - 0.5, st))
+        # Nudge if overlapping previous
+        if starts and st < starts[-1] + seg_len * 0.6:
+            st = min(src_dur - seg_len - 0.5, starts[-1] + seg_len * 0.85)
+        starts.append(round(st, 2))
+    clips_dir = Path((cfg.get("clips") or {}).get("output_dir") or "outputs") / "_montage"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    parts: list[Path] = []
+    grade = bool(cs.get("color_grade", True))
+    duck = float(cs.get("trailer_duck", 0.35))
+    for i, st in enumerate(starts):
+        # Per-cut zoom + slight pan offset for transformative look
+        z = 1.08 + (i % 3) * 0.04
+        # Alternate crop bias left/right/center via crop x expression
+        bias = ["(iw-ow)/2", "(iw-ow)/2 + ow*0.04", "(iw-ow)/2 - ow*0.04"][i % 3]
+        vf = (
+            f"scale=iw*{z}:ih*{z},"
+            f"crop=iw/{z}:ih/{z}:{bias}:(ih-oh)/2,"
+            f"scale=1920:1080:force_original_aspect_ratio=increase,"
+            f"crop=1920:1080"
+        )
+        if grade:
+            # Punchy grade: contrast/sat lift + mild teal-orange feel via colorbalance
+            vf += ",eq=contrast=1.1:brightness=0.03:saturation=1.18:gamma=1.02"
+            vf += ",colorbalance=rs=0.04:gs=-0.02:bs=-0.03:rm=0.02:bm=-0.02"
+        # Soft zoom pulse via zoompan on last third of each cut
+        vf += f",setpts=PTS-STARTPTS"
+        part = clips_dir / f"cut_{i:02d}.mp4"
+        af = f"volume={duck:.3f},aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo"
+        cmd = [
+            "ffmpeg", "-y", "-ss", f"{st:.2f}", "-t", f"{seg_len:.2f}",
+            "-i", str(source),
+            "-vf", vf,
+            "-af", af,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "160k",
+            "-movflags", "+faststart",
+            str(part),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0 or not part.is_file() or part.stat().st_size < 1000:
+            print(f"[montage] cut {i} failed: {(proc.stderr or '')[-300:]}")
+            continue
+        parts.append(part)
+    if len(parts) < 2:
+        print("[montage] fewer than 2 cuts — abort")
+        return None
+    # Optional soft music pad under ducked trailer (procedural, no asset needed)
+    concat_list = clips_dir / "concat.txt"
+    concat_list.write_text("".join(f"file '{p.resolve()}'\n" for p in parts))
+    out = out_path or (clips_dir / f"{source.stem}_montage.mp4")
+    # Concat demuxer (same codecs)
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+        "-c", "copy", str(out),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0 or not out.is_file():
+        # Fallback re-encode concat
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "160k", str(out),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0 or not out.is_file() or out.stat().st_size < 2000:
+        print(f"[montage] concat failed: {(proc.stderr or '')[-300:]}")
+        return None
+    # Soft procedural bed mixed under if music_bed
+    if bool(cs.get("music_bed", True)):
+        bedded = out.with_name(out.stem + "_bed.mp4")
+        dur = _probe_duration(out) or (n_cuts * seg_len)
+        # Low sine pad + noise → ducked under trailer
+        bed_af = (
+            f"sine=f=110:d={dur:.2f},volume=0.04,afade=t=in:d=1,afade=t=out:st={max(0,dur-1.2):.2f}:d=1.2[b];"
+            f"[0:a][b]amix=inputs=2:duration=first:dropout_transition=0,volume=1.0[aout]"
+        )
+        cmd = [
+            "ffmpeg", "-y", "-i", str(out),
+            "-f", "lavfi", "-i", f"sine=frequency=110:sample_rate=48000:duration={dur:.2f}",
+            "-filter_complex",
+            f"[1:a]volume=0.05,afade=t=in:d=0.8,afade=t=out:st={max(0,dur-1):.2f}:d=1[b];"
+            f"[0:a][b]amix=inputs=2:duration=first:weights=1 0.35[aout]",
+            "-map", "0:v", "-map", "[aout]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+            "-shortest", str(bedded),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode == 0 and bedded.is_file() and bedded.stat().st_size > 2000:
+            out.unlink(missing_ok=True)
+            bedded.rename(out)
+        else:
+            bedded.unlink(missing_ok=True)
+    print(f"[montage] built {out.name} cuts={len(parts)} seg={seg_len:.1f}s dur~{_probe_duration(out):.1f}s")
+    return out
 
 
 def render_clip(
@@ -422,6 +565,20 @@ def render_clip(
     mask_swears = bool(clips.get("mask_profanity", True))
 
     niche_id = str(cfg.get("niche_id") or (cfg.get("niche") or {}).get("id") or "gta6")
+    # gta6: multi-cut transformative montage (25–35s) before captions/VO
+    if niche_id == "gta6" and int(cs.get("montage_cuts") or 0) >= 2:
+        try:
+            mont = build_transformative_montage(source, cfg)
+            if mont is not None:
+                source = mont
+                md = _probe_duration(mont)
+                if md > 2:
+                    segment = Segment(start=0.0, end=round(md, 2), score=segment.score,
+                                      reason=(segment.reason or "") + "+montage")
+                    # Montage is already transformative — skip window gate re-check
+                    print(f"[edit] using transformative montage {mont.name} ({md:.1f}s)")
+        except Exception as e:
+            print(f"[edit] montage skip: {e}")
     words: list[dict[str, Any]] = []
     if use_whisper:
         words = get_word_timestamps(
@@ -752,17 +909,17 @@ def render_clip(
             dt = _drawtext_caption_fallback(words_for_burn if burn_captions else [], font_opt) if use_dt_fallback else ""
             nlen = len(hook_display)
             if nlen > 32:
-                header_fs_big, header_fs = 44, 38
+                header_fs_big, header_fs = 40, 34
             elif nlen > 24:
-                header_fs_big, header_fs = 50, 42
+                header_fs_big, header_fs = 44, 38
             elif nlen > 18:
-                header_fs_big, header_fs = 56, 48
+                header_fs_big, header_fs = 50, 42
             else:
-                header_fs_big, header_fs = 68, 56
+                header_fs_big, header_fs = 56, 48
             # Header visible during body (intro card carries its own title)
             anim = (
                 f"drawtext=text='{hook}'{font_opt}:fontsize={header_fs}:fontcolor=yellow:"
-                f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.15:"
+                f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.06:"
                 f"enable='lte(t\\,{hook_dur:.3f})'"
             )
             if skip_header:
