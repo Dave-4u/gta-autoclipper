@@ -78,10 +78,12 @@ def niche_moment_prompt(niche_id: str, title: str, channel: str, window_start: f
     if niche in {"gta6", "reactions"}:
         req = (
             "Find the BEST continuous 10-20 second segment where BOTH are true at the same time: "
-            "(1) GTA 6 / GTA VI trailer or clear GTA gameplay/cinematic is VISIBLY playing on screen "
-            "(not a static menu, release-date card, logo, or talking-head only), AND "
+            "(1) GTA 6 / GTA VI trailer or clear GTA gameplay/cinematic is VISIBLY PLAYING "
+            "(moving trailer footage — NOT a static release-date card, logo hold, pause screen, or talking-head only), AND "
             "(2) the primary reactor's face-cam shows a STRONG visible reaction "
-            "(laughing hard, jaw-drop shock, yelling, hands-on-face) — NOT calm chatting."
+            "(laughing hard, jaw-drop shock, yelling, hands-on-face) — NOT calm chatting. "
+            "REJECT any window with a mouse cursor or player pause/transport UI over the footage. "
+            "REJECT multi-reactor mashups and unrelated videos (Peppa, Fortnite, real-life parody, etc.)."
         )
     elif niche == "anime":
         req = (
@@ -107,6 +109,7 @@ def niche_moment_prompt(niche_id: str, title: str, channel: str, window_start: f
         '  "game_bbox": [x,y,w,h] fractions 0-1 or null,\n'
         '  "trailer_or_game_visible": true/false,\n'
         '  "reaction_strong": true/false,\n'
+        '  "cursor_or_pause_ui": true/false,\n'
         '  "desc": "<one factual sentence>",\n'
         '  "confidence": 0.0-1.0\n'
         "}\n"
@@ -171,6 +174,9 @@ def pick_moment_from_video(
     ok = conf >= min_confidence and bool(data.get("ok"))
     if niche in {"gta6", "reactions"}:
         ok = ok and bool(data.get("trailer_or_game_visible")) and bool(data.get("reaction_strong"))
+        if data.get("cursor_or_pause_ui"):
+            ok = False
+            data["reject"] = "cursor_or_pause_ui"
         # multi_cam is still a usable MOMENT — render path will fill-crop instead of split
         if layout == "multi_cam":
             data["reject"] = None
@@ -246,28 +252,42 @@ def scan_best_moment(
     return best
 
 
-FINAL_GATE_PROMPT = """You are a strict Shorts QA reviewer. Watch the FULL rendered vertical clip WITH AUDIO.
-Score 0-10 and answer carefully. Reply ONLY JSON:
+FINAL_GATE_PROMPT = """You are an ADVERSARIAL Shorts QA reviewer. Assume the clip is BAD until proven good.
+Watch the FULL rendered vertical clip WITH AUDIO. Be harsh. Most clips should score 3-6.
+Reply ONLY JSON:
 {
-  "score": <0-10>,
+  "score": <0-10 integer>,
   "header_matches": true/false,
   "vo_matches_visuals": true/false,
-  "trailer_or_subject_visible": true/false,
+  "vo_is_hype_not_description": true/false,
+  "gta6_trailer_visible": true/false_or_null,
   "reaction_real": true/false_or_null,
   "captions_synced": true/false,
+  "captions_complete": true/false,
   "layout_clean": true/false,
+  "letterboxing_or_panel_gap": true/false,
+  "mouse_cursor_or_pause_ui": true/false,
   "stray_wrong_audio": true/false,
   "wrong_footage": true/false,
   "who": "<who is actually on screen>",
-  "reasons": ["short reason", ...],
-  "desc": "<one sentence of what the clip shows>"
+  "reasons": ["explicit defect or pass note", ...],
+  "desc": "<one sentence of what the clip ACTUALLY shows>"
 }
-Rules for score:
-- Deduct heavily if header names someone not on screen, VO invents actions, wrong game/show footage,
-  multi-cam illegible layout, long silent gaps, jumbled captions, or static cards instead of real action.
-- For GTA/reaction clips: require trailer/gameplay visible AND a real visible reaction.
-- For anime: require clear fight/action filling the frame (not tiny letterboxed).
-Pass threshold is score >= 7.
+
+EXPLICIT FAIL CHECKS (any one of these caps score at <=4 and sets the matching flag):
+1) wrong_footage: not the claimed subject (e.g. Peppa Pig, Fortnite, Star Wars, real-life parody TikTok instead of GTA 6 trailer)
+2) gta6_trailer_visible=false for gta6/reactions niches: must show actual GTA 6 / GTA VI trailer, official title/logo card, cinematic, OR gameplay — a Rockstar/GTA VI branded release-date card COUNTS as visible. Fail only if footage is clearly unrelated (Peppa, Fortnite, real-life parody, etc.)
+3) reaction_real=false: reactor is calm chatting / blank / looking away with zero expression. Hands-on-face, wide eyes, open mouth, laughing = REAL reaction (pass).
+4) mouse_cursor_or_pause_ui=true: mouse cursor or player pause/transport UI over the footage
+5) letterboxing_or_panel_gap=true: contiguous EMPTY black gutter (>=~12px) between face-cam and game, OR letterbox/pillarbox bars inside a panel. A sharp content-to-content panel join is OK — do NOT fail that.
+6) captions_synced=false OR captions_complete=false: captions jumbled/backwards, truncated, or missing last words
+7) vo_is_hype_not_description=false: VO reads like a dry description ("Fierce melee combat with fiery visual effects", "Flashy bloodlust…") instead of a short natural hype line
+8) header_matches=false: header names someone/something not on screen
+9) stray_wrong_audio=true: leftover source chat/music bleeding wrongly on title cards or over VO
+
+SCORING: Start from 10, subtract 2-4 per defect above. A clip with any hard fail is <=4.
+Only score >=8 if NONE of the fail checks trigger and the clip looks publishable.
+Pass threshold is score >= 8.
 """
 
 
@@ -279,12 +299,12 @@ def final_gate_video(
     niche_id: str = "",
     title: str = "",
     cfg: dict[str, Any] | None = None,
-    min_score: float = 7.0,
+    min_score: float = 8.0,
 ) -> dict[str, Any]:
     """Upload rendered clip proxy to Gemini for end-to-end QA."""
     from .gemini_client import generate_video, has_gemini
     if not has_gemini(cfg):
-        return {"ok": True, "score": 7, "skipped": "no_key", "reasons": []}
+        return {"ok": False, "score": 0, "skipped": "no_key", "reasons": ["no_key"]}
     if not rendered.is_file():
         return {"ok": False, "score": 0, "reasons": ["missing_file"]}
     dur = _ffprobe_duration(rendered)
@@ -306,26 +326,51 @@ def final_gate_video(
     data = _parse_json(raw)
     data["raw"] = (raw or "")[:700]
     score = float(data.get("score") or 0)
-    # Hard fails
-    reasons = list(data.get("reasons") or [])
+    hard = []
     if data.get("wrong_footage"):
-        reasons.append("wrong_footage")
+        hard.append("wrong_footage")
     if data.get("stray_wrong_audio"):
-        reasons.append("stray_audio")
+        hard.append("stray_audio")
+    if data.get("mouse_cursor_or_pause_ui"):
+        hard.append("cursor_or_pause_ui")
+    if data.get("letterboxing_or_panel_gap"):
+        # Soft penalty — flash-lite often flags sharp panel joins as "gaps"
+        score = max(0.0, float(score) - 1.5)
+    if data.get("captions_synced") is False or data.get("captions_complete") is False:
+        score = min(score, score - 1.5)
+    if data.get("vo_is_hype_not_description") is False:
+        # Confirm locally — Gemini sometimes flags punchy hype as descriptive
+        vo_l = (vo or "").lower()
+        descriptive_local = any(k in vo_l for k in (
+            "fierce", "melee", "visual effect", "action-packed", "bloodlust", "fatal rhythm",
+            "sequence features", "gameplay footage",
+        ))
+        if descriptive_local:
+            hard.append("vo_descriptive")
+        else:
+            score = min(score, score - 1.0)
     if niche_id in {"gta6", "reactions"}:
-        if data.get("trailer_or_subject_visible") is False:
-            reasons.append("no_trailer")
+        # Prefer new key; fall back to old
+        trailer_ok = data.get("gta6_trailer_visible")
+        if trailer_ok is None:
+            trailer_ok = data.get("trailer_or_subject_visible")
+        if trailer_ok is False:
+            hard.append("no_gta_trailer")
         if data.get("reaction_real") is False:
-            reasons.append("no_reaction")
+            hard.append("no_reaction")
     if data.get("header_matches") is False:
-        reasons.append("header_mismatch")
+        hard.append("header_mismatch")
     if data.get("vo_matches_visuals") is False:
-        reasons.append("vo_mismatch")
+        if len((vo or "").split()) <= 6:
+            score = max(0.0, float(score) - 1.0)
+        else:
+            hard.append("vo_mismatch")
     if data.get("layout_clean") is False:
-        reasons.append("messy_layout")
-    ok = score >= min_score and "wrong_footage" not in reasons and "no_trailer" not in reasons
-    if niche_id in {"gta6", "reactions"} and "no_reaction" in reasons:
-        ok = False
+        score = min(score, score - 1.0)
+    reasons = list(dict.fromkeys(list(data.get("reasons") or []) + hard))
+    if hard and score > 4:
+        score = min(score, 4.0)
+    ok = score >= min_score and not hard
     data["ok"] = ok
     data["score"] = score
     data["reasons"] = reasons

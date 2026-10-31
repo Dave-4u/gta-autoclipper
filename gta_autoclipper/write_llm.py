@@ -12,7 +12,31 @@ _BAD_GRAMMAR = [
 ]
 
 
+_DESCRIPTIVE_VO = re.compile(
+    r"(?i)\b(fierce|melee|combat|visual effects?|action-packed|sequence features|"
+    r"bloodlust|fatal rhythm|flashy combat|gameplay footage|cinematic sequence|"
+    r"is shocked watching|watching the trailer|reacts with extreme|intense action sequence|"
+    r"features? (an? |the )?(intense|fiery|flashy)|narrat)\b"
+)
+
+
+def _vo_is_hype(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _DESCRIPTIVE_VO.search(t):
+        return False
+    # Narrator "Name is/was adjective ..." without conversational punch
+    if re.match(r"(?i)^[A-Z][\w']+(?:\s+[A-Z][\w']+)?\s+is\s+\w+ing\b", t) and not re.search(r"[!?]", t):
+        return False
+    # Too many abstract nouns / no punch
+    if len(t.split()) >= 7 and not re.search(r"[!?]|(?i)\b(no way|look|bro|she|he|they|cooked|insane|real)\b", t):
+        return False
+    return True
+
+
 def grammar_ok(text: str) -> bool:
+
     t = (text or "").strip()
     if not t:
         return False
@@ -90,15 +114,17 @@ def write_header_vo(
         f"Allowed names: {', '.join((es.streamers or [])[:3] + (es.characters or [])[:4]) or 'none'}\n\n"
         "Write exactly these lines:\n"
         "HEADER: <=6 words, catchy, factual, no ellipsis, no 'WAIT FOR', never truncate mid-word\n"
-        "VO: <=8 words. ONLY describe what is visible in the Scene description / emotion label. "
-        "If emotion is laughing/shocked/excited you may comment on that face. "
-        "If emotion is blank/talking/none/unknown, write a NEUTRAL fact from the scene "
-        "(e.g. what game footage shows) — NEVER invent reactions like 'losing his mind' or actions not described.\n"
-        "OR VO: SKIP if nothing solid.\n"
-        "SAY: phonetic hints for proper nouns in the header/VO (e.g. Gyutaro=Gyoo-tah-roh). "
-        "One comma-separated list, or SAY: none\n"
+        "VO: <=8 words. Must sound like a NATURAL spoken hype line a creator would say on TikTok "
+        "(punchy, conversational). Ground it ONLY in the visible scene/emotion.\n"
+        "GOOD VO examples: 'No way that is real!', 'Look at his face!', 'Blades everywhere!', 'She is cooked.'\n"
+        "BANNED descriptive/narrator style (never write like this): "
+        "'Fierce melee combat with fiery visual effects', 'Flashy bloodlust meets a fatal rhythm', "
+        "'Unstoppable flashy combat', 'The action-packed sequence features…', "
+        "or any clinical description of what the footage contains.\n"
+        "If emotion is blank/talking/none and nothing punchy is visible: VO: SKIP\n"
+        "SAY: phonetic hints for proper nouns (e.g. Gyutaro=Gyoo-tah-roh), or SAY: none\n"
         "Use only names in Scene description or Reactor. Perfect grammar. No hashtags.\n"
-        "Example:\nHEADER: Tengen vs Gyutaro\nVO: Blades everywhere.\nSAY: Gyutaro=Gyoo-tah-roh, Tengen=Ten-gen\n"
+        "Example:\nHEADER: Tengen vs Gyutaro\nVO: Blades everywhere!\nSAY: Gyutaro=Gyoo-tah-roh, Tengen=Ten-gen\n"
     )
     try:
         raw = generate(prompt=prompt, images=None, cfg=cfg)
@@ -152,6 +178,8 @@ def write_header_vo(
         ok_v, _ = validate_copy(vo, es)
         if not ok_v:
             vo = ""
+    if vo and not _vo_is_hype(vo):
+        vo = ""
     if vo and not vo.endswith((".", "!", "?")):
-        vo += "."
+        vo += "!"
     return {"header": header, "vo": vo, "via": "gemini", "raw": (raw or "")[:300], "say": say, "emotion": emo}

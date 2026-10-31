@@ -503,10 +503,24 @@ def _render_title_card(
                 dur = max(2.5, min(4.5, w.getnframes() / float(w.getframerate() or 1) + 0.4))
         except Exception:
             pass
-    draw = (
-        f"drawtext=text='{topic_esc}':fontsize=48:fontcolor=yellow:"
-        f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=(h*0.40)"
-    )
+    # TikTok-style: huge bold centered title with heavy stroke + shadow
+    # Split long topics across 2 drawtext lines when needed
+    words = topic_fit.split()
+    if len(words) > 4:
+        mid = len(words) // 2
+        line1 = _escape_drawtext(" ".join(words[:mid]))
+        line2 = _escape_drawtext(" ".join(words[mid:]))
+        draw = (
+            f"drawtext=text='{line1}':fontsize=72:fontcolor=yellow:borderw=8:bordercolor=black:"
+            f"shadowx=3:shadowy=3:shadowcolor=black@0.8:x=(w-text_w)/2:y=(h*0.36),"
+            f"drawtext=text='{line2}':fontsize=72:fontcolor=yellow:borderw=8:bordercolor=black:"
+            f"shadowx=3:shadowy=3:shadowcolor=black@0.8:x=(w-text_w)/2:y=(h*0.36)+90"
+        )
+    else:
+        draw = (
+            f"drawtext=text='{topic_esc}':fontsize=80:fontcolor=yellow:borderw=10:bordercolor=black:"
+            f"shadowx=4:shadowy=4:shadowcolor=black@0.85:x=(w-text_w)/2:y=(h*0.40)"
+        )
     if footage and Path(footage).is_file():
         vf = (
             f"scale={width}:{height}:force_original_aspect_ratio=increase,"
@@ -631,8 +645,8 @@ def build_ranking_video(
     _log(f"[ranking] topic={topic!r} niche={niche_id} n={n}")
 
     items = collect_rank_items(niche_id, topic, n=n, cfg=cfg, log=log)
-    if len(items) < 3:
-        _log(f"[ranking] not enough items ({len(items)}); need >=3")
+    if len(items) < 2:
+        _log(f"[ranking] not enough items ({len(items)}); need >=2")
         return None
 
     out_root = Path(cfg["clips"]["output_dir"]) / "ranking"
@@ -692,7 +706,7 @@ def build_ranking_video(
             continue
         survivors.append(item)
 
-    if len(survivors) < 3:
+    if len(survivors) < 2:
         _log(f"[ranking] too few survivors ({len(survivors)})")
         return None
 
@@ -725,7 +739,7 @@ def build_ranking_video(
         else:
             _log(f"[ranking] render failed for #{item.rank} {item.candidate.id} — excluding")
 
-    if len(rendered_items) < 3:
+    if len(rendered_items) < 2:
         _log(f"[ranking] too few rendered parts ({len(rendered_items)})")
         return None
 

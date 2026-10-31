@@ -178,6 +178,69 @@ def detect_layout(path: Path, t: float) -> FaceCamLayout:
     return FaceCamLayout(face=face_box, game=game, chat_side=chat, faces_found=len(faces))
 
 
+
+def cropdetect_box(
+    path: Path,
+    t: float,
+    bbox: tuple[float, float, float, float],
+    *,
+    frames: int = 48,
+) -> tuple[float, float, float, float]:
+    """Run ffmpeg cropdetect inside a normalized bbox; return tightened bbox fractions."""
+    import re
+    import subprocess
+    gx, gy, gw, gh = bbox
+    # Sample a mid frame region via crop then cropdetect
+    # Use absolute pixel crop from a scaled probe
+    probe_w = 720
+    cmd = [
+        "ffmpeg", "-hide_banner", "-ss", f"{max(0.0, t):.2f}", "-i", str(path),
+        "-frames:v", str(frames),
+        "-vf", (
+            f"scale={probe_w}:-2,"
+            f"crop=iw*{gw:.4f}:ih*{gh:.4f}:iw*{gx:.4f}:ih*{gy:.4f},"
+            "cropdetect=16:2:0"
+        ),
+        "-f", "null", "-",
+    ]
+    pr = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    crops = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", pr.stderr or "")
+    if not crops:
+        return bbox
+    # Last cropdetect is usually the stable one
+    cw, ch, cx, cy = [int(x) for x in crops[-1]]
+    # Region size in probe pixels after first crop
+    # We need fractions relative to ORIGINAL frame, so map back through the region
+    # Approximated: region was gw*W x gh*H; cropdetect offsets are within region
+    # Get probe height from a quick probe
+    try:
+        # Infer region pixel size from scale width
+        # After scale=720:-2, width=720; region width = 720*gw
+        rw = max(1.0, probe_w * gw)
+        # height unknown precisely — use cropdetect's parent: if crop is almost full, skip
+        if cw < 8 or ch < 8:
+            return bbox
+        # Fractions within the game bbox
+        fx = cx / rw
+        # For height, approximate rh from crop+cy: if cy+ch suggests rh
+        # Use last cropdetect line's context — better: assume rh ~= (cy+ch) if near edge else ch/(1-margin)
+        rh = max(float(cy + ch), float(ch) / 0.9)
+        fy = cy / rh
+        fw = cw / rw
+        fh = ch / rh
+        # Clamp and map back to full-frame fractions
+        fx = max(0.0, min(0.95, gx + gw * fx))
+        fy = max(0.0, min(0.95, gy + gh * fy))
+        fw = max(0.15, min(1.0 - fx, gw * fw))
+        fh = max(0.15, min(1.0 - fy, gh * fh))
+        # Only accept if we actually removed meaningful bars (>3% shrink)
+        if fw * fh > gw * gh * 0.995:
+            return bbox
+        return (fx, fy, fw, fh)
+    except Exception:
+        return bbox
+
+
 def split_filter_complex(
     layout: FaceCamLayout,
     *,
@@ -187,6 +250,8 @@ def split_filter_complex(
     in_label: str = "0:v",
     out_label: str = "vlaid",
     face_frac: float = 0.42,
+    source: Path | None = None,
+    refine_t: float | None = None,
 ) -> str | None:
     """Build ffmpeg filter that stacks face-cam (top) + game (bottom).
 
@@ -206,24 +271,66 @@ def split_filter_complex(
         gx, gy, gw, gh = 0.05, 0.05, 0.9, 0.9
     gx, gy = max(0.0, min(0.8, gx)), max(0.0, min(0.8, gy))
     gw, gh = max(0.3, min(1.0 - gx, gw)), max(0.3, min(1.0 - gy, gh))
+    # If game bbox is nearly the full frame, carve out the face-cam side so we
+    # don't re-include the source's face/chrome/black gutter in the bottom panel.
+    if gw * gh > 0.85 and layout.face:
+        ffx, ffy, ffw, ffh = layout.face
+        face_cx = ffx + ffw / 2
+        if face_cx > 0.65:  # face on right — keep left/center as game
+            gw = min(gw, max(0.35, ffx - 0.02 - gx))
+        elif face_cx < 0.35:  # face on left — keep right as game
+            new_x = max(gx, ffx + ffw + 0.02)
+            gw = max(0.35, gx + gw - new_x)
+            gx = new_x
+        print(f"[layout] carved game around face -> {(gx, gy, gw, gh)}")
+    # Tighten face + game crops to strip letterbox/black bars inside each region
+    if source is not None and refine_t is not None:
+        try:
+            fx, fy, fw, fh = cropdetect_box(Path(source), float(refine_t), (fx, fy, fw, fh))
+            print(f"[layout] cropdetect face -> {(fx, fy, fw, fh)}")
+        except Exception as e:
+            print(f"[layout] cropdetect face skip: {e}")
+        try:
+            gx, gy, gw, gh = cropdetect_box(Path(source), float(refine_t), (gx, gy, gw, gh))
+            print(f"[layout] cropdetect game -> {(gx, gy, gw, gh)}")
+        except Exception as e:
+            print(f"[layout] cropdetect game skip: {e}")
+        # Inward shrink to kill residual letterbox/chat chrome on edges
+        gx = gx + gw * 0.05
+        gy = gy + gh * 0.06
+        gw = gw * 0.90
+        gh = gh * 0.88
+        gx, gy = max(0.0, gx), max(0.0, gy)
+        gw = max(0.25, min(1.0 - gx, gw))
+        gh = max(0.25, min(1.0 - gy, gh))
+        # Face: zoom in slightly so webcam fills the top panel
+        fx = fx + fw * 0.06
+        fy = fy + fh * 0.06
+        fw = fw * 0.88
+        fh = fh * 0.88
+        fx, fy = max(0.0, fx), max(0.0, fy)
+        fw = max(0.10, min(1.0 - fx, fw))
+        fh = max(0.10, min(1.0 - fy, fh))
 
     top_h = int(height * face_frac) // 2 * 2
+    top_h = top_h - (top_h % 2)
     bot_h = height - top_h
+    bot_h = bot_h - (bot_h % 2)
+    if top_h + bot_h != height:
+        # Prefer filling height exactly: grow top if needed
+        top_h = height - bot_h
     speed = max(0.5, min(2.0, float(speed)))
 
-    # Crop face & game from source, scale to panels, vstack
-    # Hide chat by cropping game away from chat_side (already in layout.game)
+    # Crop face & game, scale-to-FILL each panel (no letterbox), vstack with exact pixel heights.
     parts = [
         f"[{in_label}]split=2[fsrc][gsrc]",
-        # Face panel — large headshot
         f"[fsrc]crop=iw*{fw:.4f}:ih*{fh:.4f}:iw*{fx:.4f}:ih*{fy:.4f},"
         f"scale={width}:{top_h}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{top_h},setsar=1[face]",
-        # Game panel
+        f"crop={width}:{top_h},setsar=1,format=yuv420p[face]",
         f"[gsrc]crop=iw*{gw:.4f}:ih*{gh:.4f}:iw*{gx:.4f}:ih*{gy:.4f},"
         f"scale={width}:{bot_h}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{bot_h},setsar=1[game]",
-        f"[face][game]vstack=inputs=2,setpts=PTS/{speed}[{out_label}]",
+        f"crop={width}:{bot_h},setsar=1,format=yuv420p[game]",
+        f"[face][game]vstack=inputs=2,setsar=1,setpts=PTS/{speed},format=yuv420p[{out_label}]",
     ]
     return ";".join(parts)
 
@@ -252,6 +359,12 @@ def layout_from_gemini(data: dict) -> FaceCamLayout:
             x, y, w, h = [float(v) for v in b]
         except Exception:
             return None
+        # Gemini sometimes returns pixel coords — normalize assuming ~1280x720/1080p
+        if max(x, y, w, h) > 1.5:
+            # Guess canvas from magnitudes
+            cw = 1280.0 if max(x + w, w) <= 1280 else 1920.0
+            ch = 720.0 if max(y + h, h) <= 720 else (1080.0 if max(y + h, h) <= 1080 else 1920.0)
+            x, y, w, h = x / cw, y / ch, w / cw, h / ch
         if w <= 0.05 or h <= 0.05:
             return None
         x, y = max(0.0, min(0.95, x)), max(0.0, min(0.95, y))

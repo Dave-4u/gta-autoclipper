@@ -145,17 +145,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         ass_path.write_text(header, encoding="utf-8")
         return 0
 
+    # Chronological order
+    cleaned.sort(key=lambda w: (float(w["start"]), float(w["end"])))
+
+    # Chunk by 4 words; do NOT flush on commas (prevents phrase reordering)
     chunks: list[list[dict[str, Any]]] = []
     cur: list[dict[str, Any]] = []
     for w in cleaned:
         cur.append(w)
-        if len(cur) >= 5 or w["word"].endswith((".", "!", "?", ",")):
+        if len(cur) >= 4 or str(w["word"]).endswith((".", "!", "?")):
             chunks.append(cur)
             cur = []
     if cur:
         chunks.append(cur)
 
-    events: list[str] = []
+    events: list[tuple[float, str]] = []
     for chunk in chunks:
         tokens = [_ass_escape(c["word"]) for c in chunk]
         for i, w in enumerate(chunk):
@@ -170,19 +174,30 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 else:
                     parts.append(r"{\c&" + COLOR_DIM + r"&}" + tok + r"{\r}")
             line = " ".join(parts)
-            start = w["start"]
-            end = w["end"]
+            start_t = float(w["start"])
+            end_t = float(w["end"])
             if i + 1 < len(chunk):
-                end = max(end, chunk[i + 1]["start"])
+                end_t = max(end_t, float(chunk[i + 1]["start"]))
             else:
-                end = max(end, start + 0.35)
-            if end <= start:
-                end = start + 0.2
+                end_t = max(end_t, start_t + 0.45)
+            if end_t <= start_t:
+                end_t = start_t + 0.25
             events.append(
-                f"Dialogue: 0,{_ts(start)},{_ts(end)},Word,,0,0,0,,{line}"
+                (start_t, f"Dialogue: 0,{_ts(start_t)},{_ts(end_t)},Word,,0,0,0,,{line}")
             )
 
-    ass_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
+    # Stretch final caption so the last word is not truncated
+    if events and cleaned:
+        import re as _re
+        st, line = events[-1]
+        m = _re.match(r"(Dialogue: \d+,)([^,]+),([^,]+),(.*)", line)
+        if m:
+            end_pad = float(cleaned[-1]["end"]) + 0.6
+            line = f"{m.group(1)}{m.group(2)},{_ts(end_pad)},{m.group(4)}"
+            events[-1] = (st, line)
+
+    events.sort(key=lambda e: e[0])
+    ass_path.write_text(header + "\n".join(e[1] for e in events) + "\n", encoding="utf-8")
     return len(events)
 
 
@@ -425,6 +440,7 @@ def render_clip(
         if face_layout.face and face_layout.game:
             split_base = split_filter_complex(
                 face_layout, width=width, height=height, speed=speed, out_label="base",
+                source=source, refine_t=(segment.start + segment.end) / 2,
             )
             print(f"[layout] gemini split face={face_layout.face} game={face_layout.game}")
         else:
@@ -444,6 +460,7 @@ def render_clip(
         if face_layout.face and face_layout.game:
             split_base = split_filter_complex(
                 face_layout, width=width, height=height, speed=speed, out_label="base",
+                source=source, refine_t=(segment.start + segment.end) / 2,
             )
             print(f"[layout] gemini split face={face_layout.face} game={face_layout.game}")
         else:
@@ -455,6 +472,7 @@ def render_clip(
             if face_layout and face_layout.face:
                 split_base = split_filter_complex(
                     face_layout, width=width, height=height, speed=speed, out_label="base",
+                    source=source, refine_t=(segment.start + segment.end) / 2,
                 )
                 print(f"[layout] face_cam={face_layout.face} chat={face_layout.chat_side} split={bool(split_base)}")
             else:
@@ -618,8 +636,16 @@ def render_clip(
             if intro_result and intro_result.wav_path:
                 cap_shift = shift
             else:
-                cap_shift = max(0.3, clip_len_est - vo_dur - 0.35)
-                print(f"[edit] caption/VO shift to payoff @{cap_shift:.2f}s")
+                # Place VO early so captions never truncate at clip end; avoids long silent lead-in
+                cap_shift = 0.35
+                # If VO would overrun the clip, we still start early (clip should cover it)
+                if cap_shift + vo_dur > clip_len_est - 0.2:
+                    need = (cap_shift + vo_dur + 0.8) - clip_len_est
+                    # Stretch source window so ASS last word is not cut by clip end
+                    segment.end = float(segment.end) + max(0.0, need) * max(speed, 0.5)
+                    clip_len_est = max(0.5, float(segment.end - segment.start) / max(speed, 0.5))
+                    print(f"[edit] extended segment for VO: need={need:.2f}s new_end={segment.end:.2f}")
+                print(f"[edit] caption/VO at @{cap_shift:.2f}s (dur={vo_dur:.2f}s)")
             if vo_result and vo_result.words:
                 caption_words = [
                     {
@@ -726,9 +752,9 @@ def render_clip(
                             com_dur = _w.getnframes() / float(_w.getframerate() or 1)
                     except Exception:
                         com_dur = 1.5
-                    payoff_at = max(0.3, clip_len - com_dur - 0.35)
+                    payoff_at = 0.35
                     delay_ms = int(payoff_at * 1000)
-                    print(f"[edit] single VO payoff delay={payoff_at:.2f}s")
+                    print(f"[edit] single VO delay={payoff_at:.2f}s")
                     cmd_d = [
                         "ffmpeg", "-y", "-i", str(only),
                         "-af", f"adelay={delay_ms}|{delay_ms}",
@@ -751,9 +777,9 @@ def render_clip(
                         com_dur = _w.getnframes() / float(_w.getframerate() or 1)
                 except Exception:
                     com_dur = 1.5
-                payoff_at = max(intro_dur + 0.4, clip_len - com_dur - 0.35)
+                payoff_at = max(intro_dur + 0.15, 0.35)
                 delay_ms = int(payoff_at * 1000)
-                print(f"[edit] VO payoff delay={payoff_at:.2f}s (clip={clip_len:.2f}s)")
+                print(f"[edit] VO delay={payoff_at:.2f}s (clip={clip_len:.2f}s)")
                 cmd_mix = [
                     "ffmpeg", "-y",
                     "-i", str(intro_p),
@@ -947,7 +973,7 @@ def render_clip(
             niche_id=niche_id,
             title=title,
             cfg=cfg,
-            min_score=7.0,
+            min_score=8.0,
         )
         print(f"[review] score={review.get('score')} ok={review.get('ok')} "
               f"reasons={review.get('reasons')} desc={str(review.get('desc',''))[:160]}")
