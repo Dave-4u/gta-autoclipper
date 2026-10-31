@@ -608,13 +608,15 @@ def _render_rank_segment(
     views = _escape_drawtext(_format_views(item.views))
     out = out_dir / f"rank_{item.rank:02d}_{item.candidate.id}.mp4"
 
+    # Cover baked-in center header so #N / label don't clash with it
     vf = (
+        f"drawbox=x=iw*0.05:y=250:w=iw*0.90:h=100:color=black@1.0:t=fill,"
         f"drawtext=text='{rank_txt}':fontsize=96:fontcolor=yellow:"
-        f"borderw=6:bordercolor=black:x=40:y=80,"
-        f"drawtext=text='{label}':fontsize=40:fontcolor=white:"
-        f"borderw=3:bordercolor=black:x=40:y=200,"
+        f"borderw=6:bordercolor=black:x=40:y=60,"
+        f"drawtext=text='{label}':fontsize=44:fontcolor=white:"
+        f"borderw=4:bordercolor=black:x=40:y=170,"
         f"drawtext=text='{views}':fontsize=36:fontcolor=yellow:"
-        f"borderw=3:bordercolor=black:x=40:y=260"
+        f"borderw=3:bordercolor=black:x=40:y=230"
     )
     cmd = [
         "ffmpeg", "-y", "-i", str(base),
@@ -785,13 +787,13 @@ def build_ranking_video(
         views = _escape_drawtext(_format_views(item.views))
         # Cover old # badge with a black box then draw new
         vf = (
-            f"drawbox=x=20:y=60:w=220:h=220:color=black@0.85:t=fill,"
+            f"drawbox=x=iw*0.05:y=250:w=iw*0.90:h=100:color=black@1.0:t=fill,"
             f"drawtext=text='{rank_txt}':fontsize=96:fontcolor=yellow:"
-            f"borderw=6:bordercolor=black:x=40:y=80,"
-            f"drawtext=text='{label}':fontsize=40:fontcolor=white:"
-            f"borderw=3:bordercolor=black:x=40:y=200,"
+            f"borderw=6:bordercolor=black:x=40:y=60,"
+            f"drawtext=text='{label}':fontsize=44:fontcolor=white:"
+            f"borderw=4:bordercolor=black:x=40:y=170,"
             f"drawtext=text='{views}':fontsize=36:fontcolor=yellow:"
-            f"borderw=3:bordercolor=black:x=40:y=260"
+            f"borderw=3:bordercolor=black:x=40:y=230"
         )
         pr = subprocess.run(
             ["ffmpeg", "-y", "-i", str(base), "-vf", vf,

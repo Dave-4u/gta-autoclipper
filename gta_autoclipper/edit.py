@@ -325,9 +325,25 @@ def render_clip(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     segment = _cap_segment(segment, cfg)
+    # Motion / silence gate on the source window (skip frozen trailer / dead air)
+    try:
+        from .window_gate import window_ok
+        meta0 = source_meta or {}
+        gbox = None
+        gl = (meta0.get("gemini_layout") or {})
+        if isinstance(gl.get("game_bbox"), (list, tuple)) and len(gl["game_bbox"]) == 4:
+            gbox = tuple(float(x) for x in gl["game_bbox"])
+        gate = window_ok(source, segment.start, segment.end, game_box=gbox)
+        if not gate.get("ok"):
+            print(f"[edit] window rejected: {gate.get('reasons')}")
+            return None
+    except Exception as e:
+        print(f"[edit] window gate skip: {e}")
     cs = _copyright_cfg(cfg)
     safe_on = bool(cs.get("enabled", True))
-    speed = float(cs.get("speed", 1.05)) if safe_on else 1.0
+    # NEVER change playback tempo (setpts/atempo mismatch = chipmunk/jitter).
+    # Copyright-safe zoom still OK; speed stays 1.0.
+    speed = 1.0
     zoom = float(cs.get("zoom", 1.08)) if safe_on else 1.0
     commentary_on = bool(cs.get("commentary_layer", True)) if safe_on else False
 
@@ -556,6 +572,7 @@ def render_clip(
     ctx.vlm_desc = vlm_desc
     hook_display = _fit_header(hook_res.text, 36)
     hook = _escape_drawtext(hook_display)
+    skip_header = bool((source_meta or {}).get("skip_header"))
     intro_result = None
     vo_result = None
     caption_words: list[dict[str, Any]] = []
@@ -640,8 +657,20 @@ def render_clip(
                     clip_len_est = max(0.5, float(segment.end - segment.start) / max(speed, 0.5))
                     print(f"[edit] extended segment for VO: need={need:.2f}s new_end={segment.end:.2f}")
                 print(f"[edit] caption/VO at @{cap_shift:.2f}s (dur={vo_dur:.2f}s)")
+            # Keep streamer/dialogue captions; VO punchline is additive (not a replace).
+            # Final pass below re-whispers mixed audio so ALL speech is covered.
+            dialogue_caps = [
+                {
+                    "word": w["word"],
+                    "start": float(w["start"]),
+                    "end": float(w["end"]),
+                }
+                for w in words
+                if float(w.get("end", 0)) > 0.05
+            ]
+            vo_caps: list[dict[str, Any]] = []
             if vo_result and vo_result.words:
-                caption_words = [
+                vo_caps = [
                     {
                         "word": w["word"],
                         "start": float(w["start"]) + cap_shift,
@@ -650,10 +679,9 @@ def render_clip(
                     for w in vo_result.words
                 ]
             elif vo_result and vo_result.text:
-                # Even spacing from estimated VO duration (not fixed 0.35s which desyncs)
                 toks = vo_result.text.split()[:24]
                 step = max(0.18, vo_dur / max(1, len(toks)))
-                caption_words = [
+                vo_caps = [
                     {
                         "word": tok,
                         "start": cap_shift + i * step,
@@ -661,8 +689,11 @@ def render_clip(
                     }
                     for i, tok in enumerate(toks)
                 ]
-            else:
-                caption_words = []
+            # Prefer dialogue when present; else VO so the punchline still shows
+            caption_words = dialogue_caps if dialogue_caps else vo_caps
+            if dialogue_caps and vo_caps:
+                # Keep both, chronological
+                caption_words = sorted(dialogue_caps + vo_caps, key=lambda w: float(w["start"]))
         else:
             # Dialogue captions: drop anything that overlaps the intro window
             caption_words = [
@@ -682,11 +713,13 @@ def render_clip(
                     w["end"] = w["start"] + dur
 
         ass_path = td_path / "captions.ass"
-        words_for_burn = caption_words if burn_captions else []
+        # First encode without burned captions; final-audio whisper pass burns once
+        # so we never double-layer VO karaoke over streamer speech.
+        words_for_burn = []
         n_events = _write_ass_captions(
             words_for_burn, ass_path, width, height, font_name=font_name
         )
-        print(f"[edit] ASS events: {n_events}")
+        print(f"[edit] ASS events (pre-final): {n_events}; will whisper final audio")
         out_path.with_suffix(".ass").write_text(
             ass_path.read_text(encoding="utf-8"), encoding="utf-8"
         )
@@ -809,6 +842,8 @@ def render_clip(
                 f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.15:"
                 f"enable='gte(t\\,{intro_dur:.3f})*lte(t\\,{hook_dur:.3f})'"
             )
+            if skip_header:
+                anim = ""
             # Use animated hook instead of single hook inside _video_chain — pass empty hook and append anim
             vchain = _video_chain(
                 width=width,
@@ -900,6 +935,60 @@ def render_clip(
             if not ok:
                 print("[edit] render failed")
                 return None
+
+        # Pass 2: whisper the FINAL mixed audio and reburn word-synced captions
+        if burn_captions and out_path.is_file():
+            try:
+                import subprocess as _sp
+                _dur = 12.0
+                try:
+                    _pr = _sp.run(
+                        ["ffprobe","-v","error","-show_entries","format=duration",
+                         "-of","csv=p=0",str(out_path)],
+                        capture_output=True, text=True, check=False,
+                    )
+                    _dur = max(1.0, float((_pr.stdout or "12").strip()))
+                except Exception:
+                    pass
+                final_words = get_word_timestamps(
+                    out_path, 0.0, _dur, model_name=model_name, niche_id=niche_id
+                )
+                if len(final_words) < 3 and model_name != "tiny":
+                    final_words = get_word_timestamps(
+                        out_path, 0.0, _dur, model_name="tiny", niche_id=niche_id
+                    )
+                if final_words:
+                    ass2 = td_path / "captions_final.ass"
+                    n2 = _write_ass_captions(final_words, ass2, width, height, font_name=font_name)
+                    print(f"[edit] final-audio whisper captions: {n2} events / {len(final_words)} words")
+                    tmp_out = td_path / "reburn.mp4"
+                    ass_esc = str(ass2).replace("\\", "/").replace(":", chr(92) + ":")
+                    vf = f"ass='{ass_esc}'"
+                    # Keep existing burned captions? Replace by stripping is hard —
+                    # overlay fresh ASS (karaoke style) on top of current frame.
+                    pr2 = subprocess.run(
+                        [
+                            "ffmpeg", "-y", "-i", str(out_path),
+                            "-vf", vf,
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                            "-c:a", "copy", "-pix_fmt", "yuv420p",
+                            "-movflags", "+faststart",
+                            str(tmp_out),
+                        ],
+                        capture_output=True, text=True, check=False,
+                    )
+                    if pr2.returncode == 0 and tmp_out.is_file():
+                        out_path.write_bytes(tmp_out.read_bytes())
+                        caption_words = final_words
+                        out_path.with_suffix(".ass").write_text(
+                            ass2.read_text(encoding="utf-8"), encoding="utf-8"
+                        )
+                    else:
+                        print("[edit] final caption reburn failed:", (pr2.stderr or "")[-400:])
+                else:
+                    print("[edit] final-audio whisper returned no words — keeping prior captions")
+            except Exception as e:
+                print(f"[edit] final-audio caption pass skip: {e}")
 
     meta_side = out_path.with_suffix(".hook.json")
     meta_side.write_text(

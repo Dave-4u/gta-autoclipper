@@ -444,8 +444,8 @@ def split_filter_complex(
 
     # Trim Twitch chat / right-edge player UI and bottom sub bars
     chat = layout.chat_side
-    if chat == "right" or (gx + gw) > 0.78:
-        gw = min(gw, max(0.40, 0.74 - gx))
+    if chat == "right" or (gx + gw) > 0.82:
+        gw = min(gw, max(0.45, 0.80 - gx))
     if chat == "left" and gx < 0.16:
         trim = 0.16 - gx
         gx = 0.16
@@ -468,9 +468,12 @@ def split_filter_complex(
             left = max(0.02, min(gx, fx + fw + 0.02))
             safe = (left, 0.04, max(0.40, right - left), 0.90)
             mean_safe = _region_mean(Path(source), float(refine_t), safe)
-            if mean_safe >= mean_final - 2 or _box_area(safe) > _box_area((gx, gy, gw, gh)):
+            # Only switch if the safe band is actually brighter (readable trailer)
+            if mean_safe > mean_final + 3:
                 print(f"[layout] dark/small game mean={mean_final:.1f} -> safe {safe} mean={mean_safe:.1f}")
                 gx, gy, gw, gh = safe
+            else:
+                print(f"[layout] keep game mean={mean_final:.1f} (safe not brighter: {mean_safe:.1f})")
 
     # Exact even panel heights that sum to frame height (yuv420-safe)
     width = int(width) - (int(width) % 2)
@@ -493,14 +496,17 @@ def split_filter_complex(
     parts = [
         f"[{in_label}]split=2[fsrc][gsrc]",
         f"[fsrc]format=rgb24,{even_crop(fx, fy, fw, fh)},"
+        # Zoom slightly into the PiP so stream chrome/black edges are cropped out
         f"scale={width}:{top_h}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{top_h},setsar=1,format=yuv420p[face]",
+        f"crop={width}:{top_h},"
+        f"scale=iw*1.22:ih*1.22,"
+        f"crop={width}:{top_h}:(iw-{width})/2:(ih-{top_h})/2,"
+        f"setsar=1,format=yuv420p[face]",
         f"[gsrc]format=rgb24,{even_crop(gx, gy, gw, gh)},"
         f"crop=floor(iw*0.96/2)*2:floor(ih*0.96/2)*2:floor(iw*0.02/2)*2:floor(ih*0.02/2)*2,"
-        f"scale={width}:{bot_h + 8}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{bot_h + 8},setsar=1,format=yuv420p[game]",
-        f"[face]pad={width}:{height}:0:0:black[canvas],"
-        f"[canvas][game]overlay=0:{top_h - 8},setsar=1,setpts=PTS/{speed},format=yuv420p[{out_label}]",
+        f"scale={width}:{bot_h}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{bot_h},setsar=1,format=yuv420p[game],"
+        f"[face][game]vstack=inputs=2,setsar=1,setpts=PTS/{speed},format=yuv420p[{out_label}]",
     ]
     print(f"[layout] final face={(fx, fy, fw, fh)} game={(gx, gy, gw, gh)}")
     return ";".join(parts)
