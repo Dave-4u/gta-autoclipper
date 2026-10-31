@@ -93,26 +93,32 @@ def mean_trailer_motion(
 
 
 
-def game_panel_stable(
+def trailer_content_ok(
     path: Path,
     start: float,
     end: float,
     game_box: tuple[float, float, float, float] = (0.28, 0.05, 0.50, 0.90),
     *,
-    max_mean_jump: float = 35.0,
-    n_samples: int = 6,
+    n_samples: int = 8,
+    min_motion: float = 8.0,
 ) -> dict[str, Any]:
-    """Reject windows where the game/trailer crop jumps to face-cam / grey room mid-clip."""
+    """Require real trailer/gameplay in the game crop — reject static logos / grey cards.
+
+    Uses frame-diff motion + per-sample mean. A Rockstar logo on dark grey has
+    near-zero motion and flat means; real trailer has motion and/or scene cuts.
+    """
     import numpy as np
     from PIL import Image
 
     gx, gy, gw, gh = game_box
     dur = max(0.5, float(end) - float(start))
     means: list[float] = []
+    stds: list[float] = []
+    arrs: list[Any] = []
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
-        for i in range(n_samples):
-            t = start + dur * (i + 0.5) / n_samples
+        times = [start + dur * (i + 0.5) / n_samples for i in range(n_samples)]
+        for i, t in enumerate(times):
             vf = f"crop=iw*{gw}:ih*{gh}:iw*{gx}:ih*{gy},scale=240:-2"
             out = td_path / f"f{i:02d}.png"
             subprocess.run(
@@ -123,10 +129,57 @@ def game_panel_stable(
             if out.is_file():
                 im = np.array(Image.open(out)).astype(np.float32)
                 means.append(float(im.mean()))
-    if len(means) < 3:
-        return {"ok": False, "jump": 999.0, "means": means}
-    jump = float(max(means) - min(means))
-    return {"ok": jump <= max_mean_jump, "jump": jump, "means": means}
+                stds.append(float(im.std()))
+                arrs.append(im)
+    if len(arrs) < 3:
+        return {"ok": False, "reason": "no_frames", "motion": 0.0, "means": means}
+    diffs = [float(np.mean(np.abs(arrs[i] - arrs[i - 1]))) for i in range(1, len(arrs))]
+    motion = float(sum(diffs) / len(diffs))
+    jump = float(max(means) - min(means)) if means else 0.0
+    mean_avg = float(sum(means) / len(means))
+    std_avg = float(sum(stds) / len(stds)) if stds else 0.0
+
+    reasons = []
+    # Static logo / title card: almost no motion, flat means, often dark
+    if motion < 4.0 and jump < 10.0:
+        reasons.append(f"static_logo_mot={motion:.1f}")
+    # Near-solid grey/black card
+    if std_avg < 18.0 and motion < 6.0:
+        reasons.append(f"flat_panel_std={std_avg:.1f}")
+    # Require measurable trailer motion overall
+    if motion < min_motion and "static_logo_mot" not in "".join(reasons):
+        # already flagged as logo, or genuinely low motion
+        if motion < min_motion:
+            reasons.append(f"low_trailer_motion={motion:.1f}")
+    ok = not reasons
+    return {
+        "ok": ok,
+        "motion": motion,
+        "jump": jump,
+        "mean_avg": mean_avg,
+        "std_avg": std_avg,
+        "means": means,
+        "reasons": reasons,
+        # keep old keys for callers
+        "logo": any("static_logo" in r or "flat_panel" in r for r in reasons),
+    }
+
+
+def game_panel_stable(
+    path: Path,
+    start: float,
+    end: float,
+    game_box: tuple[float, float, float, float] = (0.28, 0.05, 0.50, 0.90),
+    *,
+    max_mean_jump: float = 35.0,
+    n_samples: int = 6,
+) -> dict[str, Any]:
+    """Back-compat wrapper — prefer trailer_content_ok for new gates."""
+    r = trailer_content_ok(path, start, end, game_box, n_samples=n_samples, min_motion=6.0)
+    # For stable: logo fails; high jump with high motion is OK (trailer cuts)
+    ok = r["ok"] or (r["motion"] >= 8.0 and not r.get("logo"))
+    return {"ok": ok, "jump": r["jump"], "means": r["means"], "motion": r["motion"]}
+
 
 
 def silence_runs(
@@ -265,7 +318,7 @@ def window_ok(
     stab: dict[str, Any] = {"jump": 0.0, "means": []}
     dur = max(0.5, float(end) - float(start))
     try:
-        stab = game_panel_stable(path, start, end, box)
+        stab = trailer_content_ok(path, start, end, box, min_motion=8.0)
     except Exception as e:
         print(f"[window-gate] panel stability skip: {e}")
         stab = {"jump": 0.0, "means": [], "ok": True}
@@ -282,7 +335,7 @@ def window_ok(
     if freeze > freeze_limit:
         reasons.append(f"game_frozen_{freeze:.1f}s")
     if not stab.get("ok", True):
-        reasons.append(f"panel_jump_{stab.get('jump', 0):.0f}")
+        reasons.extend(stab.get("reasons") or [f"trailer_bad_jump_{stab.get('jump', 0):.0f}"])
     if sil > max_silence_s and speech["coverage"] < 0.15:
         reasons.append(f"silence_{sil:.1f}s")
     if require_speech and speech["coverage"] < min_speech_coverage:
@@ -292,7 +345,7 @@ def window_ok(
     ok = not reasons
     print(
         f"[window-gate] {start:.1f}-{end:.1f} freeze={freeze:.1f}s mot={motion:.1f} "
-        f"silence={sil:.1f}s jump={stab.get('jump', 0):.0f} speech={speech['coverage']:.0%}({speech['n_words']}w) "
+        f"silence={sil:.1f}s trailer_mot={stab.get('motion', 0):.1f} jump={stab.get('jump', 0):.0f} speech={speech['coverage']:.0%}({speech['n_words']}w) "
         f"ok={ok} {reasons}"
     )
     return {

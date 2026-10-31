@@ -583,9 +583,11 @@ def make_voiceover(ctx: HookContext, cfg: dict[str, Any], out_wav: Path, *, head
 
 
 def make_intro_vo(text: str, cfg: dict[str, Any], out_wav: Path) -> VoiceoverResult:
-    """Spoken hook VARIANT of the header — never read the header verbatim.
+    """Speak the on-screen header text as the intro VO (title-card prepend).
 
-    Pass skip_if_weak=True via cfg voiceover.intro_skip_weak to drop empty intros.
+    Callers pass the header line; we keep it (≤14 words), add punchy punctuation,
+    and apply pronunciation hints for TTS. Stock hooks only if the line is empty/too long.
+    Pass voiceover.intro_skip_weak to drop empty intros.
     """
     from .entities import normalize_pronunciation
     header = re.sub(r"\s+", " ", (text or "").strip())

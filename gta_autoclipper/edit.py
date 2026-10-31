@@ -341,11 +341,20 @@ def render_clip(
             min_speech_coverage=0.50, require_speech=not pre,
         )
         if not gate.get("ok"):
+            reasons = gate.get("reasons") or []
+            # NEVER soft-pass a static logo / flat grey trailer panel
+            hard = any(
+                ("static_logo" in str(r)) or ("flat_panel" in str(r)) or ("low_trailer_motion" in str(r))
+                for r in reasons
+            )
+            if hard:
+                print(f"[edit] window rejected (trailer content): {reasons}")
+                return None
             # Soft: preconfirmed upstream pick, or speech+motion close enough
             if pre or (gate.get("speech_coverage", 0) >= 0.25 and gate.get("motion", 0) >= 6):
-                print(f"[edit] window soft-pass: {gate.get('reasons')} pre={pre}")
+                print(f"[edit] window soft-pass: {reasons} pre={pre}")
             else:
-                print(f"[edit] window rejected: {gate.get('reasons')}")
+                print(f"[edit] window rejected: {reasons}")
                 return None
     except Exception as e:
         print(f"[edit] window gate skip: {e}")
@@ -596,12 +605,11 @@ def render_clip(
 
         intro_cfg_on = bool(vo_cfg.get("intro_header", True))
         intro_dur = float(vo_cfg.get("intro_seconds", 1.8))
-        # VO is PREPEND-ONLY (1.5–2.5s over frozen first frame). Never over streamer speech.
-        # Prefer LLM punchline as the intro line; else speak the hook header.
-        if intro_cfg_on and (llm_vo or hook_res.text):
+        # VO is PREPEND-ONLY (1.5–2.5s). Intended: speak the HEADER text over a title card.
+        if intro_cfg_on and hook_res.text:
             intro_wav = td_path / "intro.wav"
-            intro_line = (llm_vo or hook_res.text or "").strip()
-            # Keep intro short
+            # VO line MUST equal the on-screen header (fit to readable length)
+            intro_line = hook_display.strip() or hook_res.text.strip()
             words_l = intro_line.split()
             if len(words_l) > 12:
                 intro_line = " ".join(words_l[:12])
@@ -819,18 +827,39 @@ def render_clip(
                     intro_dur = min(2.5, max(1.5, d1 + 0.05))
                     print(f"[edit] VO resampled 48k stereo dur={d1:.3f}s")
 
+                # Title-card intro: blurred first frame + dark veil + huge centered header
+                # (VO speaks the same header text). Clearly distinct from the reaction body.
                 frame0 = td_path / "frame0.png"
                 subprocess.run(
                     ["ffmpeg", "-y", "-i", str(out_path), "-frames:v", "1", "-q:v", "2", str(frame0)],
                     capture_output=True, check=False,
                 )
                 hook_esc = _escape_drawtext(hook_display)
+                # Split long headers into 2 lines for the card (clean header, not TTS phonetics)
+                hw = hook_display.split()
+                if len(hw) > 5:
+                    mid = max(3, len(hw) // 2)
+                    line1 = _escape_drawtext(" ".join(hw[:mid]))
+                    line2 = _escape_drawtext(" ".join(hw[mid:]))
+                    title_draw = (
+                        f"drawtext=text='{line1}'{font_opt}:fontsize=64:fontcolor=yellow:"
+                        f"borderw=6:bordercolor=black:x=(w-text_w)/2:y=(h/2)-80,"
+                        f"drawtext=text='{line2}'{font_opt}:fontsize=64:fontcolor=yellow:"
+                        f"borderw=6:bordercolor=black:x=(w-text_w)/2:y=(h/2)+10"
+                    )
+                else:
+                    title_draw = (
+                        f"drawtext=text='{hook_esc}'{font_opt}:fontsize=72:fontcolor=yellow:"
+                        f"borderw=7:bordercolor=black:x=(w-text_w)/2:y=(h-text_h)/2"
+                    )
+                # Use ih/iw (not h/w) in drawbox; escape font path for filter_complex
                 intro_vf = (
-                    f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-                    f"fps=30,format=yuv420p,setsar=1,"
-                    f"drawtext=text='{hook_esc}'{font_opt}:fontsize=56:fontcolor=yellow:"
-                    f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.14"
+                    f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                    f"crop={width}:{height},"
+                    f"gblur=sigma=18,eq=brightness=-0.25:saturation=0.7,"
+                    f"drawbox=x=0:y=ih*0.38:w=iw:h=ih*0.24:color=black@0.55:t=fill,"
+                    f"{title_draw},"
+                    f"fps=30,format=yuv420p,setsar=1"
                 )
                 pr_i = subprocess.run(
                     [
