@@ -92,6 +92,43 @@ def mean_trailer_motion(
         return float(sum(diffs) / len(diffs))
 
 
+
+def game_panel_stable(
+    path: Path,
+    start: float,
+    end: float,
+    game_box: tuple[float, float, float, float] = (0.28, 0.05, 0.50, 0.90),
+    *,
+    max_mean_jump: float = 35.0,
+    n_samples: int = 6,
+) -> dict[str, Any]:
+    """Reject windows where the game/trailer crop jumps to face-cam / grey room mid-clip."""
+    import numpy as np
+    from PIL import Image
+
+    gx, gy, gw, gh = game_box
+    dur = max(0.5, float(end) - float(start))
+    means: list[float] = []
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        for i in range(n_samples):
+            t = start + dur * (i + 0.5) / n_samples
+            vf = f"crop=iw*{gw}:ih*{gh}:iw*{gx}:ih*{gy},scale=240:-2"
+            out = td_path / f"f{i:02d}.png"
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", f"{t:.2f}", "-i", str(path),
+                 "-frames:v", "1", "-vf", vf, "-q:v", "5", str(out)],
+                capture_output=True, check=False,
+            )
+            if out.is_file():
+                im = np.array(Image.open(out)).astype(np.float32)
+                means.append(float(im.mean()))
+    if len(means) < 3:
+        return {"ok": False, "jump": 999.0, "means": means}
+    jump = float(max(means) - min(means))
+    return {"ok": jump <= max_mean_jump, "jump": jump, "means": means}
+
+
 def silence_runs(
     path: Path,
     start: float,
@@ -225,10 +262,18 @@ def window_ok(
             print(f"[window-gate] speech coverage error: {e}")
             speech = {"coverage": 0.0, "n_words": 0, "words": []}
     reasons = []
+    stab: dict[str, Any] = {"jump": 0.0, "means": []}
     dur = max(0.5, float(end) - float(start))
-    # Trailer motion: require measurable motion (mean frame-diff). Streamers often
-    # pause briefly to talk — allow longer contiguous freezes when speech is strong.
+    try:
+        stab = game_panel_stable(path, start, end, box)
+    except Exception as e:
+        print(f"[window-gate] panel stability skip: {e}")
+        stab = {"jump": 0.0, "means": [], "ok": True}
+    # Trailer motion: streamers often pause to talk — allow near-static trailer
+    # when speech is strong AND the game panel stays stable (not face-cam grey).
     min_motion = 6.0
+    if speech["coverage"] >= min_speech_coverage and stab.get("ok", True):
+        min_motion = 1.0
     if motion < min_motion:
         reasons.append(f"trailer_static_mot={motion:.1f}")
     freeze_limit = max_freeze_s
@@ -236,6 +281,8 @@ def window_ok(
         freeze_limit = max(max_freeze_s, 0.70 * dur)  # talk-over-pause OK
     if freeze > freeze_limit:
         reasons.append(f"game_frozen_{freeze:.1f}s")
+    if not stab.get("ok", True):
+        reasons.append(f"panel_jump_{stab.get('jump', 0):.0f}")
     if sil > max_silence_s and speech["coverage"] < 0.15:
         reasons.append(f"silence_{sil:.1f}s")
     if require_speech and speech["coverage"] < min_speech_coverage:
@@ -245,7 +292,7 @@ def window_ok(
     ok = not reasons
     print(
         f"[window-gate] {start:.1f}-{end:.1f} freeze={freeze:.1f}s mot={motion:.1f} "
-        f"silence={sil:.1f}s speech={speech['coverage']:.0%}({speech['n_words']}w) "
+        f"silence={sil:.1f}s jump={stab.get('jump', 0):.0f} speech={speech['coverage']:.0%}({speech['n_words']}w) "
         f"ok={ok} {reasons}"
     )
     return {

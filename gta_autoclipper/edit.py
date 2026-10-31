@@ -731,10 +731,10 @@ def render_clip(
             )
             # FULL-LEVEL source audio (streamer + trailer). No ducking, no VO mix.
             achain = (
-                f"[0:a]{src_af},aformat=sample_rates=48000:channel_layouts=stereo,"
+                f"[0:a]{src_af},aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
                 f"loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
                 if src_af != "anull"
-                else f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+                else f"[0:a]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
                      f"loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
             )
             fc = f"{vchain};{achain}"
@@ -786,12 +786,39 @@ def render_clip(
         except Exception as e:
             print(f"[edit] dur assert skip: {e}")
 
-        # PREPEND short VO intro over frozen first frame (never over streamer speech)
+        # PREPEND short VO intro over frozen first frame (never over streamer speech).
+        # Audio hardening: kokoro emits 24kHz mono — ALWAYS resample to 48kHz stereo WAV
+        # first, then concat with aresample. Never rely on aformat alone / never asetrate.
         if prepend_vo is not None and intro_dur >= 1.4 and out_path.is_file():
             try:
                 intro_mp4 = td_path / "vo_intro.mp4"
                 body_norm = td_path / "body_norm.mp4"
-                # Frozen first frame of body for intro_dur + VO audio
+                vo48 = td_path / "intro_48k.wav"
+                # Explicit resample VO → 48k stereo (prevents 24k-as-48k chipmunk)
+                pr_rs = subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-i", str(prepend_vo),
+                        "-af", "aresample=48000:async=1,aformat=sample_rates=48000:channel_layouts=stereo",
+                        "-ar", "48000", "-ac", "2", str(vo48),
+                    ],
+                    capture_output=True, text=True, check=False,
+                )
+                if pr_rs.returncode != 0 or not vo48.is_file():
+                    print("[edit] VO resample failed:", (pr_rs.stderr or "")[-300:])
+                    vo48 = prepend_vo
+                else:
+                    # Assert resampled duration ≈ original (±5%)
+                    import wave as _w2
+                    with _w2.open(str(prepend_vo), "rb") as _a:
+                        d0 = _a.getnframes() / float(_a.getframerate() or 1)
+                    with _w2.open(str(vo48), "rb") as _b:
+                        d1 = _b.getnframes() / float(_b.getframerate() or 1)
+                        sr1 = _b.getframerate()
+                    if sr1 != 48000 or abs(d1 - d0) > 0.05 * max(d0, 0.1):
+                        print(f"[edit] WARN VO resample sr={sr1} dur {d0:.3f}->{d1:.3f}")
+                    intro_dur = min(2.5, max(1.5, d1 + 0.05))
+                    print(f"[edit] VO resampled 48k stereo dur={d1:.3f}s")
+
                 frame0 = td_path / "frame0.png"
                 subprocess.run(
                     ["ffmpeg", "-y", "-i", str(out_path), "-frames:v", "1", "-q:v", "2", str(frame0)],
@@ -808,11 +835,14 @@ def render_clip(
                 pr_i = subprocess.run(
                     [
                         "ffmpeg", "-y",
-                        "-loop", "1", "-t", f"{intro_dur:.3f}", "-i", str(frame0),
-                        "-i", str(prepend_vo),
-                        "-vf", intro_vf,
-                        "-af", f"aformat=sample_rates=48000:channel_layouts=stereo,volume={vo_vol},"
-                               f"apad=whole_dur={intro_dur:.3f},atrim=0:{intro_dur:.3f}",
+                        "-loop", "1", "-framerate", "30", "-t", f"{intro_dur:.3f}", "-i", str(frame0),
+                        "-i", str(vo48),
+                        "-filter_complex",
+                        f"[0:v]{intro_vf}[v];"
+                        f"[1:a]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                        f"volume={vo_vol},apad=whole_dur={intro_dur:.3f},atrim=0:{intro_dur:.3f},"
+                        f"asetpts=PTS-STARTPTS[a]",
+                        "-map", "[v]", "-map", "[a]",
                         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
                         "-pix_fmt", "yuv420p", "-r", "30",
@@ -820,12 +850,15 @@ def render_clip(
                     ],
                     capture_output=True, text=True, check=False,
                 )
-                # Normalize body to 30fps/48kHz for clean concat
+                # Body: force 30fps + 48kHz with aresample (never asetrate)
                 pr_b = subprocess.run(
                     [
                         "ffmpeg", "-y", "-i", str(out_path),
-                        "-vf", f"fps=30,scale={width}:{height},setsar=1,format=yuv420p",
-                        "-af", "aformat=sample_rates=48000:channel_layouts=stereo",
+                        "-filter_complex",
+                        f"[0:v]fps=30,scale={width}:{height},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v];"
+                        f"[0:a]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                        f"asetpts=PTS-STARTPTS[a]",
+                        "-map", "[v]", "-map", "[a]",
                         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
                         "-r", "30", str(body_norm),
@@ -833,7 +866,7 @@ def render_clip(
                     capture_output=True, text=True, check=False,
                 )
                 final_tmp = td_path / "with_intro.mp4"
-                if intro_mp4.is_file() and body_norm.is_file():
+                if intro_mp4.is_file() and body_norm.is_file() and pr_i.returncode == 0 and pr_b.returncode == 0:
                     pr_c = subprocess.run(
                         [
                             "ffmpeg", "-y",
@@ -851,7 +884,7 @@ def render_clip(
                     )
                     if pr_c.returncode == 0 and final_tmp.is_file():
                         out_path.write_bytes(final_tmp.read_bytes())
-                        print(f"[edit] prepended VO intro {intro_dur:.2f}s (frozen first frame)")
+                        print(f"[edit] prepended VO intro {intro_dur:.2f}s (48k resampled, frozen frame)")
                     else:
                         print("[edit] intro concat failed:", (pr_c.stderr or "")[-400:])
                 else:
@@ -873,18 +906,32 @@ def render_clip(
                     _dur = max(1.0, float((_pr.stdout or "12").strip()))
                 except Exception:
                     pass
-                # Prefer source-window streamer words (already shifted into caption_words)
+                # Prefer source-window streamer words (shifted). Only replace with final
+                # whisper if it yields MORE confident streamer-like tokens (not trailer OCR).
                 final_words = list(caption_words) if caption_words else []
-                # Also whisper final audio AFTER intro so we capture streamer voice; drop early VO tokens
                 whispered = get_word_timestamps(
                     out_path, float(intro_dur), _dur, model_name=model_name, niche_id=niche_id
                 )
                 if len(whispered) < 3 and model_name != "tiny":
                     whispered = get_word_timestamps(
-                        out_path, float(intro_dur), _dur, model_name="tiny", niche_id=niche_id
+                        out_path, float(intro_dur), _dur,
+                        model_name="base" if model_name == "tiny" else "tiny",
+                        niche_id=niche_id,
                     )
-                if len(whispered) >= len(final_words):
+                def _streamer_like(ws):
+                    text = " ".join(str(w.get("word","")) for w in ws).lower()
+                    if re.search(r"(grand theft auto|gta\s*6).{0,40}(coming|november|pre-?order)", text):
+                        if not re.search(r"\b(i|i'm|bro|chat|dude|oh my|fuck|wait)\b", text):
+                            return False
+                    return len(ws) >= 4
+                if _streamer_like(whispered) and len(whispered) > len(final_words) + 2:
                     final_words = whispered
+                elif not final_words and _streamer_like(whispered):
+                    final_words = whispered
+                # Drop captions entirely if nothing confident
+                if not _streamer_like(final_words) and len(final_words) < 6:
+                    print("[edit] dropping low-confidence captions")
+                    final_words = []
                 if final_words:
                     ass2 = td_path / "captions_final.ass"
                     n2 = _write_ass_captions(final_words, ass2, width, height, font_name=font_name)

@@ -460,20 +460,12 @@ def split_filter_complex(
     gw = min(gw, 1.0 - gx)
     gh = min(gh, 1.0 - gy)
 
-    # If game region is still too dark/small, fall back to full non-face / non-chat band
+    # NEVER expand game crop into a "safe" band — that previously swallowed the face
+    # cam / grey carpet and made the bottom panel look solid grey mid-clip.
+    # Prefer Gemini/YuNet game box; only shrink (chat trim above), never enlarge.
     if source is not None and refine_t is not None:
         mean_final = _region_mean(Path(source), float(refine_t), (gx, gy, gw, gh))
-        if mean_final < 32.0 or _box_area((gx, gy, gw, gh)) < 0.28:
-            right = 0.74 if layout.chat_side == "right" else 0.92
-            left = max(0.02, min(gx, fx + fw + 0.02))
-            safe = (left, 0.04, max(0.40, right - left), 0.90)
-            mean_safe = _region_mean(Path(source), float(refine_t), safe)
-            # Only switch if the safe band is actually brighter (readable trailer)
-            if mean_safe > mean_final + 3:
-                print(f"[layout] dark/small game mean={mean_final:.1f} -> safe {safe} mean={mean_safe:.1f}")
-                gx, gy, gw, gh = safe
-            else:
-                print(f"[layout] keep game mean={mean_final:.1f} (safe not brighter: {mean_safe:.1f})")
+        print(f"[layout] game box mean={mean_final:.1f} area={_box_area((gx, gy, gw, gh)):.3f} (no safe-expand)")
 
     # Exact even panel heights that sum to frame height (yuv420-safe)
     width = int(width) - (int(width) % 2)

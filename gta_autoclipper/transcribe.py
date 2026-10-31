@@ -126,8 +126,8 @@ def _segment_ok(
     seg: Any,
     *,
     niche_id: str | None = None,
-    min_avg_logprob: float = -1.0,
-    max_no_speech: float = 0.65,
+    min_avg_logprob: float = -0.65,
+    max_no_speech: float = 0.55,
     max_compression: float = 2.4,
 ) -> bool:
     """Quality gate for a faster-whisper segment."""
@@ -159,6 +159,12 @@ def _segment_ok(
     if niche == "anime" and re.search(r"\b(gta\s*6|grand theft auto|rockstar)\b", low):
         return False
     if niche == "gta6" and re.search(r"\b(naruto|one piece|jujutsu|demon slayer)\b", low):
+        return False
+    # Trailer on-screen text / announcer hallucinations (not streamer speech)
+    if re.search(
+        r"(grand theft auto|gta\s*6).{0,40}(coming|november|pre-?order|february|launch)",
+        low,
+    ) and not re.search(r"\b(i|i'm|im|bro|chat|dude|oh my|fuck|wait|look)\b", low):
         return False
     return True
 

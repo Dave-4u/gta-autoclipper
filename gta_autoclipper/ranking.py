@@ -610,7 +610,7 @@ def _render_rank_segment(
 
     # Cover baked-in center header so #N / label don't clash with it
     vf = (
-        f"drawbox=x=iw*0.05:y=250:w=iw*0.90:h=100:color=black@1.0:t=fill,"
+        f""
         f"drawtext=text='{rank_txt}':fontsize=96:fontcolor=yellow:"
         f"borderw=6:bordercolor=black:x=40:y=60,"
         f"drawtext=text='{label}':fontsize=44:fontcolor=white:"
@@ -785,9 +785,9 @@ def build_ranking_video(
         rank_txt = _escape_drawtext(f"#{item.rank}")
         label = _escape_drawtext(_fit_header_words(item.label, 28))
         views = _escape_drawtext(_format_views(item.views))
-        # Cover old # badge with a black box then draw new
+        # Outline-only rank labels (no black box over faces)
         vf = (
-            f"drawbox=x=iw*0.05:y=250:w=iw*0.90:h=100:color=black@1.0:t=fill,"
+            f""
             f"drawtext=text='{rank_txt}':fontsize=96:fontcolor=yellow:"
             f"borderw=6:bordercolor=black:x=40:y=60,"
             f"drawtext=text='{label}':fontsize=44:fontcolor=white:"
@@ -797,7 +797,9 @@ def build_ranking_video(
         )
         pr = subprocess.run(
             ["ffmpeg", "-y", "-i", str(base), "-vf", vf,
-             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy", str(fixed)],
+             "-af", "aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+             "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k", str(fixed)],
             capture_output=True, text=True, check=False,
         )
         parts.append(fixed if fixed.is_file() else base)
