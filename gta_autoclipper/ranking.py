@@ -503,24 +503,39 @@ def _render_title_card(
                 dur = max(2.5, min(4.5, w.getnframes() / float(w.getframerate() or 1) + 0.4))
         except Exception:
             pass
-    # TikTok-style: huge bold centered title with heavy stroke + shadow
-    # Split long topics across 2 drawtext lines when needed
+    # TikTok-style: huge bold title — wrap by ~14-char lines so nothing clips
     words = topic_fit.split()
-    if len(words) > 4:
-        mid = len(words) // 2
-        line1 = _escape_drawtext(" ".join(words[:mid]))
-        line2 = _escape_drawtext(" ".join(words[mid:]))
-        draw = (
-            f"drawtext=text='{line1}':fontsize=72:fontcolor=yellow:borderw=8:bordercolor=black:"
-            f"shadowx=3:shadowy=3:shadowcolor=black@0.8:x=(w-text_w)/2:y=(h*0.36),"
-            f"drawtext=text='{line2}':fontsize=72:fontcolor=yellow:borderw=8:bordercolor=black:"
-            f"shadowx=3:shadowy=3:shadowcolor=black@0.8:x=(w-text_w)/2:y=(h*0.36)+90"
+    lines: list[str] = []
+    cur: list[str] = []
+    max_chars = 14
+    for w in words:
+        trial = (" ".join(cur + [w])).strip()
+        if cur and len(trial) > max_chars:
+            lines.append(" ".join(cur))
+            cur = [w]
+        else:
+            cur.append(w)
+    if cur:
+        lines.append(" ".join(cur))
+    if not lines:
+        lines = [topic_fit]
+    # Prefer 2–3 lines; bump fontsize when short
+    fs = 108 if len(lines) >= 3 else (118 if len(lines) == 2 else 128)
+    # If any line still too long for 1080 @ fs (~0.55*fs per glyph), drop fs
+    longest = max(len(L) for L in lines)
+    while longest * fs * 0.55 > 1000 and fs > 72:
+        fs -= 4
+    parts = []
+    line_h = int(fs * 1.2)
+    base_y = int(1920 * (0.40 - 0.055 * (len(lines) - 1)))
+    for i, line in enumerate(lines):
+        esc = _escape_drawtext(line)
+        y = base_y + i * line_h
+        parts.append(
+            f"drawtext=text='{esc}':fontsize={fs}:fontcolor=yellow:borderw=14:bordercolor=black:"
+            f"shadowx=3:shadowy=3:shadowcolor=black@0.85:x=(w-text_w)/2:y={y}"
         )
-    else:
-        draw = (
-            f"drawtext=text='{topic_esc}':fontsize=80:fontcolor=yellow:borderw=10:bordercolor=black:"
-            f"shadowx=4:shadowy=4:shadowcolor=black@0.85:x=(w-text_w)/2:y=(h*0.40)"
-        )
+    draw = ",".join(parts)
     if footage and Path(footage).is_file():
         vf = (
             f"scale={width}:{height}:force_original_aspect_ratio=increase,"

@@ -133,7 +133,7 @@ def detect_layout(path: Path, t: float) -> FaceCamLayout:
         if scored[0][0] >= 1.0:
             face_box = scored[0][2]
             x, y, fw, fh = face_box
-            pad_x, pad_y = fw * 0.45, fh * 0.55
+            pad_x, pad_y = fw * 0.55, fh * 0.65
             x0 = max(0.0, x - pad_x)
             y0 = max(0.0, y - pad_y)
             x1 = min(1.0, x + fw + pad_x)
@@ -260,8 +260,7 @@ def split_filter_complex(
     if not layout.face:
         return None
     fx, fy, fw, fh = layout.face
-    # Source crop uses iw/ih expressions
-    # Clamp
+    # Clamp normalized boxes
     fx, fy = max(0.0, min(0.85, fx)), max(0.0, min(0.85, fy))
     fw, fh = max(0.12, min(1.0 - fx, fw)), max(0.12, min(1.0 - fy, fh))
 
@@ -271,19 +270,19 @@ def split_filter_complex(
         gx, gy, gw, gh = 0.05, 0.05, 0.9, 0.9
     gx, gy = max(0.0, min(0.8, gx)), max(0.0, min(0.8, gy))
     gw, gh = max(0.3, min(1.0 - gx, gw)), max(0.3, min(1.0 - gy, gh))
-    # If game bbox is nearly the full frame, carve out the face-cam side so we
-    # don't re-include the source's face/chrome/black gutter in the bottom panel.
+
+    # Carve face out of near-full-frame game bbox only (never touch face box)
     if gw * gh > 0.85 and layout.face:
         ffx, ffy, ffw, ffh = layout.face
         face_cx = ffx + ffw / 2
-        if face_cx > 0.65:  # face on right — keep left/center as game
+        if face_cx > 0.65:
             gw = min(gw, max(0.35, ffx - 0.02 - gx))
-        elif face_cx < 0.35:  # face on left — keep right as game
+        elif face_cx < 0.35:
             new_x = max(gx, ffx + ffw + 0.02)
             gw = max(0.35, gx + gw - new_x)
             gx = new_x
         print(f"[layout] carved game around face -> {(gx, gy, gw, gh)}")
-    # Tighten face + game crops to strip letterbox/black bars inside each region
+
     if source is not None and refine_t is not None:
         try:
             fx, fy, fw, fh = cropdetect_box(Path(source), float(refine_t), (fx, fy, fw, fh))
@@ -295,44 +294,53 @@ def split_filter_complex(
             print(f"[layout] cropdetect game -> {(gx, gy, gw, gh)}")
         except Exception as e:
             print(f"[layout] cropdetect game skip: {e}")
-        # Inward shrink to kill residual letterbox/chat chrome on edges
-        gx = gx + gw * 0.05
-        gy = gy + gh * 0.06
-        gw = gw * 0.90
-        gh = gh * 0.88
-        gx, gy = max(0.0, gx), max(0.0, gy)
-        gw = max(0.25, min(1.0 - gx, gw))
-        gh = max(0.25, min(1.0 - gy, gh))
-        # Face: zoom in slightly so webcam fills the top panel
-        fx = fx + fw * 0.06
-        fy = fy + fh * 0.06
-        fw = fw * 0.88
-        fh = fh * 0.88
-        fx, fy = max(0.0, fx), max(0.0, fy)
-        fw = max(0.10, min(1.0 - fx, fw))
-        fh = max(0.10, min(1.0 - fy, fh))
+        # Mild inward shrink on GAME only (kill letterbox/chat chrome)
+        gx = min(0.9, gx + gw * 0.02)
+        gy = min(0.9, gy + gh * 0.03)
+        gw = max(0.3, gw * 0.96)
+        gh = max(0.3, gh * 0.94)
+        gw = min(gw, 1.0 - gx)
+        gh = min(gh, 1.0 - gy)
 
-    top_h = int(height * face_frac) // 2 * 2
+    # Exact even panel heights that sum to frame height (yuv420-safe)
+    width = int(width) - (int(width) % 2)
+    height = int(height) - (int(height) % 2)
+    top_h = int(round(height * face_frac))
     top_h = top_h - (top_h % 2)
     bot_h = height - top_h
-    bot_h = bot_h - (bot_h % 2)
-    if top_h + bot_h != height:
-        # Prefer filling height exactly: grow top if needed
-        top_h = height - bot_h
+    if bot_h % 2:
+        top_h -= 1
+        bot_h = height - top_h
     speed = max(0.5, min(2.0, float(speed)))
 
-    # Crop face & game, scale-to-FILL each panel (no letterbox), vstack with exact pixel heights.
+    # Do NOT expand face into neighboring game/gap (that pulls magenta/black).
+    # Tiny face crops are fine — scale-to-FILL zooms them to the panel.
+
+    # EVEN pixel crops; rgb24 during crop/scale avoids yuv420 magenta artifacts
+    def even_crop(fx_, fy_, fw_, fh_):
+        return (
+            f"crop=floor(iw*{fw_:.6f}/2)*2:floor(ih*{fh_:.6f}/2)*2:"
+            f"floor(iw*{fx_:.6f}/2)*2:floor(ih*{fy_:.6f}/2)*2"
+        )
+
+    # NOTE: never use force_divisible_by with increase — it shrinks output and
+    # letterboxes. Width/height targets are already even.
     parts = [
         f"[{in_label}]split=2[fsrc][gsrc]",
-        f"[fsrc]crop=iw*{fw:.4f}:ih*{fh:.4f}:iw*{fx:.4f}:ih*{fy:.4f},"
+        f"[fsrc]format=rgb24,{even_crop(fx, fy, fw, fh)},"
         f"scale={width}:{top_h}:force_original_aspect_ratio=increase,"
         f"crop={width}:{top_h},setsar=1,format=yuv420p[face]",
-        f"[gsrc]crop=iw*{gw:.4f}:ih*{gh:.4f}:iw*{gx:.4f}:ih*{gy:.4f},"
-        f"scale={width}:{bot_h}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{bot_h},setsar=1,format=yuv420p[game]",
-        f"[face][game]vstack=inputs=2,setsar=1,setpts=PTS/{speed},format=yuv420p[{out_label}]",
+        # Trim residual letterbox inside game crop, then fill-scale
+        f"[gsrc]format=rgb24,{even_crop(gx, gy, gw, gh)},"
+        f"crop=floor(iw*0.88/2)*2:floor(ih*0.88/2)*2:floor(iw*0.04/2)*2:floor(ih*0.06/2)*2,"
+        f"scale={width}:{bot_h + 4}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{bot_h + 4},setsar=1,format=yuv420p[game]",
+        # 4px overlap via overlay kills any seam at the join
+        f"[face]pad={width}:{height}:0:0:black[canvas],"
+        f"[canvas][game]overlay=0:{top_h - 4},setsar=1,setpts=PTS/{speed},format=yuv420p[{out_label}]",
     ]
     return ";".join(parts)
+
 
 
 def detect_at_segment(path: Path, start: float, end: float) -> FaceCamLayout:

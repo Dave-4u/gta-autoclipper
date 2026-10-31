@@ -145,56 +145,50 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         ass_path.write_text(header, encoding="utf-8")
         return 0
 
-    # Chronological order
+    # Chronological order; drop punctuation-only tokens (emdash etc.)
     cleaned.sort(key=lambda w: (float(w["start"]), float(w["end"])))
+    cleaned = [w for w in cleaned if any(ch.isalnum() for ch in w["word"])]
+    if not cleaned:
+        ass_path.write_text(header, encoding="utf-8")
+        return 0
 
-    # Chunk by 4 words; do NOT flush on commas (prevents phrase reordering)
-    chunks: list[list[dict[str, Any]]] = []
-    cur: list[dict[str, Any]] = []
-    for w in cleaned:
-        cur.append(w)
-        if len(cur) >= 4 or str(w["word"]).endswith((".", "!", "?")):
+    # Short VO (<=8 words): ONE chunk so the full line is always visible
+    if len(cleaned) <= 8:
+        chunks: list[list[dict[str, Any]]] = [cleaned]
+    else:
+        chunks = []
+        cur: list[dict[str, Any]] = []
+        for w in cleaned:
+            cur.append(w)
+            if len(cur) >= 5 or str(w["word"]).endswith((".", "!", "?")):
+                chunks.append(cur)
+                cur = []
+        if cur:
             chunks.append(cur)
-            cur = []
-    if cur:
-        chunks.append(cur)
 
+    # One Dialogue per chunk (full phrase visible). Non-overlapping windows.
+    # Karaoke \k highlights words in order without hiding prior text.
     events: list[tuple[float, str]] = []
-    for chunk in chunks:
-        tokens = [_ass_escape(c["word"]) for c in chunk]
+    for ci, chunk in enumerate(chunks):
+        start_t = float(chunk[0]["start"])
+        end_t = float(chunk[-1]["end"]) + 0.55
+        if ci + 1 < len(chunks):
+            end_t = min(end_t, float(chunks[ci + 1][0]["start"]) - 0.02)
+        if end_t <= start_t:
+            end_t = start_t + max(0.6, 0.22 * len(chunk))
+        parts = []
         for i, w in enumerate(chunk):
-            parts = []
-            for j, tok in enumerate(tokens):
-                if j == i:
-                    parts.append(
-                        r"{\c&" + COLOR_ACTIVE + r"&\b1\fscx110\fscy110}"
-                        + tok
-                        + r"{\r}"
-                    )
-                else:
-                    parts.append(r"{\c&" + COLOR_DIM + r"&}" + tok + r"{\r}")
-            line = " ".join(parts)
-            start_t = float(w["start"])
-            end_t = float(w["end"])
+            w_start = float(w["start"])
+            w_end = float(w["end"])
             if i + 1 < len(chunk):
-                end_t = max(end_t, float(chunk[i + 1]["start"]))
-            else:
-                end_t = max(end_t, start_t + 0.45)
-            if end_t <= start_t:
-                end_t = start_t + 0.25
-            events.append(
-                (start_t, f"Dialogue: 0,{_ts(start_t)},{_ts(end_t)},Word,,0,0,0,,{line}")
-            )
-
-    # Stretch final caption so the last word is not truncated
-    if events and cleaned:
-        import re as _re
-        st, line = events[-1]
-        m = _re.match(r"(Dialogue: \d+,)([^,]+),([^,]+),(.*)", line)
-        if m:
-            end_pad = float(cleaned[-1]["end"]) + 0.6
-            line = f"{m.group(1)}{m.group(2)},{_ts(end_pad)},{m.group(4)}"
-            events[-1] = (st, line)
+                w_end = max(w_end, float(chunk[i + 1]["start"]))
+            dur_cs = max(12, int(round((w_end - w_start) * 100)))
+            tok = _ass_escape(w["word"])
+            parts.append(r"{\k" + str(dur_cs) + r"\c&" + COLOR_ACTIVE + r"&}" + tok)
+        line = " ".join(parts)
+        events.append(
+            (start_t, f"Dialogue: 0,{_ts(start_t)},{_ts(end_t)},Word,,0,0,0,,{line}")
+        )
 
     events.sort(key=lambda e: e[0])
     ass_path.write_text(header + "\n".join(e[1] for e in events) + "\n", encoding="utf-8")
@@ -637,7 +631,7 @@ def render_clip(
                 cap_shift = shift
             else:
                 # Place VO early so captions never truncate at clip end; avoids long silent lead-in
-                cap_shift = 0.35
+                cap_shift = 0.55
                 # If VO would overrun the clip, we still start early (clip should cover it)
                 if cap_shift + vo_dur > clip_len_est - 0.2:
                     need = (cap_shift + vo_dur + 0.8) - clip_len_est
@@ -752,7 +746,7 @@ def render_clip(
                             com_dur = _w.getnframes() / float(_w.getframerate() or 1)
                     except Exception:
                         com_dur = 1.5
-                    payoff_at = 0.35
+                    payoff_at = 0.55  # must match caption cap_shift
                     delay_ms = int(payoff_at * 1000)
                     print(f"[edit] single VO delay={payoff_at:.2f}s")
                     cmd_d = [
@@ -777,7 +771,7 @@ def render_clip(
                         com_dur = _w.getnframes() / float(_w.getframerate() or 1)
                 except Exception:
                     com_dur = 1.5
-                payoff_at = max(intro_dur + 0.15, 0.35)
+                payoff_at = max(intro_dur + 0.15, 0.55)  # align with caption shift
                 delay_ms = int(payoff_at * 1000)
                 print(f"[edit] VO delay={payoff_at:.2f}s (clip={clip_len:.2f}s)")
                 cmd_mix = [
