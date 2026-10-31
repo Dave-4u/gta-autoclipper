@@ -385,3 +385,133 @@ def final_gate_video(
     data["reasons"] = reasons
     print(f"[final-gate] score={score} ok={ok} reasons={reasons} desc={str(data.get('desc',''))[:120]}")
     return data
+
+
+def score_reaction_intensity(
+    source: Path,
+    start: float,
+    end: float,
+    *,
+    cfg: dict[str, Any] | None = None,
+    title: str = "",
+    who: str = "",
+) -> dict[str, Any]:
+    """Gemini video-proxy score: visible+audible reaction intensity 0-10.
+
+    Reject windows scoring below 6 for reaction niche picks.
+    """
+    from .gemini_client import generate_video, has_gemini
+    from .window_gate import speech_coverage, trailer_content_ok
+
+    if end <= start:
+        return {"ok": False, "intensity": 0, "reason": "bad_window"}
+    speech = speech_coverage(source, start, end, niche_id="reactions")
+    trailer = {"ok": True, "motion": 0.0}
+    try:
+        trailer = trailer_content_ok(source, start, end, min_motion=6.0)
+    except Exception:
+        pass
+
+    intensity = 0
+    raw = ""
+    audible = False
+    visible = False
+    if has_gemini(cfg):
+        with tempfile.TemporaryDirectory() as td:
+            proxy = Path(td) / "react_proxy.mp4"
+            # Slightly denser fps so expression changes are visible
+            if not make_proxy(source, proxy, start=start, duration=end - start, height=360, fps=2.0, audio=True):
+                return {"ok": False, "intensity": 0, "reason": "proxy_fail", "speech_coverage": speech.get("coverage", 0)}
+            prompt = (
+                "You are rating a streamer reaction clip (face-cam + trailer/game footage).\n"
+                f"Title: {(title or '')[:120]}\n"
+                f"Who (if known): {(who or '')[:60]}\n"
+                "Watch the FULL proxy (video+audio). Answer EXACTLY:\n"
+                "INTENSITY: <integer 0-10>\n"
+                "VISIBLE: yes OR no  (clear face reaction: laugh, shock, yell, hands-on-face, hype)\n"
+                "AUDIBLE: yes OR no  (streamer voice reacting — not just trailer audio/music)\n"
+                "DESC: <one factual sentence>\n"
+                "Rubric: 0-2 blank/silent; 3-5 mild smile/talking; 6-7 clear shock/laugh/hype; "
+                "8-10 explosive reaction. Prefer honest scores."
+            )
+            try:
+                raw = generate_video(prompt=prompt, video_path=proxy, cfg=cfg, max_output_tokens=200)
+            except Exception as e:
+                print(f"[video_vlm] intensity score failed: {e}")
+                raw = str(e)[:160]
+        for ln in (raw or "").splitlines():
+            s = ln.strip(); low = s.lower()
+            if low.startswith("intensity"):
+                m = re.search(r"(\d+)", s)
+                if m:
+                    intensity = max(0, min(10, int(m.group(1))))
+            elif low.startswith("visible"):
+                rest = s.split(":", 1)[1].strip().lower() if ":" in s else ""
+                visible = rest.startswith("y") or rest == ""  # incomplete line → assume yes if intensity high
+            elif low.startswith("audible"):
+                rest = s.split(":", 1)[1].strip().lower() if ":" in s else ""
+                audible = rest.startswith("y")
+        # If Gemini omitted AUDIBLE, infer from speech coverage
+        if not audible and float(speech.get("coverage") or 0) >= 0.30:
+            audible = True
+        if intensity >= 6 and not visible:
+            visible = True  # intensity already implies visible reaction
+    else:
+        # No Gemini: approximate from speech coverage alone (conservative)
+        cov = float(speech.get("coverage") or 0)
+        intensity = 7 if cov >= 0.5 else (4 if cov >= 0.25 else 1)
+        audible = cov >= 0.35
+        visible = True
+        raw = "no_gemini_key"
+
+    cov = float(speech.get("coverage") or 0)
+    # Combined score: intensity primary, speech coverage as tie-breaker / hard floor
+    combined = float(intensity) + min(2.0, cov * 2.0)
+    ok = intensity >= 6 and audible and cov >= 0.25 and bool(trailer.get("ok", True))
+    return {
+        "ok": ok,
+        "intensity": intensity,
+        "combined": round(combined, 2),
+        "visible": visible,
+        "audible": audible,
+        "speech_coverage": cov,
+        "speech_words": int(speech.get("n_words") or 0),
+        "trailer_ok": bool(trailer.get("ok", True)),
+        "trailer_motion": float(trailer.get("motion") or 0),
+        "raw": (raw or "")[:400],
+        "start": float(start),
+        "end": float(end),
+    }
+
+
+def pick_best_reaction_window(
+    source: Path,
+    candidates: list[tuple[float, float]],
+    *,
+    cfg: dict[str, Any] | None = None,
+    title: str = "",
+    who: str = "",
+    min_intensity: int = 6,
+) -> dict[str, Any]:
+    """Score candidate windows; return the max combined score if intensity >= min."""
+    scored: list[dict[str, Any]] = []
+    for start, end in candidates:
+        r = score_reaction_intensity(
+            source, start, end, cfg=cfg, title=title, who=who,
+        )
+        print(
+            f"[react-score] {start:.1f}-{end:.1f} intensity={r.get('intensity')} "
+            f"speech={r.get('speech_coverage', 0):.0%} audible={r.get('audible')} "
+            f"ok={r.get('ok')} combined={r.get('combined')}"
+        )
+        scored.append(r)
+    scored.sort(key=lambda x: (float(x.get("combined") or 0), float(x.get("intensity") or 0)), reverse=True)
+    best = scored[0] if scored else {"ok": False, "intensity": 0, "reason": "no_candidates"}
+    if int(best.get("intensity") or 0) < min_intensity or not best.get("ok"):
+        return {
+            "ok": False,
+            "reason": f"best_intensity_{best.get('intensity')}<{min_intensity}",
+            "best": best,
+            "all": scored,
+        }
+    return {"ok": True, "best": best, "all": scored}

@@ -30,6 +30,11 @@ _HALLUCINATION_PHRASES = (
     "amara.org",
     "translated by",
     "captioned by",
+    "streamer reaction commentary",
+    "clear spoken english",
+    "laughter and short reactions",
+    "not music lyrics",
+    "anime english dub",
 )
 
 # Known GTA 6 trailer dialogue — captioning these as "streamer speech" is wrong
@@ -161,9 +166,9 @@ def extract_vocals_wav(
 def _niche_prompt(niche_id: str | None) -> str:
     niche = (niche_id or "gta6").lower()
     prompts = {
-        "gta6": "Grand Theft Auto dialogue. Lucia and Jason talking. Clear spoken English under music.",
+        "gta6": "Excited streamer talking about a game trailer.",
         "anime": "Anime English dub or commentary. Clear spoken English. Not music lyrics.",
-        "reactions": "Streamer reaction commentary. Clear spoken English. Laughter and short reactions.",
+        "reactions": "Casual speech, slang, laughter.",
         "gaming": "Gaming commentary and callouts. Clear spoken English.",
         "funny": "Comedy dialogue and reactions. Clear spoken English.",
         "movies": "Movie trailer dialogue or commentary. Clear spoken English.",
@@ -192,7 +197,7 @@ def _segment_ok(
     seg: Any,
     *,
     niche_id: str | None = None,
-    min_avg_logprob: float = -0.50,
+    min_avg_logprob: float = -0.85,
     max_no_speech: float = 0.50,
     max_compression: float = 2.2,
 ) -> bool:
@@ -282,7 +287,7 @@ def _transcribe_wav(
         vad_parameters=dict(min_silence_duration_ms=400),
         no_speech_threshold=0.55,
         compression_ratio_threshold=2.2,
-        log_prob_threshold=-0.55,
+        log_prob_threshold=-0.65,
         condition_on_previous_text=False,
         beam_size=5,
         best_of=5,
@@ -364,14 +369,22 @@ def get_word_timestamps(
     """
     duration = max(0.5, end - start)
     # Prefer small/medium int8; never fall back to tiny (hallucinates trailer lines).
-    attempts: list[tuple[str, str, bool]] = [
-        ("vocals+model", model_name, True),
-        ("plain+model", model_name, False),
-    ]
+    niche = (niche_id or "").lower()
+    # Loud streamer yells (Kai "omg") degrade under bandpass vocals — try plain first for reactions.
+    if niche in {"reactions", "gta6", "funny"}:
+        attempts: list[tuple[str, str, bool]] = [
+            ("plain+model", model_name, False),
+            ("vocals+model", model_name, True),
+        ]
+    else:
+        attempts = [
+            ("vocals+model", model_name, True),
+            ("plain+model", model_name, False),
+        ]
     if model_name in {"tiny", "base"}:
-        attempts.append(("vocals+small", "small", True))
+        attempts.append(("plain+small", "small", False))
     elif model_name == "small":
-        attempts.append(("vocals+base", "base", True))  # base only as backup, never tiny
+        attempts.append(("plain+base", "base", False))  # never tiny
 
 
     last_err = None

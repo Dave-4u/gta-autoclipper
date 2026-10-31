@@ -954,16 +954,26 @@ def render_clip(
                     text = " ".join(str(w.get("word","")) for w in ws).lower()
                     if _trailer_line(text):
                         return False
+                    # Whisper sometimes echoes the initial_prompt
+                    if any(p in text for p in (
+                        "streamer reaction commentary", "clear spoken english",
+                        "laughter and short reactions", "not music lyrics",
+                    )):
+                        return False
                     if re.search(r"(grand theft auto|gta\s*6).{0,40}(coming|november|pre-?order)", text):
                         if not re.search(r"\b(i|i'm|bro|chat|dude|oh my|fuck|wait)\b", text):
                             return False
-                    return len(ws) >= 4
-                if _streamer_like(whispered) and len(whispered) > len(final_words) + 2:
-                    final_words = whispered
-                elif not final_words and _streamer_like(whispered):
+                    return len(ws) >= 3
+                # Prefer original source-window captions; only upgrade if final whisper is clearly better
+                if final_words and _streamer_like(final_words):
+                    if _streamer_like(whispered) and len(whispered) > len(final_words) + 4:
+                        final_words = whispered
+                    else:
+                        print(f"[edit] keeping source captions ({len(final_words)} words)")
+                elif _streamer_like(whispered):
                     final_words = whispered
                 # Drop captions entirely if nothing confident
-                if not _streamer_like(final_words) and len(final_words) < 6:
+                if not _streamer_like(final_words) and len(final_words) < 3:
                     print("[edit] dropping low-confidence captions")
                     final_words = []
                 if final_words:

@@ -632,6 +632,71 @@ def _render_rank_segment(
     return out
 
 
+
+def _ass_dialogue_count(ass_path: Path) -> int:
+    if not ass_path.is_file():
+        return 0
+    return sum(1 for ln in ass_path.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.startswith("Dialogue:"))
+
+
+def _ensure_part_captions(
+    clip: Path,
+    *,
+    cfg: dict[str, Any],
+    niche_id: str,
+    work: Path,
+    label: str = "",
+) -> Path:
+    """Guarantee burned streamer captions on a ranking part (reuse ASS or re-whisper+burn)."""
+    from .transcribe import get_word_timestamps
+    from .edit import _write_ass_captions
+
+    ass = clip.with_suffix(".ass")
+    n = _ass_dialogue_count(ass)
+    if n > 0:
+        print(f"[ranking] captions ok {label or clip.name}: {n} Dialogue events")
+        return clip
+    try:
+        import json as _json
+        pr = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(clip)],
+            capture_output=True, text=True, check=False,
+        )
+        dur = float((_json.loads(pr.stdout).get("format") or {}).get("duration") or 12)
+    except Exception:
+        dur = 12.0
+    model = str((cfg.get("analysis") or {}).get("whisper_model") or "small")
+    if model == "tiny":
+        model = "small"
+    # Skip title-card intro when present (~2s)
+    words = get_word_timestamps(clip, 2.0, max(3.0, dur - 0.2), model_name=model, niche_id=niche_id)
+    if len(words) < 3:
+        words = get_word_timestamps(clip, 0.3, max(3.0, dur - 0.2), model_name=model, niche_id=niche_id)
+    if len(words) < 3:
+        print(f"[ranking] WARN {label or clip.name}: no caption words after whisper")
+        return clip
+    ass2 = work / f"{clip.stem}_rankcaps.ass"
+    n2 = _write_ass_captions(words, ass2, 1080, 1920)
+    print(f"[ranking] burned {n2} Dialogue events onto {label or clip.name} ({len(words)} words)")
+    out = work / f"{clip.stem}_captioned.mp4"
+    ass_esc = str(ass2).replace("\\", "/").replace(":", chr(92) + ":")
+    pr = subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", str(clip),
+            "-vf", f"ass='{ass_esc}'",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:a", "copy", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            str(out),
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    if pr.returncode == 0 and out.is_file():
+        out.with_suffix(".ass").write_text(ass2.read_text(encoding="utf-8"), encoding="utf-8")
+        return out
+    print(f"[ranking] caption burn failed: {(pr.stderr or '')[-300:]}")
+    return clip
+
+
 def build_ranking_video(
     niche_id: str,
     topic: str | None = None,
@@ -781,6 +846,13 @@ def build_ranking_video(
     )
     parts: list[Path] = [title_card]
     for item, base in zip(survivors, rendered_paths):
+        base = _ensure_part_captions(
+            base, cfg=cfg, niche_id=niche_id, work=work, label=f"#{item.rank} {item.label}",
+        )
+        n_dlg = _ass_dialogue_count(base.with_suffix(".ass"))
+        if n_dlg <= 0:
+            _log(f"[ranking] ASSERT FAIL #{item.rank} {item.label}: ASS Dialogue count is 0")
+            return None
         fixed = work / f"rank_{item.rank:02d}_{item.candidate.id}_final.mp4"
         # Re-render overlay from original source clip via _render_rank_segment again would
         # re-call Gemini; instead redraw number/label on the already-rendered base.
