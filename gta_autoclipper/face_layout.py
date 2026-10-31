@@ -241,6 +241,114 @@ def cropdetect_box(
         return bbox
 
 
+def _expand_face_pip(box: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """Grow a face bbox into the PiP window — not into surrounding gameplay.
+
+    Tiny Gemini face hits (area < ~6%) live *inside* an overlay PiP. Expanding
+    past ~22% width pulls trailer pixels into the face panel (seen as
+    blurry fingers beside Kai). Stop at the PiP chrome.
+    """
+    fx, fy, fw, fh = box
+    cx, cy = fx + fw / 2.0, fy + fh / 2.0
+    area = fw * fh
+    if area < 0.06:
+        # Face-in-PiP: pad ~1.5–1.6x, hard-cap to typical overlay size
+        fw2 = min(0.22, max(fw * 1.55, 0.16))
+        fh2 = min(0.32, max(fh * 1.45, 0.24))
+    else:
+        fw2 = min(0.40, max(fw * 1.15, 0.26))
+        fh2 = min(0.48, max(fh * 1.15, 0.30))
+    fx2 = max(0.0, min(1.0 - fw2, cx - fw2 / 2.0))
+    fy2 = max(0.0, min(1.0 - fh2, cy - fh2 / 2.0))
+    return (fx2, fy2, fw2, fh2)
+
+
+
+
+def _face_panel_at(
+    path: Path,
+    t: float,
+    hint: tuple[float, float, float, float] | None = None,
+) -> tuple[float, float, float, float] | None:
+    """Build a face-centered PiP panel from YuNet, optionally biased by a Gemini hint."""
+    img = _grab(path, t, width=960)
+    if img is None:
+        return None
+    faces = _detect_faces(img)
+    if not faces:
+        return None
+    # Drop chat avatars (tiny) and full-frame trailer heads (huge)
+    usable = [f for f in faces if 0.0003 <= f[2] * f[3] <= 0.08]
+    if not usable:
+        return None
+    if hint:
+        hx, hy, hw, hh = hint
+        hcx, hcy = hx + hw / 2.0, hy + hh / 2.0
+        usable = sorted(
+            usable,
+            key=lambda f: (f[0] + f[2] / 2 - hcx) ** 2 + (f[1] + f[3] / 2 - hcy) ** 2,
+        )
+        fx, fy, fw, fh = usable[0]
+        dist = ((fx + fw / 2 - hcx) ** 2 + (fy + fh / 2 - hcy) ** 2) ** 0.5
+        if dist > 0.35:
+            return None
+    else:
+        usable = sorted(usable, key=lambda f: -(f[2] * f[3]))
+        fx, fy, fw, fh = usable[0]
+    cx, cy = fx + fw / 2.0, fy + fh / 2.0
+    # Panel fills top half after scale-to-fill; bias face up to crop stream HUD
+    pw, ph = 0.20, 0.26
+    px = max(0.0, min(1.0 - pw, cx - pw / 2.0))
+    # Bias face upward so Twitch/YT viewer HUD under the webcam is cropped out
+    py = max(0.0, min(1.0 - ph, cy - ph * 0.55))
+    if py + ph > 0.58:
+        ph = max(0.20, 0.58 - py)
+    return (px, py, pw, ph)
+
+
+def _box_area(box: tuple[float, float, float, float]) -> float:
+    return max(0.0, float(box[2]) * float(box[3]))
+
+
+def _region_mean(path: Path, t: float, box: tuple[float, float, float, float]) -> float:
+    """Mean luma of a normalized bbox at time t (0 if unreadable)."""
+    try:
+        import cv2
+        import numpy as np
+        img = _grab(path, t, width=720)
+        if img is None:
+            return 0.0
+        h, w = img.shape[:2]
+        x, y, bw, bh = box
+        x0, y0 = int(max(0, x * w)), int(max(0, y * h))
+        x1, y1 = int(min(w, (x + bw) * w)), int(min(h, (y + bh) * h))
+        if x1 <= x0 + 2 or y1 <= y0 + 2:
+            return 0.0
+        gray = cv2.cvtColor(img[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+        return float(np.mean(gray))
+    except Exception:
+        return 0.0
+
+
+def _accept_refined(
+    original: tuple[float, float, float, float],
+    refined: tuple[float, float, float, float],
+    *,
+    min_area: float,
+    min_keep_frac: float = 0.50,
+) -> bool:
+    """Reject cropdetect results that collapse the region or stay tiny."""
+    oa, ra = _box_area(original), _box_area(refined)
+    if ra < min_area:
+        return False
+    if oa > 0 and ra < oa * min_keep_frac:
+        return False
+    # Reject needle-thin boxes
+    if refined[2] < 0.18 or refined[3] < 0.18:
+        return False
+    return True
+
+
 def split_filter_complex(
     layout: FaceCamLayout,
     *,
@@ -259,48 +367,110 @@ def split_filter_complex(
     """
     if not layout.face:
         return None
-    fx, fy, fw, fh = layout.face
-    # Clamp normalized boxes
-    fx, fy = max(0.0, min(0.85, fx)), max(0.0, min(0.85, fy))
-    fw, fh = max(0.12, min(1.0 - fx, fw)), max(0.12, min(1.0 - fy, fh))
+    # Prefer YuNet face-centered panel (centers the person; crops stream HUD).
+    # Fall back to Gemini bbox expanded into PiP chrome only.
+    face_orig = None
+    if source is not None and refine_t is not None:
+        try:
+            face_orig = _face_panel_at(Path(source), float(refine_t), hint=layout.face)
+            if face_orig:
+                print(f"[layout] YuNet face panel -> {face_orig}")
+        except Exception as e:
+            print(f"[layout] YuNet face panel skip: {e}")
+    if face_orig is None:
+        face_orig = _expand_face_pip(layout.face)
+        print(f"[layout] Gemini/expand face panel -> {face_orig}")
+    fx, fy, fw, fh = face_orig
+    fx, fy = max(0.0, min(0.75, fx)), max(0.0, min(0.75, fy))
+    fw, fh = max(0.16, min(1.0 - fx, fw)), max(0.22, min(1.0 - fy, fh))
+    face_orig = (fx, fy, fw, fh)
 
     if layout.game:
         gx, gy, gw, gh = layout.game
     else:
         gx, gy, gw, gh = 0.05, 0.05, 0.9, 0.9
-    gx, gy = max(0.0, min(0.8, gx)), max(0.0, min(0.8, gy))
-    gw, gh = max(0.3, min(1.0 - gx, gw)), max(0.3, min(1.0 - gy, gh))
+    gx, gy = max(0.0, min(0.75, gx)), max(0.0, min(0.75, gy))
+    gw, gh = max(0.35, min(1.0 - gx, gw)), max(0.35, min(1.0 - gy, gh))
+    game_orig = (gx, gy, gw, gh)
 
     # Carve face out of near-full-frame game bbox only (never touch face box)
     if gw * gh > 0.85 and layout.face:
-        ffx, ffy, ffw, ffh = layout.face
-        face_cx = ffx + ffw / 2
+        face_cx = fx + fw / 2
         if face_cx > 0.65:
-            gw = min(gw, max(0.35, ffx - 0.02 - gx))
-        elif face_cx < 0.35:
-            new_x = max(gx, ffx + ffw + 0.02)
-            gw = max(0.35, gx + gw - new_x)
+            gw = min(gw, max(0.40, fx - 0.02 - gx))
+        elif face_cx < 0.40:
+            new_x = max(gx, fx + fw + 0.01)
+            gw = max(0.40, gx + gw - new_x)
             gx = new_x
         print(f"[layout] carved game around face -> {(gx, gy, gw, gh)}")
+        game_orig = (gx, gy, gw, gh)
 
     if source is not None and refine_t is not None:
+        src = Path(source)
+        tref = float(refine_t)
+        fx, fy, fw, fh = face_orig
+        # Tighten face panel only (remove chat/game margins); never expand/shrink <70%
         try:
-            fx, fy, fw, fh = cropdetect_box(Path(source), float(refine_t), (fx, fy, fw, fh))
-            print(f"[layout] cropdetect face -> {(fx, fy, fw, fh)}")
+            refined_f = cropdetect_box(src, tref, face_orig)
+            if (
+                _accept_refined(face_orig, refined_f, min_area=0.03, min_keep_frac=0.70)
+                and refined_f[2] <= face_orig[2] * 1.05
+                and refined_f[3] <= face_orig[3] * 1.05
+            ):
+                fx, fy, fw, fh = refined_f
+                print(f"[layout] face tighten -> {(fx, fy, fw, fh)}")
+            else:
+                print(f"[layout] face keep panel -> {face_orig}")
         except Exception as e:
-            print(f"[layout] cropdetect face skip: {e}")
+            print(f"[layout] face tighten skip: {e}")
         try:
-            gx, gy, gw, gh = cropdetect_box(Path(source), float(refine_t), (gx, gy, gw, gh))
-            print(f"[layout] cropdetect game -> {(gx, gy, gw, gh)}")
+            refined_g = cropdetect_box(src, tref, game_orig)
+            mean_g = _region_mean(src, tref, refined_g)
+            mean_o = _region_mean(src, tref, game_orig)
+            ok = _accept_refined(game_orig, refined_g, min_area=0.22, min_keep_frac=0.50)
+            # Dark unreadable zoom (mean << original) → reject
+            if ok and mean_g < 28 and mean_g < mean_o * 0.75:
+                ok = False
+                print(f"[layout] cropdetect game too dark mean={mean_g:.1f} vs orig={mean_o:.1f}")
+            if ok:
+                gx, gy, gw, gh = refined_g
+                print(f"[layout] cropdetect game kept -> {(gx, gy, gw, gh)} mean={mean_g:.1f}")
+            else:
+                gx, gy, gw, gh = game_orig
+                print(f"[layout] cropdetect game rejected; keep Gemini {game_orig}")
         except Exception as e:
             print(f"[layout] cropdetect game skip: {e}")
-        # Mild inward shrink on GAME only (kill letterbox/chat chrome)
-        gx = min(0.9, gx + gw * 0.02)
-        gy = min(0.9, gy + gh * 0.03)
-        gw = max(0.3, gw * 0.96)
-        gh = max(0.3, gh * 0.94)
-        gw = min(gw, 1.0 - gx)
+            gx, gy, gw, gh = game_orig
+
+    # Trim Twitch chat / right-edge player UI and bottom sub bars
+    chat = layout.chat_side
+    if chat == "right" or (gx + gw) > 0.78:
+        gw = min(gw, max(0.40, 0.74 - gx))
+    if chat == "left" and gx < 0.16:
+        trim = 0.16 - gx
+        gx = 0.16
+        gw = max(0.40, gw - trim)
+    # Bottom stream HUD
+    if gy + gh > 0.92:
+        gh = max(0.40, 0.92 - gy)
+    # Light top trim for overlays
+    if gy < 0.02:
+        gy = 0.02
         gh = min(gh, 1.0 - gy)
+    gw = min(gw, 1.0 - gx)
+    gh = min(gh, 1.0 - gy)
+
+    # If game region is still too dark/small, fall back to full non-face / non-chat band
+    if source is not None and refine_t is not None:
+        mean_final = _region_mean(Path(source), float(refine_t), (gx, gy, gw, gh))
+        if mean_final < 32.0 or _box_area((gx, gy, gw, gh)) < 0.28:
+            right = 0.74 if layout.chat_side == "right" else 0.92
+            left = max(0.02, min(gx, fx + fw + 0.02))
+            safe = (left, 0.04, max(0.40, right - left), 0.90)
+            mean_safe = _region_mean(Path(source), float(refine_t), safe)
+            if mean_safe >= mean_final - 2 or _box_area(safe) > _box_area((gx, gy, gw, gh)):
+                print(f"[layout] dark/small game mean={mean_final:.1f} -> safe {safe} mean={mean_safe:.1f}")
+                gx, gy, gw, gh = safe
 
     # Exact even panel heights that sum to frame height (yuv420-safe)
     width = int(width) - (int(width) % 2)
@@ -313,32 +483,26 @@ def split_filter_complex(
         bot_h = height - top_h
     speed = max(0.5, min(2.0, float(speed)))
 
-    # Do NOT expand face into neighboring game/gap (that pulls magenta/black).
-    # Tiny face crops are fine — scale-to-FILL zooms them to the panel.
-
-    # EVEN pixel crops; rgb24 during crop/scale avoids yuv420 magenta artifacts
     def even_crop(fx_, fy_, fw_, fh_):
         return (
             f"crop=floor(iw*{fw_:.6f}/2)*2:floor(ih*{fh_:.6f}/2)*2:"
             f"floor(iw*{fx_:.6f}/2)*2:floor(ih*{fy_:.6f}/2)*2"
         )
 
-    # NOTE: never use force_divisible_by with increase — it shrinks output and
-    # letterboxes. Width/height targets are already even.
+    # Mild 2% inward on game only (chat chrome) — NOT the old 12% that over-zoomed
     parts = [
         f"[{in_label}]split=2[fsrc][gsrc]",
         f"[fsrc]format=rgb24,{even_crop(fx, fy, fw, fh)},"
         f"scale={width}:{top_h}:force_original_aspect_ratio=increase,"
         f"crop={width}:{top_h},setsar=1,format=yuv420p[face]",
-        # Trim residual letterbox inside game crop, then fill-scale
         f"[gsrc]format=rgb24,{even_crop(gx, gy, gw, gh)},"
-        f"crop=floor(iw*0.88/2)*2:floor(ih*0.88/2)*2:floor(iw*0.04/2)*2:floor(ih*0.06/2)*2,"
-        f"scale={width}:{bot_h + 4}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{bot_h + 4},setsar=1,format=yuv420p[game]",
-        # 4px overlap via overlay kills any seam at the join
+        f"crop=floor(iw*0.96/2)*2:floor(ih*0.96/2)*2:floor(iw*0.02/2)*2:floor(ih*0.02/2)*2,"
+        f"scale={width}:{bot_h + 8}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{bot_h + 8},setsar=1,format=yuv420p[game]",
         f"[face]pad={width}:{height}:0:0:black[canvas],"
-        f"[canvas][game]overlay=0:{top_h - 4},setsar=1,setpts=PTS/{speed},format=yuv420p[{out_label}]",
+        f"[canvas][game]overlay=0:{top_h - 8},setsar=1,setpts=PTS/{speed},format=yuv420p[{out_label}]",
     ]
+    print(f"[layout] final face={(fx, fy, fw, fh)} game={(gx, gy, gw, gh)}")
     return ";".join(parts)
 
 
@@ -379,7 +543,15 @@ def layout_from_gemini(data: dict) -> FaceCamLayout:
         w, h = max(0.08, min(1.0 - x, w)), max(0.08, min(1.0 - y, h))
         return (x, y, w, h)
     face, game = box("face_bbox"), box("game_bbox")
-    return FaceCamLayout(face=face, game=game, chat_side=None, faces_found=1 if face else 0)
+    # Most reaction streams put Twitch chat on the right
+    chat = None
+    if face:
+        fcx = face[0] + face[2] / 2.0
+        if fcx < 0.45:
+            chat = "right"
+        elif fcx > 0.55:
+            chat = "left"
+    return FaceCamLayout(face=face, game=game, chat_side=chat, faces_found=1 if face else 0)
 
 
 def fill_crop_filter(
@@ -387,20 +559,23 @@ def fill_crop_filter(
     width: int = 1080,
     height: int = 1920,
     speed: float = 1.0,
-    zoom: float = 1.12,
+    zoom: float = 1.08,
     in_label: str = "0:v",
     out_label: str = "base",
     cx: float = 0.5,
     cy: float = 0.5,
 ) -> str:
-    """9:16 crop-to-fill (no letterbox/blur bars). Optional center bias cx/cy 0-1."""
-    z = max(1.05, float(zoom))
+    """9:16 crop-to-fill (no pillarbox/letterbox). Optional center bias cx/cy 0-1."""
+    z = max(1.0, float(zoom))
     speed = max(0.5, min(2.0, float(speed)))
-    # Scale to cover, then crop centered (with optional bias via crop x/y expressions)
-    # Use force_original_aspect_ratio=increase then crop
+    cx = max(0.0, min(1.0, float(cx)))
+    cy = max(0.0, min(1.0, float(cy)))
+    # Cover 9:16, then optional mild zoom; always crop — never pad
     return (
-        f"[{in_label}]scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},scale=iw*{z}:ih*{z},"
+        f"[{in_label}]format=rgb24,"
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height}:(iw-{width})*{cx}:(ih-{height})*{cy},"
+        f"scale=iw*{z}:ih*{z},"
         f"crop={width}:{height}:(iw-{width})/2:(ih-{height})/2,"
-        f"setpts=PTS/{speed}[{out_label}]"
+        f"setsar=1,setpts=PTS/{speed},format=yuv420p[{out_label}]"
     )
