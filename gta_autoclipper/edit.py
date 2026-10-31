@@ -498,7 +498,16 @@ def render_clip(
     )
     face_layout = None
     split_base = None
-    is_reactionish = niche_id in {"gta6", "reactions"} or "react" in (title or "").lower()
+    # Streamer face-cam split is reactions-only (experimental). gta6/anime/animation = fill-crop.
+    niche_meta = (cfg.get("niche") or {})
+    force_fill = str(niche_meta.get("layout") or "").lower() in {"fill_crop", "fill", "full_frame"}
+    is_reactionish = (
+        niche_id == "reactions"
+        and not force_fill
+        and ("react" in (title or "").lower() or niche_id == "reactions")
+    )
+    if niche_id in {"gta6", "anime", "animation", "gaming", "movies"}:
+        is_reactionish = False
     gem_layout = meta.get("gemini_layout") or {}
     if gem_layout.get("face_bbox") and gem_layout.get("game_bbox"):
         face_layout = layout_from_gemini(gem_layout)

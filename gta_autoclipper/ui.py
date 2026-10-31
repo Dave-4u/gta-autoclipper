@@ -22,7 +22,7 @@ from .discover import Candidate, discover, _url_to_id
 from .download import download_video, probe_duration
 from .edit import probe_clip, render_clip
 from .history import History
-from .niches import list_niche_ids
+from .niches import list_niche_ids, list_autopilot_niche_ids
 from .autopilot import get_state, request_stop, start_autopilot_background
 
 try:
@@ -475,7 +475,9 @@ def build_app(config_path: str | None = None):
         paths, _ = result_holder.get("out", ([], log.text()))
         yield paths, log.text(), refresh_gallery()
 
-    niche_ids = list_niche_ids()
+    niche_ids = list_niche_ids()  # enabled only (reactions experimental/off)
+    autopilot_defaults = list_autopilot_niche_ids()
+    all_niche_ids = list_niche_ids(include_disabled=True)
 
     def refresh_gallery_all():
         root = project_root() / "outputs"
@@ -578,8 +580,8 @@ Free local multi-niche Shorts clipper — smart discovery, catchy headers, intro
                 )
                 niche_select = gr.CheckboxGroup(
                     choices=niche_ids,
-                    value=["gta6", "anime"],
-                    label="Niches",
+                    value=autopilot_defaults or ["anime", "animation", "gta6"],
+                    label="Niches (reactions niche is experimental / off by default)",
                 )
                 custom_kw = gr.Textbox(
                     label="Custom keywords (for 'custom' niche, comma-separated)",
@@ -611,11 +613,15 @@ Free local multi-niche Shorts clipper — smart discovery, catchy headers, intro
                     "Top-N ranking video: auto topic → trending moments in one niche → "
                     "ordered by views (#N lowest → #1 highest) with rank overlays."
                 )
-                rk_niche = gr.Dropdown(choices=niche_ids, value="gta6", label="Niche")
+                rk_niche = gr.Dropdown(choices=niche_ids, value="anime", label="Niche")
                 with gr.Row():
                     rk_n = gr.Slider(3, 7, value=5, step=1, label="Items (N)")
                     suggest_btn = gr.Button("Suggest topic")
-                rk_topic = gr.Textbox(label="Topic", placeholder="Top 5 funniest GTA 6 reactions")
+                rk_topic = gr.Textbox(
+                    label="Topic",
+                    placeholder="Top 5 hardest anime fights",
+                    value="Top 5 hardest anime fight moments",
+                )
                 rk_make = gr.Button("Make Ranking Video", variant="primary")
                 rk_status = gr.Textbox(label="Status", interactive=False)
                 rk_log = gr.Textbox(label="Log", lines=12, interactive=False)

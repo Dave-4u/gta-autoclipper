@@ -42,8 +42,8 @@ def _fit_header_words(text: str, max_chars: int = 28) -> str:
 TOPIC_TEMPLATES = {
     "gta6": [
         "Top {n} wildest GTA 6 trailer moments",
-        "Top {n} funniest GTA 6 reactions",
-        "Top {n} craziest GTA 6 gameplay clips",
+        "Top {n} craziest GTA gameplay moments",
+        "Top {n} GTA 6 chase clips",
         "Top {n} GTA 6 moments you missed",
     ],
     "anime": [
@@ -52,7 +52,7 @@ TOPIC_TEMPLATES = {
         "Top {n} anime fights going crazy",
         "Top {n} anime moments worth rewatching",
     ],
-    "reactions": [
+    "reactions": [  # experimental / disabled niche — kept for code compatibility
         "Top {n} funniest streamer reactions",
         "Top {n} trailer reactions that broke chat",
         "Top {n} streamer meltdown moments",
@@ -61,6 +61,7 @@ TOPIC_TEMPLATES = {
     "gaming": [
         "Top {n} cleanest gaming clutches",
         "Top {n} gaming fails that hurt",
+        "Top {n} GTA gameplay moments",
     ],
     "funny": [
         "Top {n} funniest viral moments",
@@ -69,7 +70,9 @@ TOPIC_TEMPLATES = {
         "Top {n} movie trailer moments",
     ],
     "animation": [
+        "Top {n} funniest animation moments",
         "Top {n} animation scenes that slap",
+        "Top {n} cartoon moments that hit",
     ],
 }
 
@@ -86,9 +89,12 @@ class RankItem:
 
 
 def suggest_topic(niche_id: str, n: int = 5, cfg: dict[str, Any] | None = None) -> str:
-    niche = (niche_id or "gta6").lower()
+    niche = (niche_id or "anime").lower()
+    if niche == "reactions":
+        niche = "anime"  # reactions paused — fall back to anime topics
     templates = TOPIC_TEMPLATES.get(niche) or [f"Top {{n}} {niche} moments"]
-    # Prefer templates matching recent search keywords if present
+    # Prefer non-reaction wording
+    templates = [x for x in templates if "reaction" not in x.lower()] or templates
     topic = random.choice(templates).format(n=n)
     if cfg:
         kws = list(((cfg.get("search") or {}).get("keywords")) or [])
@@ -98,7 +104,7 @@ def suggest_topic(niche_id: str, n: int = 5, cfg: dict[str, Any] | None = None) 
             topic = f"Top {n} {seed} moments"
             # Sanitize leak-heavy seeds for gta
             if niche == "gta6" and "leak" in topic.lower():
-                topic = f"Top {n} GTA 6 trailer reactions"
+                topic = f"Top {n} GTA 6 trailer moments"
     return topic
 
 
@@ -762,6 +768,8 @@ def build_ranking_video(
         # Prefer already Gemini-confirmed segments from upstream scan
         pre = [s for s in segs if "gemini" in (s.reason or "")]
         ordered = pre + [s for s in segs if s not in pre]
+        topic_type = detect_topic_type(topic)
+        need_reaction = niche_id == "reactions" or topic_type == "reactions"
         for s in ordered[:6]:
             try:
                 # Trust a prior gemini_* reason after a quick confirm; skip if already confirmed
@@ -770,24 +778,43 @@ def build_ranking_video(
                     picked = s
                     _log(f"[ranking] trust preconfirmed @{s.start:.1f}")
                     break
-                gate = confirm_reaction_moment(
-                    item.path, s.start, s.end, cfg=cfg,
-                    title=item.candidate.title, require_trailer=True,
-                )
-                _log(f"[ranking] gate @{s.start:.1f}: ok={gate.get('ok')} emo={gate.get('emotion')} {gate.get('reasons')}")
-                if gate.get("ok"):
-                    item.segment = s
-                    extra = dict(item.candidate.extra or {})
-                    extra["gate_emotion"] = gate.get("emotion")
-                    extra["gate_desc"] = gate.get("desc")
-                    item.candidate.extra = extra
-                    picked = s
-                    break
+                if need_reaction:
+                    gate = confirm_reaction_moment(
+                        item.path, s.start, s.end, cfg=cfg,
+                        title=item.candidate.title, require_trailer=True,
+                    )
+                    _log(f"[ranking] gate @{s.start:.1f}: ok={gate.get('ok')} emo={gate.get('emotion')} {gate.get('reasons')}")
+                    if gate.get("ok"):
+                        item.segment = s
+                        extra = dict(item.candidate.extra or {})
+                        extra["gate_emotion"] = gate.get("emotion")
+                        extra["gate_desc"] = gate.get("desc")
+                        item.candidate.extra = extra
+                        picked = s
+                        break
+                else:
+                    # anime / animation / gameplay: motion + no player UI
+                    from .window_gate import player_ui_visible, trailer_content_ok
+                    box = (0.05, 0.05, 0.90, 0.90)
+                    ui = player_ui_visible(item.path, s.start, s.end, box, cfg=cfg, use_gemini=True)
+                    mot = trailer_content_ok(item.path, s.start, s.end, box, min_motion=6.0)
+                    ok = (not ui.get("visible")) and bool(mot.get("ok"))
+                    _log(f"[ranking] content-gate @{s.start:.1f}: ok={ok} ui={ui.get('visible')} mot={mot.get('motion',0):.1f}")
+                    if ok:
+                        item.segment = s
+                        picked = s
+                        break
             except Exception as e:
                 _log(f"[ranking] gate err: {e}")
         if picked is None:
-            _log(f"[ranking] DROPPED {item.candidate.id} (no strong reaction+trailer segment)")
-            continue
+            # Non-reaction niches: keep best highlight rather than drop everything
+            if not need_reaction and ordered:
+                item.segment = ordered[0]
+                picked = ordered[0]
+                _log(f"[ranking] soft-keep @{picked.start:.1f} for fill-crop niche")
+            else:
+                _log(f"[ranking] DROPPED {item.candidate.id} (no strong reaction+trailer segment)")
+                continue
         survivors.append(item)
 
     if len(survivors) < 2:
@@ -803,7 +830,7 @@ def build_ranking_video(
     import re as _re
     topic = _re.sub(r"(?i)\btop\s*\d+\b", f"Top {total}", topic)
     if not _re.search(r"(?i)\btop\s*\d+", topic):
-        topic = f"Top {total} {topic}" if topic else f"Top {total} reactions"
+        topic = f"Top {total} {topic}" if topic else f"Top {total} moments"
     _log(f"[ranking] final topic={topic!r} count={total}")
 
     bg_item = survivors[-1]

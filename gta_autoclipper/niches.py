@@ -7,18 +7,19 @@ from typing import Any
 
 NICHES: dict[str, dict[str, Any]] = {
     "gta6": {
-        "label": "GTA 6",
+        "label": "GTA 6 / Gameplay",
+        "enabled": True,
+        "layout": "fill_crop",  # full-frame trailer/gameplay, no face-cam split
         "keywords": [
             "GTA 6 official trailer",
-            "GTA VI trailer Rockstar",
+            "GTA VI official trailer Rockstar",
             "GTA 6 gameplay",
-            "GTA 6 trailer reaction",
-            "GTA VI trailer reaction",
-            "GTA 6 streamer reaction",
+            "GTA VI gameplay",
+            "Grand Theft Auto VI trailer",
+            "GTA 6 chase gameplay",
             "GTA 6 news Rockstar",
-            "GTA 6 leaks",
         ],
-        "header_styles": ["pov", "hype", "hot_take", "question", "reaction", "when_you", "info_news"],
+        "header_styles": ["pov", "hype", "hot_take", "question", "when_you", "info_news"],
         "voice": "am_fenrir",
         "voice_style": "hype",
         "hashtags": ["#GTA6", "#GTAVI", "#GTA", "#Shorts", "#FYP", "#Gaming", "#RockstarGames"],
@@ -29,6 +30,8 @@ NICHES: dict[str, dict[str, Any]] = {
         "vocab": ["trailer", "gameplay", "chase", "Rockstar"],
     },
     "anime": {
+        "enabled": True,
+        "layout": "fill_crop",
         "label": "Anime",
         "keywords": [
             "anime fight scene 4k",
@@ -52,6 +55,8 @@ NICHES: dict[str, dict[str, Any]] = {
         "vocab": ["aura", "peak fiction", "goat", "shonen", "animation", "fight"],
     },
     "animation": {
+        "enabled": True,
+        "layout": "fill_crop",
         "label": "Animation / Cartoons",
         "keywords": [
             "cartoon funny moments",
@@ -70,7 +75,9 @@ NICHES: dict[str, dict[str, Any]] = {
         "vocab": ["toon force", "frame one", "cinema", "animated"],
     },
     "reactions": {
-        "label": "Reactions / Streamers",
+        "label": "Reactions / Streamers (experimental)",
+        "enabled": False,
+        "experimental": True,
         "keywords": [
             "streamer reaction funny",
             "twitch funny moments",
@@ -159,8 +166,36 @@ NICHES: dict[str, dict[str, Any]] = {
 }
 
 
-def list_niche_ids() -> list[str]:
-    return list(NICHES.keys())
+def list_niche_ids(*, include_disabled: bool = False) -> list[str]:
+    """Niche ids for UI/autopilot. Reactions is experimental and off by default."""
+    if include_disabled:
+        return list(NICHES.keys())
+    out = []
+    for k, v in NICHES.items():
+        if v.get("enabled", True) is False:
+            continue
+        out.append(k)
+    return out
+
+
+def list_autopilot_niche_ids() -> list[str]:
+    """Default autopilot niches: anime / animation / gameplay — not streamer reactions."""
+    preferred = ["anime", "animation", "gta6", "gaming"]
+    enabled = set(list_niche_ids())
+    return [k for k in preferred if k in enabled] or list(list_niche_ids())
+
+
+def niche_is_enabled(niche_id: str) -> bool:
+    key = (niche_id or "").strip().lower()
+    if key not in NICHES:
+        n = get_niche(key)
+        # get_niche aliases; find real key
+        for k, v in NICHES.items():
+            if v.get("label") == n.get("label"):
+                key = k
+                break
+    meta = NICHES.get(key) or {}
+    return bool(meta.get("enabled", True))
 
 
 def get_niche(niche_id: str) -> dict[str, Any]:
