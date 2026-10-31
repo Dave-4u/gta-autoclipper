@@ -496,19 +496,35 @@ def split_filter_complex(
     parts = [
         f"[{in_label}]split=2[fsrc][gsrc]",
         f"[fsrc]format=rgb24,{even_crop(fx, fy, fw, fh)},"
-        # Zoom slightly into the PiP so stream chrome/black edges are cropped out
         f"scale={width}:{top_h}:force_original_aspect_ratio=increase,"
         f"crop={width}:{top_h},"
-        f"scale=iw*1.22:ih*1.22,"
+        f"scale=iw*1.32:ih*1.32,"
         f"crop={width}:{top_h}:(iw-{width})/2:(ih-{top_h})/2,"
-        f"setsar=1,format=yuv420p[face]",
+        # Trim last 2px of face (webcam bottom edge) then scale back — kills grey seam
+        f"crop={width}:{top_h}-2:0:0,scale={width}:{top_h}:flags=bilinear,"
+        f"setsar=1,format=rgb24[face]",
         f"[gsrc]format=rgb24,{even_crop(gx, gy, gw, gh)},"
-        f"crop=floor(iw*0.96/2)*2:floor(ih*0.96/2)*2:floor(iw*0.02/2)*2:floor(ih*0.02/2)*2,"
+        f"crop=floor(iw*0.96/2)*2:floor(ih*0.94/2)*2:floor(iw*0.02/2)*2:floor(ih*0.03/2)*2,"
         f"scale={width}:{bot_h}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{bot_h},setsar=1,format=yuv420p[game],"
-        f"[face][game]vstack=inputs=2,setsar=1,setpts=PTS/{speed},format=yuv420p[{out_label}]",
+        f"crop={width}:{bot_h},"
+        # Trim first 2px of game then scale back
+        f"crop={width}:{bot_h}-2:0:2,scale={width}:{bot_h}:flags=bilinear,"
+        f"setsar=1,format=rgb24[game],"
+        # vstack in rgb24 (no pad) then yuv420 — heights sum exactly to height
+        f"[face][game]vstack=inputs=2,setsar=1,setpts=PTS/{speed},"
+        f"crop={width}:{height}:0:0,"
+        # Blend 3 rows at the panel join so no 1px grey seam line remains
+        f"geq="
+        f"r='if(between(Y,{top_h}-1,{top_h}+1),"
+        f"(r(X,{top_h}-2)+r(X,{top_h}-1)+r(X,{top_h})+r(X,{top_h}+1)+r(X,{top_h}+2))/5,r(X,Y))':"
+        f"g='if(between(Y,{top_h}-1,{top_h}+1),"
+        f"(g(X,{top_h}-2)+g(X,{top_h}-1)+g(X,{top_h})+g(X,{top_h}+1)+g(X,{top_h}+2))/5,g(X,Y))':"
+        f"b='if(between(Y,{top_h}-1,{top_h}+1),"
+        f"(b(X,{top_h}-2)+b(X,{top_h}-1)+b(X,{top_h})+b(X,{top_h}+1)+b(X,{top_h}+2))/5,b(X,Y))',"
+        f"format=yuv420p[{out_label}]",
     ]
-    print(f"[layout] final face={(fx, fy, fw, fh)} game={(gx, gy, gw, gh)}")
+    assert top_h + bot_h == height, (top_h, bot_h, height)
+    print(f"[layout] panels top_h={top_h}+bot_h={bot_h}={height} face={(fx, fy, fw, fh)} game={(gx, gy, gw, gh)}")
     return ";".join(parts)
 
 

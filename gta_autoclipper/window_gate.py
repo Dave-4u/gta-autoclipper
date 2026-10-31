@@ -56,6 +56,42 @@ def game_freeze_seconds(
         return max_run / float(fps)
 
 
+
+def mean_trailer_motion(
+    path: Path,
+    start: float,
+    end: float,
+    game_box: tuple[float, float, float, float] = (0.28, 0.05, 0.50, 0.90),
+    *,
+    n_samples: int = 8,
+) -> float:
+    """Mean absolute frame-diff in the game/trailer crop (higher = more motion)."""
+    import numpy as np
+    from PIL import Image
+
+    gx, gy, gw, gh = game_box
+    dur = max(0.5, float(end) - float(start))
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        times = [start + dur * (i + 1) / (n_samples + 1) for i in range(n_samples)]
+        for i, t in enumerate(times):
+            vf = (
+                f"crop=iw*{gw}:ih*{gh}:iw*{gx}:ih*{gy},scale=240:-2"
+            )
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", f"{t:.2f}", "-i", str(path),
+                 "-frames:v", "1", "-vf", vf, "-q:v", "5",
+                 str(td_path / f"f{i:02d}.png")],
+                capture_output=True, check=False,
+            )
+        frames = sorted(td_path.glob("f*.png"))
+        if len(frames) < 3:
+            return 0.0
+        arrs = [np.array(Image.open(f)).astype(np.float32) for f in frames]
+        diffs = [float(np.mean(np.abs(arrs[i] - arrs[i - 1]))) for i in range(1, len(arrs))]
+        return float(sum(diffs) / len(diffs))
+
+
 def silence_runs(
     path: Path,
     start: float,
@@ -93,6 +129,77 @@ def longest_silence(path: Path, start: float, end: float, **kw: Any) -> float:
     return max(e - s for s, e in runs)
 
 
+
+def speech_coverage(
+    path: Path,
+    start: float,
+    end: float,
+    *,
+    model_name: str = "tiny",
+    niche_id: str = "gta6",
+) -> dict[str, Any]:
+    """Whisper the source window; return coverage fraction of real streamer words.
+
+    Uses get_word_timestamps (with its filters) and also a plain faster-whisper
+    fallback so music-heavy filters cannot zero out real speech.
+    """
+    dur = max(0.5, float(end) - float(start))
+
+    def _cov(words):
+        real = [w for w in (words or []) if str(w.get("word", "")).strip()
+                and not str(w.get("word", "")).startswith("[")]
+        if not real:
+            return 0.0, 0, []
+        spans = sorted((float(w["start"]), float(w["end"])) for w in real)
+        covered = 0.0
+        cs, ce = spans[0]
+        for s, e in spans[1:]:
+            if s <= ce:
+                ce = max(ce, e)
+            else:
+                covered += max(0.0, ce - cs)
+                cs, ce = s, e
+        covered += max(0.0, ce - cs)
+        return min(1.0, covered / dur), len(real), [str(w.get("word", "")) for w in real]
+
+    best = (0.0, 0, [])
+    try:
+        from .transcribe import get_word_timestamps
+    except Exception:
+        from gta_autoclipper.transcribe import get_word_timestamps  # type: ignore
+    try:
+        words = get_word_timestamps(Path(path), float(start), float(end),
+                                    model_name=model_name, niche_id="gta6")  # broad vocab for coverage
+        best = max(best, _cov(words), key=lambda x: x[0])
+    except Exception as e:
+        print(f"[speech-cov] filtered whisper err: {e}")
+
+    # Plain faster-whisper fallback (no niche/music drop) for coverage gating
+    try:
+        from faster_whisper import WhisperModel
+        import tempfile, subprocess
+        with tempfile.TemporaryDirectory() as td:
+            wav = Path(td) / "a.wav"
+            subprocess.run(
+                ["ffmpeg", "-y", "-ss", f"{start:.2f}", "-t", f"{dur:.2f}",
+                 "-i", str(path), "-ac", "1", "-ar", "16000", str(wav)],
+                capture_output=True, check=False,
+            )
+            if wav.is_file():
+                model = WhisperModel(model_name, device="cpu", compute_type="int8")
+                segs, _ = model.transcribe(str(wav), word_timestamps=True, language="en")
+                plain = []
+                for seg in segs:
+                    for w in (seg.words or []):
+                        plain.append({"word": w.word.strip(), "start": float(w.start), "end": float(w.end)})
+                best = max(best, _cov(plain), key=lambda x: x[0])
+    except Exception as e:
+        print(f"[speech-cov] plain whisper err: {e}")
+
+    cov, n, toks = best
+    return {"coverage": cov, "n_words": n, "words": toks}
+
+
 def window_ok(
     path: Path,
     start: float,
@@ -101,19 +208,57 @@ def window_ok(
     game_box: tuple[float, float, float, float] | None = None,
     max_freeze_s: float = 1.5,
     max_silence_s: float = 1.5,
+    min_speech_coverage: float = 0.50,
+    niche_id: str = "gta6",
+    require_speech: bool = True,
 ) -> dict[str, Any]:
-    """Gate a candidate window. ok=False if trailer frozen or long silence."""
+    """Gate a candidate window. Requires trailer motion + streamer speech coverage."""
     box = game_box or (0.28, 0.05, 0.50, 0.90)
     freeze = game_freeze_seconds(path, start, end, box)
+    motion = mean_trailer_motion(path, start, end, box)
     sil = longest_silence(path, start, end, min_d=1.0)
+    speech = {"coverage": 0.0, "n_words": 0, "words": []}
+    if require_speech and min_speech_coverage > 0:
+        try:
+            speech = speech_coverage(path, start, end, niche_id=niche_id)
+        except Exception as e:
+            print(f"[window-gate] speech coverage error: {e}")
+            speech = {"coverage": 0.0, "n_words": 0, "words": []}
     reasons = []
-    if freeze > max_freeze_s:
+    dur = max(0.5, float(end) - float(start))
+    # Trailer motion: require measurable motion (mean frame-diff). Streamers often
+    # pause briefly to talk — allow longer contiguous freezes when speech is strong.
+    min_motion = 6.0
+    if motion < min_motion:
+        reasons.append(f"trailer_static_mot={motion:.1f}")
+    freeze_limit = max_freeze_s
+    if speech["coverage"] >= min_speech_coverage:
+        freeze_limit = max(max_freeze_s, 0.70 * dur)  # talk-over-pause OK
+    if freeze > freeze_limit:
         reasons.append(f"game_frozen_{freeze:.1f}s")
-    if sil > max_silence_s:
+    if sil > max_silence_s and speech["coverage"] < 0.15:
         reasons.append(f"silence_{sil:.1f}s")
+    if require_speech and speech["coverage"] < min_speech_coverage:
+        reasons.append(f"speech_cov_{speech['coverage']:.0%}<{min_speech_coverage:.0%}")
+    if require_speech and speech["n_words"] < 4:
+        reasons.append(f"too_few_words_{speech['n_words']}")
     ok = not reasons
-    print(f"[window-gate] {start:.1f}-{end:.1f} freeze={freeze:.1f}s silence={sil:.1f}s ok={ok} {reasons}")
-    return {"ok": ok, "freeze_s": freeze, "silence_s": sil, "reasons": reasons}
+    print(
+        f"[window-gate] {start:.1f}-{end:.1f} freeze={freeze:.1f}s mot={motion:.1f} "
+        f"silence={sil:.1f}s speech={speech['coverage']:.0%}({speech['n_words']}w) "
+        f"ok={ok} {reasons}"
+    )
+    return {
+        "ok": ok,
+        "freeze_s": freeze,
+        "motion": motion,
+        "silence_s": sil,
+        "speech_coverage": speech["coverage"],
+        "n_words": speech["n_words"],
+        "sample_words": speech["words"][:12],
+        "reasons": reasons,
+    }
+
 
 
 def black_bar_ratios(

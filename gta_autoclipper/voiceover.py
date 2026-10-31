@@ -590,23 +590,30 @@ def make_intro_vo(text: str, cfg: dict[str, Any], out_wav: Path) -> VoiceoverRes
     from .entities import normalize_pronunciation
     header = re.sub(r"\s+", " ", (text or "").strip())
     vo_cfg = cfg.get("voiceover") or {}
-    # Always use a short spoken hook, never the raw header text
-    hooks = [
-        "Wait for this.",
-        "Look at this.",
-        "Here we go.",
-        "Watch closely.",
-        "Don't blink.",
-        "This is the one.",
-        "Pay attention.",
-    ]
-    # Lightly specialize from header keywords without reading it
-    hl = header.lower()
-    if "versus" in hl or " vs " in f" {hl} ":
-        hooks = ["This fight goes crazy.", "Watch this clash.", "Here we go."] + hooks
-    elif any(k in hl for k in ("react", "kai", "cinna", "streamer")):
-        hooks = ["Watch the face cam.", "Look at the face.", "Here we go."] + hooks
-    clean = random.choice(hooks[:5])
+    # Prefer the provided punchline/line (LLM VO). Only fall back to a short stock hook
+    # when the caller passed a long header-like string (>14 words) or empty.
+    words = header.split()
+    if header and len(words) <= 14 and not vo_cfg.get("force_stock_intro"):
+        clean = header
+        # Ensure it ends with punchy punctuation for TTS
+        if clean[-1:] not in ".!?":
+            clean = clean.rstrip(",;:") + "!"
+    else:
+        hooks = [
+            "Wait for this.",
+            "Look at this.",
+            "Here we go.",
+            "Watch closely.",
+            "Don't blink.",
+            "This is the one.",
+            "Pay attention.",
+        ]
+        hl = header.lower()
+        if "versus" in hl or " vs " in f" {hl} ":
+            hooks = ["This fight goes crazy.", "Watch this clash.", "Here we go."] + hooks
+        elif any(k in hl for k in ("react", "kai", "cinna", "streamer")):
+            hooks = ["Watch the face cam.", "Look at the face.", "Here we go."] + hooks
+        clean = random.choice(hooks[:5])
     if vo_cfg.get("intro_skip_weak") and not header:
         return VoiceoverResult(text="", style="intro", via="skipped", wav_path=None, words=[], engine="skip", voice="")
     clean = normalize_pronunciation(clean)

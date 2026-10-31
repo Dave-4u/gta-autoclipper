@@ -333,10 +333,20 @@ def render_clip(
         gl = (meta0.get("gemini_layout") or {})
         if isinstance(gl.get("game_bbox"), (list, tuple)) and len(gl["game_bbox"]) == 4:
             gbox = tuple(float(x) for x in gl["game_bbox"])
-        gate = window_ok(source, segment.start, segment.end, game_box=gbox)
+        niche_for_gate = str(cfg.get("niche_id") or (cfg.get("niche") or {}).get("id") or "gta6")
+        pre = bool((source_meta or {}).get("preconfirmed"))
+        gate = window_ok(
+            source, segment.start, segment.end, game_box=gbox,
+            niche_id=niche_for_gate,
+            min_speech_coverage=0.50, require_speech=not pre,
+        )
         if not gate.get("ok"):
-            print(f"[edit] window rejected: {gate.get('reasons')}")
-            return None
+            # Soft: preconfirmed upstream pick, or speech+motion close enough
+            if pre or (gate.get("speech_coverage", 0) >= 0.25 and gate.get("motion", 0) >= 6):
+                print(f"[edit] window soft-pass: {gate.get('reasons')} pre={pre}")
+            else:
+                print(f"[edit] window rejected: {gate.get('reasons')}")
+                return None
     except Exception as e:
         print(f"[edit] window gate skip: {e}")
     cs = _copyright_cfg(cfg)
@@ -586,131 +596,44 @@ def render_clip(
 
         intro_cfg_on = bool(vo_cfg.get("intro_header", True))
         intro_dur = float(vo_cfg.get("intro_seconds", 1.8))
-        # Drop robotic intro when we already have a punchy commentary VO
-        if intro_cfg_on and hook_res.text and not llm_vo:
+        # VO is PREPEND-ONLY (1.5–2.5s over frozen first frame). Never over streamer speech.
+        # Prefer LLM punchline as the intro line; else speak the hook header.
+        if intro_cfg_on and (llm_vo or hook_res.text):
             intro_wav = td_path / "intro.wav"
-            intro_result = make_intro_vo(hook_res.text, cfg, intro_wav)
+            intro_line = (llm_vo or hook_res.text or "").strip()
+            # Keep intro short
+            words_l = intro_line.split()
+            if len(words_l) > 12:
+                intro_line = " ".join(words_l[:12])
+            intro_result = make_intro_vo(intro_line, cfg, intro_wav)
             if intro_result and intro_result.wav_path and intro_result.wav_path.is_file():
                 try:
                     import wave
                     with wave.open(str(intro_result.wav_path), "rb") as w:
-                        intro_dur = min(2.2, max(0.9, w.getnframes() / float(w.getframerate() or 1)))
+                        raw_d = w.getnframes() / float(w.getframerate() or 1)
+                    intro_dur = min(2.5, max(1.5, raw_d))
                 except Exception:
-                    intro_dur = min(2.0, max(1.0, intro_dur))
-        elif intro_cfg_on and llm_vo:
-            print("[intro-vo] skipped — commentary VO present")
+                    intro_dur = min(2.5, max(1.5, intro_dur))
+                print(f"[intro-vo] prepend {intro_dur:.2f}s: {intro_line!r}")
+            else:
+                intro_result = None
+                intro_dur = 0.0
+        else:
             intro_dur = 0.0
 
-        # Captions start AFTER intro VO (header already shows the spoken intro).
-        # Never burn intro VO words as bottom karaoke while the header is up.
+        # Streamer captions only (shifted by intro prepend). No VO karaoke over speech.
         shift = intro_dur if (intro_result and intro_result.wav_path) else 0.0
-        if vo_enabled:
-            vo_wav = td_path / "voiceover.wav"
-            ctx.header_text = hook_res.text
-            # Prefer LLM punchline; skip commentary VO entirely when nothing real to add
-            if llm_vo:
-                from .voiceover import _synthesize_with_fallback, VoiceoverResult, _estimate_words, _wav_duration, _punctuate_for_speech
-                from .entities import normalize_pronunciation
-                display_line = _punctuate_for_speech(llm_vo)
-                speak_line = display_line
-                # Phonetics for TTS only — captions keep readable spelling
-                if llm_say and llm_say.lower() != "none":
-                    import re as _re
-                    for part in llm_say.split(","):
-                        if "=" in part:
-                            a, b = part.split("=", 1)
-                            a, b = a.strip(), b.strip()
-                            if a and b:
-                                speak_line = _re.sub(_re.escape(a), b, speak_line, flags=_re.I)
-                speak_line = normalize_pronunciation(speak_line)
-                path_v, engine_v, voice_v = _synthesize_with_fallback(speak_line, vo_wav, cfg, niche_id)
-                if path_v:
-                    dur_v = _wav_duration(path_v)
-                    vo_result = VoiceoverResult(
-                        text=display_line, style="llm", via="llm", wav_path=path_v,
-                        words=_estimate_words(display_line, dur_v), engine=engine_v, voice=voice_v,
-                    )
-                    print(f"[voiceover] llm line: {display_line} (tts={speak_line!r})")
-                else:
-                    vo_result = None
-            else:
-                print("[voiceover] skip commentary VO (nothing real to add)")
-                vo_result = None
-            # Align captions to where VO actually plays (payoff window if no intro)
-            clip_len_est = max(0.5, float(segment.end - segment.start) / max(speed, 0.5))
-            if vo_result and vo_result.words:
-                vo_dur = max((float(w["end"]) for w in vo_result.words), default=1.5)
-            elif vo_result and vo_result.text:
-                vo_dur = max(1.0, 0.32 * len(vo_result.text.split()))
-            else:
-                vo_dur = 1.5
-            if intro_result and intro_result.wav_path:
-                cap_shift = shift
-            else:
-                # Place VO early so captions never truncate at clip end; avoids long silent lead-in
-                cap_shift = 0.55
-                # If VO would overrun the clip, we still start early (clip should cover it)
-                if cap_shift + vo_dur > clip_len_est - 0.2:
-                    need = (cap_shift + vo_dur + 0.8) - clip_len_est
-                    # Stretch source window so ASS last word is not cut by clip end
-                    segment.end = float(segment.end) + max(0.0, need) * max(speed, 0.5)
-                    clip_len_est = max(0.5, float(segment.end - segment.start) / max(speed, 0.5))
-                    print(f"[edit] extended segment for VO: need={need:.2f}s new_end={segment.end:.2f}")
-                print(f"[edit] caption/VO at @{cap_shift:.2f}s (dur={vo_dur:.2f}s)")
-            # Keep streamer/dialogue captions; VO punchline is additive (not a replace).
-            # Final pass below re-whispers mixed audio so ALL speech is covered.
-            dialogue_caps = [
-                {
-                    "word": w["word"],
-                    "start": float(w["start"]),
-                    "end": float(w["end"]),
-                }
-                for w in words
-                if float(w.get("end", 0)) > 0.05
-            ]
-            vo_caps: list[dict[str, Any]] = []
-            if vo_result and vo_result.words:
-                vo_caps = [
-                    {
-                        "word": w["word"],
-                        "start": float(w["start"]) + cap_shift,
-                        "end": float(w["end"]) + cap_shift,
-                    }
-                    for w in vo_result.words
-                ]
-            elif vo_result and vo_result.text:
-                toks = vo_result.text.split()[:24]
-                step = max(0.18, vo_dur / max(1, len(toks)))
-                vo_caps = [
-                    {
-                        "word": tok,
-                        "start": cap_shift + i * step,
-                        "end": cap_shift + (i + 0.85) * step,
-                    }
-                    for i, tok in enumerate(toks)
-                ]
-            # Prefer dialogue when present; else VO so the punchline still shows
-            caption_words = dialogue_caps if dialogue_caps else vo_caps
-            if dialogue_caps and vo_caps:
-                # Keep both, chronological
-                caption_words = sorted(dialogue_caps + vo_caps, key=lambda w: float(w["start"]))
-        else:
-            # Dialogue captions: drop anything that overlaps the intro window
-            caption_words = [
-                {
-                    "word": w["word"],
-                    "start": float(w["start"]),
-                    "end": float(w["end"]),
-                }
-                for w in words
-                if float(w.get("end", 0)) > shift + 0.05
-            ]
-            # Nudge remaining dialogue so first readable caption starts after intro
-            for w in caption_words:
-                if float(w["start"]) < shift:
-                    dur = max(0.08, float(w["end"]) - float(w["start"]))
-                    w["start"] = shift + 0.05
-                    w["end"] = w["start"] + dur
+        vo_result = None  # body commentary VO disabled — intro handles the spoken hook
+        caption_words = [
+            {
+                "word": w["word"],
+                "start": float(w["start"]) + shift,
+                "end": float(w["end"]) + shift,
+            }
+            for w in words
+            if float(w.get("end", 0)) > 0.05 and not str(w.get("word", "")).startswith("[")
+        ]
+        print(f"[edit] streamer captions: {len(caption_words)} words (shift={shift:.2f}s)")
 
         ass_path = td_path / "captions.ass"
         # First encode without burned captions; final-audio whisper pass burns once
@@ -755,76 +678,25 @@ def render_clip(
         atempo = speed if abs(speed - 1.0) > 0.001 else 1.0
         src_af = f"atempo={atempo}" if abs(atempo - 1.0) > 0.001 else "anull"
         vo_vol = float(vo_cfg.get("volume", 1.0))
-        duck = float(vo_cfg.get("duck_level", 0.22))
-        use_sidechain = bool(vo_cfg.get("sidechain", True))
-
-        # Build optional combined voice track: intro + delayed commentary
-        voice_inputs: list[Path] = []
-        if intro_result and intro_result.wav_path and intro_result.wav_path.is_file():
-            voice_inputs.append(intro_result.wav_path)
-        if vo_enabled and vo_result and vo_result.wav_path and vo_result.wav_path.is_file():
-            voice_inputs.append(vo_result.wav_path)
-
-        combined_vo = None
-        if voice_inputs:
-            combined_vo = td_path / "voice_mix.wav"
-            if len(voice_inputs) == 1:
-                only = voice_inputs[0]
-                # If it's commentary-only (no intro), delay to payoff window
-                if not (intro_result and intro_result.wav_path and intro_result.wav_path.is_file()):
-                    clip_len = max(0.5, float(segment.end - segment.start) / max(speed, 0.5))
-                    try:
-                        import wave as _wave
-                        with _wave.open(str(only), "rb") as _w:
-                            com_dur = _w.getnframes() / float(_w.getframerate() or 1)
-                    except Exception:
-                        com_dur = 1.5
-                    payoff_at = 0.55  # must match caption cap_shift
-                    delay_ms = int(payoff_at * 1000)
-                    print(f"[edit] single VO delay={payoff_at:.2f}s")
-                    cmd_d = [
-                        "ffmpeg", "-y", "-i", str(only),
-                        "-af", f"adelay={delay_ms}|{delay_ms}",
-                        str(combined_vo),
-                    ]
-                    pr = subprocess.run(cmd_d, capture_output=True, check=False)
-                    if pr.returncode != 0 or not combined_vo.is_file():
-                        combined_vo.write_bytes(only.read_bytes())
-                else:
-                    combined_vo.write_bytes(only.read_bytes())
-            else:
-                # intro at start; commentary near the END (payoff) so it does not talk over the streamer
-                intro_p = voice_inputs[0]
-                com_p = voice_inputs[1]
-                clip_len = max(0.5, float(segment.end - segment.start) / max(speed, 0.5))
-                # Estimate commentary duration ~1.5s; place so it finishes ~0.3s before end
-                try:
-                    import wave as _wave
-                    with _wave.open(str(com_p), "rb") as _w:
-                        com_dur = _w.getnframes() / float(_w.getframerate() or 1)
-                except Exception:
-                    com_dur = 1.5
-                payoff_at = max(intro_dur + 0.15, 0.55)  # align with caption shift
-                delay_ms = int(payoff_at * 1000)
-                print(f"[edit] VO delay={payoff_at:.2f}s (clip={clip_len:.2f}s)")
-                cmd_mix = [
-                    "ffmpeg", "-y",
-                    "-i", str(intro_p),
-                    "-i", str(com_p),
-                    "-filter_complex",
-                    f"[0:a]apad=pad_dur={intro_dur:.3f},atrim=0:{intro_dur:.3f},volume={vo_vol}[intro];"
-                    f"[1:a]adelay={delay_ms}|{delay_ms},volume={vo_vol}[com];"
-                    f"[intro][com]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]",
-                    "-map", "[aout]", str(combined_vo),
-                ]
-                proc_m = subprocess.run(cmd_mix, capture_output=True, text=True, check=False)
-                if proc_m.returncode != 0 or not combined_vo.is_file():
-                    print("[edit] voice mix failed, using intro only")
-                    combined_vo.write_bytes(intro_p.read_bytes())
+        # Body VO / sidechain ducking REMOVED — streamer+trailer audio stays full level.
+        # Intro VO (if any) is prepended after the body render (frozen first frame).
+        prepend_vo = None
+        if intro_result and intro_result.wav_path and intro_result.wav_path.is_file() and intro_dur >= 1.4:
+            prepend_vo = intro_result.wav_path
+            # Clamp intro_dur to wav length
+            try:
+                import wave as _wave
+                with _wave.open(str(prepend_vo), "rb") as _w:
+                    wav_d = _w.getnframes() / float(_w.getframerate() or 1)
+                intro_dur = min(2.5, max(1.5, min(intro_dur, wav_d + 0.15)))
+            except Exception:
+                intro_dur = min(2.5, max(1.5, intro_dur))
+        else:
+            intro_dur = 0.0
+            prepend_vo = None
 
         def run_ffmpeg(use_ass: bool, use_dt_fallback: bool = False) -> bool:
             dt = _drawtext_caption_fallback(words_for_burn if burn_captions else [], font_opt) if use_dt_fallback else ""
-            # Extra animated header layer: large then normal via two drawtexts
             nlen = len(hook_display)
             if nlen > 32:
                 header_fs_big, header_fs = 44, 38
@@ -834,22 +706,19 @@ def render_clip(
                 header_fs_big, header_fs = 56, 48
             else:
                 header_fs_big, header_fs = 68, 56
+            # Header visible during body (intro card carries its own title)
             anim = (
-                f"drawtext=text='{hook}'{font_opt}:fontsize={header_fs_big}:fontcolor=yellow:"
-                f"borderw=6:bordercolor=black:x=(w-text_w)/2:y=h*0.14:"
-                f"enable='lte(t\\,{intro_dur:.3f})',"
                 f"drawtext=text='{hook}'{font_opt}:fontsize={header_fs}:fontcolor=yellow:"
                 f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.15:"
-                f"enable='gte(t\\,{intro_dur:.3f})*lte(t\\,{hook_dur:.3f})'"
+                f"enable='lte(t\\,{hook_dur:.3f})'"
             )
             if skip_header:
                 anim = ""
-            # Use animated hook instead of single hook inside _video_chain — pass empty hook and append anim
             vchain = _video_chain(
                 width=width,
                 height=height,
                 ass_filter=ass_filter if use_ass else None,
-                hook=" ",  # placeholder tiny; replaced below
+                hook=" ",
                 font_opt=font_opt,
                 hook_dur=0.01,
                 speed=speed,
@@ -860,66 +729,30 @@ def render_clip(
                 out_label="vout",
                 base_filter=split_base,
             )
-            # Remove tiny placeholder drawtext if present — keep chain working
-            has_vo = combined_vo is not None and combined_vo.is_file()
-            if has_vo:
-                if use_sidechain:
-                    achain = (
-                        f"[0:a]{src_af}[a0];"
-                        f"[1:a]volume=1.0,apad=whole_dur=3600,asplit=2[sc][voice];"
-                        f"[a0][sc]sidechaincompress=threshold=0.008:ratio=12:"
-                        f"attack=20:release=220:makeup=1[ducked];"
-                        f"[ducked][voice]amix=inputs=2:duration=first:"
-                        f"dropout_transition=0:normalize=0,"
-                        f"loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
-                    )
-                else:
-                    achain = (
-                        f"[0:a]{src_af},volume={duck}[a0];"
-                        f"[1:a]volume=1.0,apad=whole_dur=3600[voice];"
-                        f"[a0][voice]amix=inputs=2:duration=first:"
-                        f"dropout_transition=0:normalize=0,"
-                        f"loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
-                    )
-                fc = f"{vchain};{achain}"
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-ss", str(segment.start),
-                    "-to", str(segment.end),
-                    "-i", str(source),
-                    "-i", str(combined_vo),
-                    "-filter_complex", fc,
-                    "-map", "[vout]",
-                    "-map", "[aout]",
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-movflags", "+faststart",
-                    "-pix_fmt", "yuv420p",
-                    "-r", "30",
-                    str(out_path),
-                ]
-            else:
-                achain = (
-                    f"[0:a]{src_af},loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
-                    if src_af != "anull"
-                    else f"[0:a]loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
-                )
-                fc = f"{vchain};{achain}"
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-ss", str(segment.start),
-                    "-to", str(segment.end),
-                    "-i", str(source),
-                    "-filter_complex", fc,
-                    "-map", "[vout]",
-                    "-map", "[aout]",
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-movflags", "+faststart",
-                    "-pix_fmt", "yuv420p",
-                    "-r", "30",
-                    str(out_path),
-                ]
+            # FULL-LEVEL source audio (streamer + trailer). No ducking, no VO mix.
+            achain = (
+                f"[0:a]{src_af},aformat=sample_rates=48000:channel_layouts=stereo,"
+                f"loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
+                if src_af != "anull"
+                else f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+                     f"loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
+            )
+            fc = f"{vchain};{achain}"
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(segment.start),
+                "-to", str(segment.end),
+                "-i", str(source),
+                "-filter_complex", fc,
+                "-map", "[vout]",
+                "-map", "[aout]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-pix_fmt", "yuv420p",
+                "-r", "30",
+                str(out_path),
+            ]
             proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if proc.returncode != 0 or not out_path.is_file():
                 print((proc.stderr or "")[-1200:])
@@ -936,7 +769,97 @@ def render_clip(
                 print("[edit] render failed")
                 return None
 
-        # Pass 2: whisper the FINAL mixed audio and reburn word-synced captions
+        # Assert body duration == window length ±0.1s
+        try:
+            import json as _j
+            _pr = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "json", str(out_path)],
+                capture_output=True, text=True, check=False,
+            )
+            body_dur = float((_j.loads(_pr.stdout).get("format") or {}).get("duration") or 0)
+            win_len = float(segment.end - segment.start) / max(speed, 0.5)
+            if abs(body_dur - win_len) > 0.1:
+                print(f"[edit] WARN body dur {body_dur:.3f}s vs window {win_len:.3f}s")
+            else:
+                print(f"[edit] body dur OK {body_dur:.3f}s ~= window {win_len:.3f}s")
+        except Exception as e:
+            print(f"[edit] dur assert skip: {e}")
+
+        # PREPEND short VO intro over frozen first frame (never over streamer speech)
+        if prepend_vo is not None and intro_dur >= 1.4 and out_path.is_file():
+            try:
+                intro_mp4 = td_path / "vo_intro.mp4"
+                body_norm = td_path / "body_norm.mp4"
+                # Frozen first frame of body for intro_dur + VO audio
+                frame0 = td_path / "frame0.png"
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(out_path), "-frames:v", "1", "-q:v", "2", str(frame0)],
+                    capture_output=True, check=False,
+                )
+                hook_esc = _escape_drawtext(hook_display)
+                intro_vf = (
+                    f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                    f"fps=30,format=yuv420p,setsar=1,"
+                    f"drawtext=text='{hook_esc}'{font_opt}:fontsize=56:fontcolor=yellow:"
+                    f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.14"
+                )
+                pr_i = subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-loop", "1", "-t", f"{intro_dur:.3f}", "-i", str(frame0),
+                        "-i", str(prepend_vo),
+                        "-vf", intro_vf,
+                        "-af", f"aformat=sample_rates=48000:channel_layouts=stereo,volume={vo_vol},"
+                               f"apad=whole_dur={intro_dur:.3f},atrim=0:{intro_dur:.3f}",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
+                        "-pix_fmt", "yuv420p", "-r", "30",
+                        "-shortest", str(intro_mp4),
+                    ],
+                    capture_output=True, text=True, check=False,
+                )
+                # Normalize body to 30fps/48kHz for clean concat
+                pr_b = subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-i", str(out_path),
+                        "-vf", f"fps=30,scale={width}:{height},setsar=1,format=yuv420p",
+                        "-af", "aformat=sample_rates=48000:channel_layouts=stereo",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
+                        "-r", "30", str(body_norm),
+                    ],
+                    capture_output=True, text=True, check=False,
+                )
+                final_tmp = td_path / "with_intro.mp4"
+                if intro_mp4.is_file() and body_norm.is_file():
+                    pr_c = subprocess.run(
+                        [
+                            "ffmpeg", "-y",
+                            "-i", str(intro_mp4), "-i", str(body_norm),
+                            "-filter_complex",
+                            "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]",
+                            "-map", "[v]", "-map", "[a]",
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
+                            "-pix_fmt", "yuv420p", "-r", "30",
+                            "-movflags", "+faststart",
+                            str(final_tmp),
+                        ],
+                        capture_output=True, text=True, check=False,
+                    )
+                    if pr_c.returncode == 0 and final_tmp.is_file():
+                        out_path.write_bytes(final_tmp.read_bytes())
+                        print(f"[edit] prepended VO intro {intro_dur:.2f}s (frozen first frame)")
+                    else:
+                        print("[edit] intro concat failed:", (pr_c.stderr or "")[-400:])
+                else:
+                    print("[edit] intro build failed:", (pr_i.stderr or "")[-300:], (pr_b.stderr or "")[-200:])
+            except Exception as e:
+                print(f"[edit] VO prepend skip: {e}")
+
+        # Pass 2: burn streamer-word captions (prefer source whisper shifted by intro)
         if burn_captions and out_path.is_file():
             try:
                 import subprocess as _sp
@@ -950,13 +873,18 @@ def render_clip(
                     _dur = max(1.0, float((_pr.stdout or "12").strip()))
                 except Exception:
                     pass
-                final_words = get_word_timestamps(
-                    out_path, 0.0, _dur, model_name=model_name, niche_id=niche_id
+                # Prefer source-window streamer words (already shifted into caption_words)
+                final_words = list(caption_words) if caption_words else []
+                # Also whisper final audio AFTER intro so we capture streamer voice; drop early VO tokens
+                whispered = get_word_timestamps(
+                    out_path, float(intro_dur), _dur, model_name=model_name, niche_id=niche_id
                 )
-                if len(final_words) < 3 and model_name != "tiny":
-                    final_words = get_word_timestamps(
-                        out_path, 0.0, _dur, model_name="tiny", niche_id=niche_id
+                if len(whispered) < 3 and model_name != "tiny":
+                    whispered = get_word_timestamps(
+                        out_path, float(intro_dur), _dur, model_name="tiny", niche_id=niche_id
                     )
+                if len(whispered) >= len(final_words):
+                    final_words = whispered
                 if final_words:
                     ass2 = td_path / "captions_final.ass"
                     n2 = _write_ass_captions(final_words, ass2, width, height, font_name=font_name)

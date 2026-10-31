@@ -802,52 +802,127 @@ def build_ranking_video(
         )
         parts.append(fixed if fixed.is_file() else base)
 
-    # Normalize AV then concat (avoids sample-rate / stream mismatches)
+    # Normalize EVERY part to 30fps + 48kHz stereo, then concat via filter
+    # (demuxer -c copy with mixed sample rates = chipmunk / A-V desync).
     final = out_root / f"{niche_id}_top{total}_{stamp}.mp4"
     width = int((cfg.get("clips") or {}).get("width", 1080))
     height = int((cfg.get("clips") or {}).get("height", 1920))
+
+    def _probe_dur(pp: Path) -> float:
+        try:
+            import json as _j
+            pr = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "json", str(pp)],
+                capture_output=True, text=True, check=False,
+            )
+            return float((_j.loads(pr.stdout).get("format") or {}).get("duration") or 0)
+        except Exception:
+            return 0.0
+
+    def _probe_av(pp: Path) -> dict:
+        try:
+            import json as _j
+            pr = subprocess.run(
+                ["ffprobe", "-v", "error",
+                 "-show_entries", "stream=codec_type,sample_rate,r_frame_rate,duration",
+                 "-show_entries", "format=duration", "-of", "json", str(pp)],
+                capture_output=True, text=True, check=False,
+            )
+            return _j.loads(pr.stdout or "{}")
+        except Exception:
+            return {}
+
     norm_parts: list[Path] = []
     for i, part in enumerate(parts):
+        src_dur = _probe_dur(part)
         npth = work / f"norm_{i:02d}.mp4"
+        # Force exact canvas, 30fps, 48kHz stereo — no pad color between panels (already 9:16)
         cmd_n = [
             "ffmpeg", "-y", "-i", str(part),
-            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
             "-filter_complex",
             f"[0:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p[v];"
-            f"[0:a]aformat=sample_rates=44100:channel_layouts=stereo[a0];"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"fps=30,setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v];"
+            f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+            f"aresample=48000,asetpts=PTS-STARTPTS[a0];"
             f"[a0][1:a]amix=inputs=2:duration=first:dropout_transition=0[a]",
             "-map", "[v]", "-map", "[a]",
             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-ar", "44100", "-ac", "2",
+            "-r", "30",
+            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
             "-shortest", str(npth),
         ]
         pr = subprocess.run(cmd_n, capture_output=True, text=True, check=False)
         if pr.returncode != 0 or not npth.is_file():
-            # Simpler path: video only + silent audio
+            _log(f"[ranking] norm {i} failed: {(pr.stderr or '')[-300:]}")
             cmd_n2 = [
                 "ffmpeg", "-y", "-i", str(part),
-                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-                "-vf", f"scale={width}:{height},fps=30,format=yuv420p",
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                "-vf", f"scale={width}:{height},fps=30,format=yuv420p,setsar=1",
                 "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "libx264", "-preset", "veryfast",
-                "-c:a", "aac", "-ar", "44100", "-ac", "2", "-shortest",
+                "-c:v", "libx264", "-preset", "veryfast", "-r", "30",
+                "-c:a", "aac", "-ar", "48000", "-ac", "2", "-shortest",
                 str(npth),
             ]
             subprocess.run(cmd_n2, capture_output=True, check=False)
-        if npth.is_file():
-            norm_parts.append(npth)
-    lst = work / "concat.txt"
-    lst.write_text("\n".join(f"file '{pp.resolve()}'" for pp in norm_parts) + "\n", encoding="utf-8")
-    cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-        "-c", "copy", "-movflags", "+faststart",
+        if not npth.is_file():
+            continue
+        nd = _probe_dur(npth)
+        # Assert normalized duration ~= source part duration (±0.15s); title card is short
+        if src_dur > 2.0 and abs(nd - src_dur) > 0.15:
+            _log(f"[ranking] WARN dur mismatch part{i}: src={src_dur:.2f}s norm={nd:.2f}s — re-encode with -t")
+            # Hard trim/pad to src_dur
+            fixed = work / f"norm_{i:02d}_fixed.mp4"
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", str(npth), "-t", f"{src_dur:.3f}",
+                 "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                 "-filter_complex",
+                 f"[0:v]fps=30,format=yuv420p,setpts=PTS-STARTPTS[v];"
+                 f"[0:a]aformat=sample_rates=48000:channel_layouts=stereo[a0];"
+                 f"[a0][1:a]amix=inputs=2:duration=first[a]",
+                 "-map", "[v]", "-map", "[a]",
+                 "-c:v", "libx264", "-preset", "veryfast", "-r", "30",
+                 "-c:a", "aac", "-ar", "48000", "-ac", "2", "-shortest",
+                 str(fixed)],
+                capture_output=True, check=False,
+            )
+            if fixed.is_file():
+                npth = fixed
+                nd = _probe_dur(npth)
+        info = _probe_av(npth)
+        _log(f"[ranking] norm part{i}: dur={nd:.3f}s (src={src_dur:.3f}) {info.get('streams', [{}])}")
+        # Assert ±0.1s for clip-length parts
+        if src_dur > 2.0 and abs(nd - src_dur) > 0.1:
+            _log(f"[ranking] ASSERT FAIL part{i} duration {nd:.3f} vs window {src_dur:.3f}")
+        norm_parts.append(npth)
+
+    if len(norm_parts) < 2:
+        _log("[ranking] not enough normalized parts")
+        return None
+
+    # concat FILTER (not demuxer copy) so timebases/sample rates stay aligned
+    cmd = ["ffmpeg", "-y"]
+    for pp in norm_parts:
+        cmd += ["-i", str(pp)]
+    n = len(norm_parts)
+    fc = "".join(f"[{i}:v][{i}:a]" for i in range(n)) + f"concat=n={n}:v=1:a=1[v][a]"
+    cmd += [
+        "-filter_complex", fc,
+        "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        "-r", "30",
+        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
+        "-movflags", "+faststart",
         str(final),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0 or not final.is_file():
-        _log(f"[ranking] concat failed: {(proc.stderr or '')[-400:]}")
+        _log(f"[ranking] concat filter failed: {(proc.stderr or '')[-600:]}")
         return None
+    fin_info = _probe_av(final)
+    _log(f"[ranking] final probe: {fin_info}")
 
     # Cap ~90s
     try:
