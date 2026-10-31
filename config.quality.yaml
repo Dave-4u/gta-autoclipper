@@ -48,7 +48,7 @@ analysis:
   - look
   - oh my god
   use_whisper: true
-  whisper_model: tiny
+  whisper_model: small
   scene_threshold: 27.0
   vocal_prefilter: true
 scheduler:

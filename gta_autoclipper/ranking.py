@@ -654,7 +654,9 @@ def build_ranking_video(
     cfg["clips"]["max_clips_per_video"] = 1
     cfg["clips"]["target_duration"] = 12
     cfg["clips"]["min_duration"] = 8
-    cfg["clips"]["max_duration"] = 14
+    cfg["clips"]["max_duration"] = 16
+    # Assembled ranking length = title + all items; do not inherit quality.yaml's 30s clip cap as a total.
+    cfg["clips"]["max_ranking_duration"] = 180
     cs = cfg["clips"].setdefault("copyright_safe", {})
     cs["enabled"] = True
 
@@ -926,27 +928,41 @@ def build_ranking_video(
     fin_info = _probe_av(final)
     _log(f"[ranking] final probe: {fin_info}")
 
-    # Cap ~90s
+    # Duration must equal sum of parts (title + every rank). Never apply clips.max_duration
+    # (e.g. quality.yaml's 30s) to the assembled ranking — that cut mid-list and dropped #1.
     try:
         import json as _json
+        part_durs = [_probe_dur(pp) for pp in norm_parts]
+        expected = float(sum(part_durs))
         pr = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(final)],
             capture_output=True, text=True, check=False,
         )
         dur = float((_json.loads(pr.stdout).get("format") or {}).get("duration") or 0)
-        if dur > 92:
-            trimmed = final.with_name(final.stem + "_90s.mp4")
+        _log(
+            f"[ranking] duration check: final={dur:.3f}s expected_sum={expected:.3f}s "
+            f"parts={[round(d,3) for d in part_durs]} ranks={[it.rank for it in survivors]}"
+        )
+        if expected > 1.0 and abs(dur - expected) > 0.75:
+            _log(
+                f"[ranking] ASSERT FAIL duration {dur:.3f} != sum(parts) {expected:.3f} "
+                f"— refusing truncated ranking"
+            )
+            return None
+        # Safety only for extreme length (never a 30s short-form cap)
+        if dur > 180:
+            trimmed = final.with_name(final.stem + "_180s.mp4")
             subprocess.run(
-                ["ffmpeg", "-y", "-i", str(final), "-t", "90", "-c", "copy", str(trimmed)],
+                ["ffmpeg", "-y", "-i", str(final), "-t", "180", "-c", "copy", str(trimmed)],
                 capture_output=True, check=False,
             )
             if trimmed.is_file():
                 final.unlink(missing_ok=True)
                 trimmed.rename(final)
-                dur = 90.0
-        _log(f"[ranking] final {final} ({dur:.1f}s)")
-    except Exception:
-        pass
+                dur = min(dur, 180.0)
+        _log(f"[ranking] final {final} ({dur:.1f}s) includes ranks {[it.rank for it in survivors]}")
+    except Exception as e:
+        _log(f"[ranking] duration verify skip: {e}")
 
     # Metadata
     hashtags = " ".join((cfg.get("hashtags") or [])[:8])

@@ -32,6 +32,68 @@ _HALLUCINATION_PHRASES = (
     "captioned by",
 )
 
+# Known GTA 6 trailer dialogue — captioning these as "streamer speech" is wrong
+# (whisper often hallucinates near-matches like "She's stuck together with the boyfriend").
+GTA6_TRAILER_LINES = (
+    "we gotta stick together through this we just gotta",
+    "we gotta stick together through this",
+    "we just gotta stick together",
+    "are we gonna be okay",
+    "we're stuck together through everything",
+    "we stuck together through everything",
+    "just gotta get through",
+    "there's gotta get through",
+    "i will die before i walk away",
+    "this is lucia",
+    "welcome to leonida",
+    "the next grand theft auto",
+    "grand theft auto six",
+    "grand theft auto vi",
+)
+
+def _norm_caption_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9\s]+", " ", (text or "").lower()).strip()
+
+
+def _token_set(text: str) -> set[str]:
+    stop = {"the", "a", "an", "to", "and", "or", "of", "in", "on", "for", "is", "it", "we", "i", "you"}
+    return {w for w in _norm_caption_text(text).split() if len(w) > 1 and w not in stop}
+
+
+def matches_trailer_line(text: str, *, min_overlap: float = 0.55) -> bool:
+    """True if text is (near) a known GTA 6 trailer line — drop from streamer captions."""
+    norm = _norm_caption_text(text)
+    if not norm or len(norm.split()) < 3:
+        return False
+    toks = _token_set(norm)
+    if not toks:
+        return False
+    for line in GTA6_TRAILER_LINES:
+        lt = _token_set(line)
+        if not lt:
+            continue
+        overlap = len(toks & lt) / max(1, len(lt))
+        # also require decent coverage of the hypothesis
+        cov = len(toks & lt) / max(1, len(toks))
+        if overlap >= min_overlap and cov >= 0.45:
+            return True
+        # substring / near-phrase
+        if len(line) >= 12 and (line in norm or norm in line):
+            return True
+    # Generic "stick/stuck together" trailer motif (whisper often hears stick→stuck)
+    if (("stick" in toks) or ("stuck" in toks)) and "together" in toks and len(toks) <= 14:
+        return True
+    # Common near-miss hallucinations of the stick-together trailer beat
+    if "boyfriend" in toks and (("stuck" in toks) or ("stick" in toks) or ("together" in toks)):
+        return True
+    if "tool" in toks and (("good" in toks) or ("got" in toks)) and len(toks) <= 10:
+        # "He's got a good tool" — trailer garble, not streamer talk
+        if any(x in toks for x in ("stuck", "stick", "together", "boyfriend", "hes", "he")):
+            return True
+    return False
+
+
+
 
 def _whisper_model(name: str):
     from faster_whisper import WhisperModel
@@ -57,12 +119,16 @@ def extract_vocals_wav(
         out = Path(tmp.name)
         tmp.close()
 
+    # Lightweight vocal isolation (no demucs): speech band + denoise + center emphasis
     af = (
-        "highpass=f=120,"
-        "lowpass=f=3800,"
-        "afftdn=nr=10:nf=-25,"
+        "highpass=f=180,"
+        "lowpass=f=3500,"
+        "afftdn=nr=14:nf=-28,"
+        "equalizer=f=300:t=q:w=1.0:g=-3,"
+        "equalizer=f=1200:t=q:w=0.8:g=3,"
+        "equalizer=f=2400:t=q:w=0.8:g=2,"
         "dynaudnorm=f=75:g=15,"
-        "volume=2.5"
+        "volume=3.0"
     )
     cmd = ["ffmpeg", "-y"]
     if start is not None:
@@ -126,9 +192,9 @@ def _segment_ok(
     seg: Any,
     *,
     niche_id: str | None = None,
-    min_avg_logprob: float = -0.65,
-    max_no_speech: float = 0.55,
-    max_compression: float = 2.4,
+    min_avg_logprob: float = -0.50,
+    max_no_speech: float = 0.50,
+    max_compression: float = 2.2,
 ) -> bool:
     """Quality gate for a faster-whisper segment."""
     text = (getattr(seg, "text", None) or "").strip()
@@ -136,6 +202,8 @@ def _segment_ok(
         return False
     low = text.lower()
     if any(p in low for p in _HALLUCINATION_PHRASES):
+        return False
+    if matches_trailer_line(text):
         return False
     if _is_repeated_text(text):
         return False
@@ -212,9 +280,9 @@ def _transcribe_wav(
         word_timestamps=True,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=400),
-        no_speech_threshold=0.6,
-        compression_ratio_threshold=2.4,
-        log_prob_threshold=-1.0,
+        no_speech_threshold=0.55,
+        compression_ratio_threshold=2.2,
+        log_prob_threshold=-0.55,
         condition_on_previous_text=False,
         beam_size=5,
         best_of=5,
@@ -256,7 +324,29 @@ def _transcribe_wav(
                     })
     if dropped:
         print(f"[transcribe] dropped {dropped} low-quality/music segments (kept {kept})")
-    return _clean_words(words)
+    cleaned = _clean_words(words)
+    # Second pass: drop word runs whose joined text matches known trailer dialogue
+    if cleaned and matches_trailer_line(" ".join(w["word"] for w in cleaned)):
+        print("[transcribe] dropping caption run — matches known GTA6 trailer line")
+        return []
+    # Drop short sliding windows that match trailer lines
+    filtered: list[dict[str, Any]] = []
+    i = 0
+    while i < len(cleaned):
+        # look ahead up to 10 tokens
+        matched = False
+        for n in range(min(10, len(cleaned) - i), 2, -1):
+            chunk = cleaned[i:i + n]
+            if matches_trailer_line(" ".join(w["word"] for w in chunk)):
+                print(f"[transcribe] drop trailer chunk: {' '.join(w['word'] for w in chunk)!r}")
+                i += n
+                matched = True
+                break
+        if matched:
+            continue
+        filtered.append(cleaned[i])
+        i += 1
+    return filtered
 
 
 def get_word_timestamps(
@@ -264,7 +354,7 @@ def get_word_timestamps(
     start: float,
     end: float,
     *,
-    model_name: str = "base",
+    model_name: str = "small",
     language: str | None = "en",
     niche_id: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -273,12 +363,16 @@ def get_word_timestamps(
     Returns [] (no captions) for music-only / no-speech — never fake placeholders.
     """
     duration = max(0.5, end - start)
+    # Prefer small/medium int8; never fall back to tiny (hallucinates trailer lines).
     attempts: list[tuple[str, str, bool]] = [
         ("vocals+model", model_name, True),
         ("plain+model", model_name, False),
     ]
-    alt = "tiny" if model_name != "tiny" else "base"
-    attempts.append((f"vocals+{alt}", alt, True))
+    if model_name in {"tiny", "base"}:
+        attempts.append(("vocals+small", "small", True))
+    elif model_name == "small":
+        attempts.append(("vocals+base", "base", True))  # base only as backup, never tiny
+
 
     last_err = None
     for label, mid, use_vocals in attempts:

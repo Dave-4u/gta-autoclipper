@@ -379,7 +379,9 @@ def render_clip(
         )
 
     ana = cfg.get("analysis") or {}
-    model_name = str(ana.get("whisper_model", "base"))
+    model_name = str(ana.get("whisper_model", "small"))
+    if model_name in {"tiny"}:
+        model_name = "small"  # tiny hallucinates trailer dialogue into captions
     use_whisper = ana.get("use_whisper", True)
     vo_cfg = cfg.get("voiceover") or {}
     vo_enabled = bool(vo_cfg.get("enabled", True))
@@ -941,14 +943,17 @@ def render_clip(
                 whispered = get_word_timestamps(
                     out_path, float(intro_dur), _dur, model_name=model_name, niche_id=niche_id
                 )
-                if len(whispered) < 3 and model_name != "tiny":
+                if len(whispered) < 3 and model_name in {"tiny", "base"}:
                     whispered = get_word_timestamps(
                         out_path, float(intro_dur), _dur,
-                        model_name="base" if model_name == "tiny" else "tiny",
+                        model_name="small",
                         niche_id=niche_id,
                     )
+                from .transcribe import matches_trailer_line as _trailer_line
                 def _streamer_like(ws):
                     text = " ".join(str(w.get("word","")) for w in ws).lower()
+                    if _trailer_line(text):
+                        return False
                     if re.search(r"(grand theft auto|gta\s*6).{0,40}(coming|november|pre-?order)", text):
                         if not re.search(r"\b(i|i'm|bro|chat|dude|oh my|fuck|wait)\b", text):
                             return False
