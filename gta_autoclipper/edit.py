@@ -431,8 +431,9 @@ def render_clip(
             print(f"[layout] detect failed: {e}")
 
     # Gate: require trailer + strong reaction for reaction niches
-    reaction_meta = {"ok": True, "emotion": "", "desc": ""}
-    if is_reactionish:
+    reaction_meta = {"ok": True, "emotion": str(meta.get("gate_emotion") or ""), "desc": str(meta.get("gate_desc") or "")}
+    preconfirmed = bool(meta.get("preconfirmed") or "gemini" in (segment.reason or ""))
+    if is_reactionish and not preconfirmed:
         try:
             reaction_meta = confirm_reaction_moment(
                 source, segment.start, segment.end, cfg=cfg, title=title, require_trailer=True,
@@ -444,6 +445,16 @@ def render_clip(
                 return None
         except Exception as e:
             print(f"[gate] error: {e}")
+    elif is_reactionish and preconfirmed:
+        print(f"[gate] trust preconfirmed emo={reaction_meta.get('emotion')!r}")
+        # Still refresh emotion if empty
+        if not reaction_meta.get("emotion"):
+            try:
+                reaction_meta = confirm_reaction_moment(
+                    source, segment.start, segment.end, cfg=cfg, title=title, require_trailer=True,
+                )
+            except Exception:
+                reaction_meta = {"ok": True, "emotion": "shocked", "desc": ""}
 
     vlm_desc = ""
     llm_vo = ""

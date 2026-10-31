@@ -705,20 +705,62 @@ def build_ranking_video(
         footage=bg_item.path,
         footage_t=float(getattr(bg_item.segment, "start", 0.0) or 0.0),
     )
-    parts: list[Path] = [title_card]
+    rendered_items: list[RankItem] = []
+    rendered_paths: list[Path] = []
     for item in survivors:
         _log(f"[ranking] render #{item.rank} {item.candidate.title[:50]} ({_format_views(item.views)})")
         seg = _render_rank_segment(item, cfg, work, with_vo=with_vo)
         if seg:
-            parts.append(seg)
+            rendered_items.append(item)
+            rendered_paths.append(seg)
         else:
-            _log(f"[ranking] render failed for #{item.rank} {item.candidate.id}")
+            _log(f"[ranking] render failed for #{item.rank} {item.candidate.id} — excluding")
 
-    # If a late render failed, drop title mismatches by rebuilding ranks from successful parts
-    # (title already uses survivor count; prefer failing closed if <3)
-    if len(parts) < 4:  # title + >=3
-        _log(f"[ranking] too few rendered parts ({len(parts)-1})")
+    if len(rendered_items) < 3:
+        _log(f"[ranking] too few rendered parts ({len(rendered_items)})")
         return None
+
+    # Re-rank / retitle from what ACTUALLY rendered (no missing #N)
+    total = len(rendered_items)
+    for i, item in enumerate(rendered_items):
+        item.rank = total - i
+    topic = _re.sub(r"(?i)\btop\s*\d+\b", f"Top {total}", topic)
+    if not _re.search(r"(?i)\btop\s*\d+", topic):
+        topic = f"Top {total} {topic}"
+    _log(f"[ranking] post-render topic={topic!r} count={total}")
+    survivors = rendered_items
+
+    # Rebuild title card + re-burn rank overlays with final numbers
+    bg_item = survivors[-1]
+    title_card, _ = _render_title_card(
+        topic, work, cfg,
+        footage=bg_item.path,
+        footage_t=float(getattr(bg_item.segment, "start", 0.0) or 0.0),
+    )
+    parts: list[Path] = [title_card]
+    for item, base in zip(survivors, rendered_paths):
+        fixed = work / f"rank_{item.rank:02d}_{item.candidate.id}_final.mp4"
+        # Re-render overlay from original source clip via _render_rank_segment again would
+        # re-call Gemini; instead redraw number/label on the already-rendered base.
+        rank_txt = _escape_drawtext(f"#{item.rank}")
+        label = _escape_drawtext(_fit_header_words(item.label, 28))
+        views = _escape_drawtext(_format_views(item.views))
+        # Cover old # badge with a black box then draw new
+        vf = (
+            f"drawbox=x=20:y=60:w=220:h=220:color=black@0.85:t=fill,"
+            f"drawtext=text='{rank_txt}':fontsize=96:fontcolor=yellow:"
+            f"borderw=6:bordercolor=black:x=40:y=80,"
+            f"drawtext=text='{label}':fontsize=40:fontcolor=white:"
+            f"borderw=3:bordercolor=black:x=40:y=200,"
+            f"drawtext=text='{views}':fontsize=36:fontcolor=yellow:"
+            f"borderw=3:bordercolor=black:x=40:y=260"
+        )
+        pr = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(base), "-vf", vf,
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy", str(fixed)],
+            capture_output=True, text=True, check=False,
+        )
+        parts.append(fixed if fixed.is_file() else base)
 
     # Normalize AV then concat (avoids sample-rate / stream mismatches)
     final = out_root / f"{niche_id}_top{total}_{stamp}.mp4"
