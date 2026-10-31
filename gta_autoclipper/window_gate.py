@@ -500,7 +500,7 @@ def speech_coverage(
         from gta_autoclipper.transcribe import get_word_timestamps  # type: ignore
     try:
         words = get_word_timestamps(Path(path), float(start), float(end),
-                                    model_name=model_name, niche_id="gta6")  # broad vocab for coverage
+                                    model_name=model_name, niche_id=niche_id)
         best = max(best, _cov(words), key=lambda x: x[0])
     except Exception as e:
         print(f"[speech-cov] filtered whisper err: {e}")

@@ -47,6 +47,7 @@ def describe_moment(
 ) -> str:
     from .gemini_client import generate, has_gemini
     if not has_gemini(cfg):
+        print("[vlm] gemini skipped: no API key")
         return ""
     dur = max(0.5, end - start)
     times = [start + dur * x for x in (0.15, 0.4, 0.65, 0.85)[:n_frames]]
@@ -76,6 +77,7 @@ def describe_moment(
 def reaction_emotion(path: Path, t: float, *, cfg: dict[str, Any] | None = None, title: str = "") -> dict[str, Any]:
     from .gemini_client import generate, has_gemini
     if not has_gemini(cfg):
+        print("[vlm] gemini skipped: no API key")
         return {"ok": True, "label": "unknown", "raw": "no_key"}
     frames = grab_frame_files(path, [t, t + 0.7, t + 1.4], width=512)
     if not frames:

@@ -215,9 +215,35 @@ def smart_rank_score(c: Candidate, *, sort_by: str = "recent_views", niche_id: s
     return base
 
 
+
+def _is_playlist_or_channel(entry_or_url: dict | str, vid: str = "") -> bool:
+    """Reject YouTube playlists/channels that hang yt-dlp for minutes."""
+    if isinstance(entry_or_url, dict):
+        e = entry_or_url
+        vid = str(vid or e.get("id") or "")
+        url = str(e.get("url") or e.get("webpage_url") or e.get("ie_key") or "")
+        etype = str(e.get("_type") or e.get("ie_key") or "").lower()
+        if etype in {"playlist", "channel", "youtube:tab"}:
+            return True
+    else:
+        url = str(entry_or_url or "")
+    low = (url or "").lower()
+    if "playlist?list=" in low or "/playlist" in low:
+        return True
+    if "/channel/" in low or "/c/" in low or "/user/" in low:
+        return True
+    # bare @handle channel URLs
+    if "youtube.com/@" in low and "watch" not in low:
+        return True
+    if vid.startswith(("PL", "UU", "OLAK5uy_")):
+        return True
+    return False
+
 def _entry_to_candidate(e: dict[str, Any], source: str) -> Candidate | None:
     vid = e.get("id") or ""
     if not vid:
+        return None
+    if _is_playlist_or_channel(e, str(vid)):
         return None
     url = e.get("url") or e.get("webpage_url") or ""
     if url and not str(url).startswith("http"):
@@ -302,6 +328,9 @@ def read_links_file(path: str | Path) -> list[Candidate]:
         if not line or line.startswith("#"):
             continue
         vid = _url_to_id(line)
+        if _is_playlist_or_channel(line, vid):
+            print(f"[discover] skip playlist/channel link: {line[:80]}")
+            continue
         out.append(
             Candidate(
                 id=vid,

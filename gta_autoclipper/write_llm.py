@@ -65,20 +65,62 @@ def _overlap(a: str, b: str) -> float:
     return len(ta & tb) / max(1, len(ta))
 
 
+def _clean_title_header(title: str) -> str:
+    """Readable header from a YouTube title — keep names, drop noise tags."""
+    t = title or ""
+    t = re.sub(r"[\[\]\(\)【】「」『』]", " ", t)
+    t = re.sub(r"[|#].*$", " ", t)  # drop trailing hashtags / pipe suffixes later carefully
+    # Keep left side of first pipe / emdash if it looks like the real title
+    t = re.split(r"\s*[|–—]\s*", t, maxsplit=1)[0]
+    t = re.sub(
+        r"(?i)\b("
+        r"official\s+(?:teaser\s+)?(?:trailer|video)|teaser\s+trailer|launch\s+trailer|"
+        r"4k|8k|hdr|60fps?|1080p|2160p|hd|full\s+fight|amv|edit|shorts?|tiktok|"
+        r"compilation|reaction|reacts|free\s+pf|visuals?"
+        r")\b",
+        " ",
+        t,
+    )
+    t = re.sub(r"\s+", " ", t).strip(" -_:.")
+    # Prefer "X vs Y" intact
+    mvs = re.search(
+        r"(?i)\b([A-Za-z][A-Za-z0-9' ]{1,24}?)\s+vs\.?\s+([A-Za-z][A-Za-z0-9' ]{1,24})",
+        title or "",
+    )
+    if mvs:
+        return _fit_six_words(f"{mvs.group(1).strip().title()} vs {mvs.group(2).strip().title()}")
+    if not t or len(t.split()) < 1:
+        return ""
+    return _fit_six_words(t)
+
+
 def _template_fallback(*, niche_id, title, channel, vlm_desc, event, entities) -> dict[str, str]:
     from .entities import detect_reactor, NEUTRAL_HEADERS
     reactor = detect_reactor(title, channel)
     desc_l = (vlm_desc or "").lower()
     header = ""
     mvs = re.search(r"(?i)\b([A-Za-z][A-Za-z ]{1,20}?)\s+vs\.?\s+([A-Za-z][A-Za-z ]{1,20})", title or "")
+    title_hdr = _clean_title_header(title or "")
+    # Reject mangled event fragments like "Grand trailer", "Turning trailer", "DON'T clutch"
+    bad_event = bool(
+        event and re.search(
+            r"(?i)^(grand|turning|learn|boxtoxtv|fight trill|oga sabinus)?\s*"
+            r"(trailer|teaser|clutch|moment)$",
+            (event or "").strip(),
+        )
+    ) or bool(event and re.search(r"(?i)\b(trailer|teaser|clutch)\b$", (event or "").strip()) and len((event or "").split()) <= 2)
     if mvs:
         header = _fit_six_words(f"{mvs.group(1).strip().title()} vs {mvs.group(2).strip().title()}")
     elif "tengen" in desc_l:
         header = "Tengen vs Gyutaro" if "gyutaro" in desc_l else "Tengen fights"
+    elif title_hdr and len(title_hdr.split()) >= 2:
+        header = title_hdr
     elif reactor:
         header = _fit_six_words(f"{reactor.split()[0]} loses it")
-    elif event and event.lower() not in {"this moment", "that reaction", "moment"}:
+    elif event and (not bad_event) and event.lower() not in {"this moment", "that reaction", "moment", "trailer", "clutch"}:
         header = _fit_six_words(event)
+    elif title_hdr:
+        header = title_hdr
     else:
         header = _fit_six_words(NEUTRAL_HEADERS[0])
     vo = ""
@@ -87,7 +129,6 @@ def _template_fallback(*, niche_id, title, channel, vlm_desc, event, entities) -
     elif any(k in desc_l for k in ("fight", "blade", "slash")):
         vo = "Blades everywhere."
     return {"header": header, "vo": vo, "via": "fallback", "raw": ""}
-
 
 def write_header_vo(
     *, niche_id: str, title: str, channel: str, vlm_desc: str, transcript: str,
@@ -100,6 +141,7 @@ def write_header_vo(
     es = entities or extract_entities(title=title, channel=channel, transcript=transcript, niche_id=niche_id)
     reactor = detect_reactor(title, channel)
     if not has_gemini(cfg):
+        print("[llm] gemini skipped: no API key (set GEMINI_API_KEY env, .env, or gemini.api_key)")
         return _template_fallback(niche_id=niche_id, title=title, channel=channel,
                                   vlm_desc=vlm_desc, event=event, entities=es)
 

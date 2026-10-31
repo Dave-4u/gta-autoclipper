@@ -18,7 +18,7 @@ from .discover import discover
 from .download import download_video, probe_duration
 from .edit import probe_clip, render_clip
 from .history import History
-from .niches import apply_niche_to_config, list_niche_ids, niche_relevance
+from .niches import apply_niche_to_config, list_niche_ids, list_autopilot_niche_ids, niche_is_enabled, niche_relevance
 
 
 LogFn = Callable[[str], None]
@@ -219,7 +219,13 @@ def run_autopilot(
     if not cfg["analysis"].get("whisper_model"):
         cfg["analysis"]["whisper_model"] = "tiny"
 
-    niche_list = [n for n in niches if n] or ["gta6"]
+    from .niches import niche_is_enabled, list_autopilot_niche_ids
+    niche_list = [n for n in niches if n and niche_is_enabled(n)]
+    if not niche_list:
+        niche_list = list_autopilot_niche_ids() or ["anime", "animation", "gta6"]
+    skipped = [n for n in niches if n and not niche_is_enabled(n)]
+    if skipped:
+        _log(f"[auto] skipping disabled niches: {', '.join(skipped)}", log)
     all_out: list[str] = []
     try:
         while True:

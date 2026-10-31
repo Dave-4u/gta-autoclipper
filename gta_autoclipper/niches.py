@@ -99,14 +99,16 @@ NICHES: dict[str, dict[str, Any]] = {
     },
     "gaming": {
         "label": "Gaming",
+        "enabled": True,
         "keywords": [
-            "gaming funny moments",
-            "clutch play shorts",
-            "game fail compilation",
-            "new game trailer",
-            "speedrun fail funny",
-            "ranked rage moment",
-            "best gaming clips",
+            "gaming funny moments gameplay",
+            "1v5 clutch gameplay",
+            "game fail compilation gameplay",
+            "new game trailer gameplay",
+            "speedrun fail funny gameplay",
+            "ranked rage moment gameplay",
+            "best gaming clips twitch",
+            "fps clutch play",
         ],
         "header_styles": ["hype", "pov", "when_you", "hot_take", "question", "reaction"],
         "voice": "am_adam",
@@ -119,6 +121,7 @@ NICHES: dict[str, dict[str, Any]] = {
     },
     "funny": {
         "label": "Funny / Viral",
+        "enabled": False,
         "keywords": [
             "funny viral video",
             "unexpected moment funny",
@@ -136,6 +139,7 @@ NICHES: dict[str, dict[str, Any]] = {
     },
     "movies": {
         "label": "Movies / Trailers",
+        "enabled": False,
         "keywords": [
             "movie trailer new",
             "film trailer reaction",
@@ -316,11 +320,17 @@ NICHE_RELEVANCE: dict[str, dict[str, list[str]]] = {
     },
     "gaming": {
         "must_any": [
-            "gameplay", "gaming", "gamer", "clutch", "speedrun", "boss fight", "ranked",
+            "gameplay", "gaming", "gamer", "speedrun", "boss fight", "ranked",
             "playstation", "xbox", "steam", "nintendo", "esports", "noob", "gg ",
             "call of duty", "fortnite", "valorant", "minecraft", "elden ring",
+            "twitch", "streamer", "fps", "battle royale", "warzone", "apex legends",
         ],
-        "hard_reject": ["asmr cooking", "makeup tutorial"],
+        "hard_reject": [
+            "asmr cooking", "makeup tutorial",
+            "clutch control", "manual transmission", "driving lesson", "how does a clutch",
+            "how does it work", "civil engineering", "car clutch", "learn clutch",
+            "transmission system", "engine power", "driving school",
+        ],
     },
     "funny": {
         "must_any": [

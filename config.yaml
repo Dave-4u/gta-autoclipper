@@ -11,6 +11,11 @@ search:
 download:
   links_file: links.txt
   output_dir: downloads
+  # Optional: bypass YouTube bot check. Example: chrome  or  edge
+  cookies_from_browser: ''
+  # Or a Netscape cookies.txt exported from your browser:
+  cookies: ''
+  timeout_seconds: 180
   format: bv*[height<=1080][vcodec!~='av01'][vcodec!~='av1']+ba/b[height<=1080]/b
 history:
   file: history.json

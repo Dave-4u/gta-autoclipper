@@ -68,6 +68,31 @@ def _escape_drawtext(text: str) -> str:
     return text
 
 
+def _fc_path(path: str | Path) -> str:
+    """Path for ffmpeg filter options: forward slashes, escape drive colon."""
+    s = str(path).replace(chr(92), '/')
+    if len(s) >= 2 and s[1] == ":":
+        s = s[0] + chr(92) + ":" + s[2:]
+    return s
+
+
+def _font_opt(font: str) -> str:
+    if not font:
+        return ""
+    return f":fontfile={_fc_path(font)}"
+
+
+def _run_ffmpeg_with_script(
+    cmd_prefix: list[str],
+    filter_complex: str,
+    cmd_suffix: list[str],
+    script_path: Path,
+) -> subprocess.CompletedProcess:
+    """Write filtergraph to a file; use -filter_complex_script (Windows-safe)."""
+    script_path.write_text(filter_complex, encoding="utf-8")
+    cmd = list(cmd_prefix) + ["-filter_complex_script", str(script_path)] + list(cmd_suffix)
+    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+
 
 def _fit_header(text: str, max_chars: int = 36) -> str:
     """Keep headers readable on 9:16; never truncate mid-word / mid-name."""
@@ -296,6 +321,8 @@ def _video_chain(
     in_label: str = "0:v",
     out_label: str = "vout",
     base_filter: str | None = None,
+    hook_textfile: str | None = None,
+    header_fontsize: int = 48,
 ) -> str:
     z = max(1.0, float(zoom))
     speed = max(0.5, min(2.0, float(speed)))
@@ -315,18 +342,30 @@ def _video_chain(
     if ass_filter:
         parts.append(f"[{cur}]{ass_filter}[cap]")
         cur = "cap"
-    parts.append(
-        f"[{cur}]drawtext=text='{hook}'{font_opt}:fontsize=72:fontcolor=yellow:"
-        f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.06:"
-        f"enable='lte(t\\,{hook_dur})'[hooked]"
-    )
-    cur = "hooked"
+    # Real header only — never a blank placeholder drawtext (breaks Windows argv).
+    hook_draw = ""
+    if hook_textfile:
+        tf = _fc_path(hook_textfile)
+        hook_draw = (
+            f"drawtext=textfile='{tf}'{font_opt}:fontsize={int(header_fontsize)}:fontcolor=yellow:"
+            f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.06:"
+            f"enable='lte(t\\,{hook_dur:.3f})'"
+        )
+    elif hook and hook.strip():
+        hook_draw = (
+            f"drawtext=text='{hook}'{font_opt}:fontsize={int(header_fontsize)}:fontcolor=yellow:"
+            f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.06:"
+            f"enable='lte(t\\,{hook_dur:.3f})'"
+        )
+    if hook_draw:
+        parts.append(f"[{cur}]{hook_draw}[hooked]")
+        cur = "hooked"
     if commentary_on and commentary:
         parts.append(
             f"[{cur}]drawtext=text='{commentary}'{font_opt}:fontsize=40:"
             f"fontcolor=white:borderw=3:bordercolor=black:"
             f"x=(w-text_w)/2:y=h*0.22:"
-            f"enable='lte(t\\,{max(hook_dur + 2.5, 4.0)})'[com]"
+            f"enable='lte(t\\,{max(hook_dur + 2.5, 4.0):.3f})'[com]"
         )
         cur = "com"
     if drawtext_extra:
@@ -857,19 +896,15 @@ def render_clip(
             ass_path.read_text(encoding="utf-8"), encoding="utf-8"
         )
 
-        ass_escaped = str(ass_path).replace("\\", "/").replace(":", chr(92) + ":")
+        ass_escaped = _fc_path(ass_path)
         fontsdir = ""
         if font:
-            fontsdir = str(Path(font).parent).replace("\\", "/").replace(":", chr(92) + ":")
+            fontsdir = _fc_path(Path(font).parent)
         ass_filter = f"ass='{ass_escaped}'"
         if fontsdir:
             ass_filter = f"ass='{ass_escaped}':fontsdir='{fontsdir}'"
 
-        if font:
-            _font_esc = font.replace(":", chr(92) + ":")
-            font_opt = f":fontfile={_font_esc}"
-        else:
-            font_opt = ""
+        font_opt = _font_opt(font)
 
         commentary_text = ""
         # Avoid stacking commentary banner on top of karaoke captions/VO
@@ -909,35 +944,34 @@ def render_clip(
             dt = _drawtext_caption_fallback(words_for_burn if burn_captions else [], font_opt) if use_dt_fallback else ""
             nlen = len(hook_display)
             if nlen > 32:
-                header_fs_big, header_fs = 40, 34
+                header_fs = 34
             elif nlen > 24:
-                header_fs_big, header_fs = 44, 38
+                header_fs = 38
             elif nlen > 18:
-                header_fs_big, header_fs = 50, 42
+                header_fs = 42
             else:
-                header_fs_big, header_fs = 56, 48
-            # Header visible during body (intro card carries its own title)
-            anim = (
-                f"drawtext=text='{hook}'{font_opt}:fontsize={header_fs}:fontcolor=yellow:"
-                f"borderw=5:bordercolor=black:x=(w-text_w)/2:y=h*0.06:"
-                f"enable='lte(t\\,{hook_dur:.3f})'"
-            )
-            if skip_header:
-                anim = ""
+                header_fs = 48
+            # Write header to a text file so apostrophes (DON'T) and Windows paths are safe.
+            header_tf = None
+            if not skip_header and hook_display.strip():
+                header_tf = td_path / "header.txt"
+                header_tf.write_text(hook_display.strip() + "\n", encoding="utf-8")
             vchain = _video_chain(
                 width=width,
                 height=height,
                 ass_filter=ass_filter if use_ass else None,
-                hook=" ",
+                hook="",
                 font_opt=font_opt,
-                hook_dur=0.01,
+                hook_dur=hook_dur,
                 speed=speed,
                 zoom=1.0 if split_base else zoom,
                 commentary=commentary_text,
                 commentary_on=commentary_on and bool(commentary_text),
-                drawtext_extra=(anim + (("," + dt) if dt else "")),
+                drawtext_extra=(dt if dt else ""),
                 out_label="vout",
                 base_filter=split_base,
+                hook_textfile=str(header_tf) if header_tf is not None else None,
+                header_fontsize=header_fs,
             )
             # FULL-LEVEL source audio (streamer + trailer). No ducking, no VO mix.
             achain = (
@@ -948,12 +982,14 @@ def render_clip(
                      f"loudnorm=I={lufs}:TP=-1.5:LRA=11[aout]"
             )
             fc = f"{vchain};{achain}"
-            cmd = [
+            script = td_path / ("fc_ass.txt" if use_ass else "fc_dt.txt")
+            cmd_prefix = [
                 "ffmpeg", "-y",
                 "-ss", str(segment.start),
                 "-to", str(segment.end),
                 "-i", str(source),
-                "-filter_complex", fc,
+            ]
+            cmd_suffix = [
                 "-map", "[vout]",
                 "-map", "[aout]",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
@@ -963,7 +999,7 @@ def render_clip(
                 "-r", "30",
                 str(out_path),
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            proc = _run_ffmpeg_with_script(cmd_prefix, fc, cmd_suffix, script)
             if proc.returncode != 0 or not out_path.is_file():
                 print((proc.stderr or "")[-1200:])
                 return False
@@ -1036,25 +1072,28 @@ def render_clip(
                     ["ffmpeg", "-y", "-i", str(out_path), "-frames:v", "1", "-q:v", "2", str(frame0)],
                     capture_output=True, check=False,
                 )
-                hook_esc = _escape_drawtext(hook_display)
-                # Split long headers into 2 lines for the card (clean header, not TTS phonetics)
+                # Title-card intro via textfile + filter script (Windows-safe)
                 hw = hook_display.split()
+                header_files = []
                 if len(hw) > 5:
                     mid = max(3, len(hw) // 2)
-                    line1 = _escape_drawtext(" ".join(hw[:mid]))
-                    line2 = _escape_drawtext(" ".join(hw[mid:]))
+                    tf1 = td_path / "intro_h1.txt"
+                    tf2 = td_path / "intro_h2.txt"
+                    tf1.write_text(" ".join(hw[:mid]) + "\n", encoding="utf-8")
+                    tf2.write_text(" ".join(hw[mid:]) + "\n", encoding="utf-8")
                     title_draw = (
-                        f"drawtext=text='{line1}'{font_opt}:fontsize=64:fontcolor=yellow:"
+                        f"drawtext=textfile='{_fc_path(tf1)}'{font_opt}:fontsize=64:fontcolor=yellow:"
                         f"borderw=6:bordercolor=black:x=(w-text_w)/2:y=(h/2)-80,"
-                        f"drawtext=text='{line2}'{font_opt}:fontsize=64:fontcolor=yellow:"
+                        f"drawtext=textfile='{_fc_path(tf2)}'{font_opt}:fontsize=64:fontcolor=yellow:"
                         f"borderw=6:bordercolor=black:x=(w-text_w)/2:y=(h/2)+10"
                     )
                 else:
+                    tf0 = td_path / "intro_h.txt"
+                    tf0.write_text(hook_display.strip() + "\n", encoding="utf-8")
                     title_draw = (
-                        f"drawtext=text='{hook_esc}'{font_opt}:fontsize=72:fontcolor=yellow:"
+                        f"drawtext=textfile='{_fc_path(tf0)}'{font_opt}:fontsize=72:fontcolor=yellow:"
                         f"borderw=7:bordercolor=black:x=(w-text_w)/2:y=(h-text_h)/2"
                     )
-                # Use ih/iw (not h/w) in drawbox; escape font path for filter_complex
                 intro_vf = (
                     f"scale={width}:{height}:force_original_aspect_ratio=increase,"
                     f"crop={width}:{height},"
@@ -1063,23 +1102,28 @@ def render_clip(
                     f"{title_draw},"
                     f"fps=30,format=yuv420p,setsar=1"
                 )
-                pr_i = subprocess.run(
+                intro_fc = (
+                    f"[0:v]{intro_vf}[v];"
+                    f"[1:a]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                    f"volume={vo_vol},apad=whole_dur={intro_dur:.3f},atrim=0:{intro_dur:.3f},"
+                    f"asetpts=PTS-STARTPTS[a]"
+                )
+                intro_script = td_path / "intro_fc.txt"
+                pr_i = _run_ffmpeg_with_script(
                     [
                         "ffmpeg", "-y",
                         "-loop", "1", "-framerate", "30", "-t", f"{intro_dur:.3f}", "-i", str(frame0),
                         "-i", str(vo48),
-                        "-filter_complex",
-                        f"[0:v]{intro_vf}[v];"
-                        f"[1:a]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
-                        f"volume={vo_vol},apad=whole_dur={intro_dur:.3f},atrim=0:{intro_dur:.3f},"
-                        f"asetpts=PTS-STARTPTS[a]",
+                    ],
+                    intro_fc,
+                    [
                         "-map", "[v]", "-map", "[a]",
                         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
                         "-pix_fmt", "yuv420p", "-r", "30",
                         "-shortest", str(intro_mp4),
                     ],
-                    capture_output=True, text=True, check=False,
+                    intro_script,
                 )
                 # Body: force 30fps + 48kHz with aresample (never asetrate)
                 pr_b = subprocess.run(

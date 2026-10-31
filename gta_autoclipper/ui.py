@@ -22,7 +22,7 @@ from .discover import Candidate, discover, _url_to_id
 from .download import download_video, probe_duration
 from .edit import probe_clip, render_clip
 from .history import History
-from .niches import list_niche_ids, list_autopilot_niche_ids
+from .niches import list_niche_ids, list_autopilot_niche_ids, niche_is_enabled
 from .autopilot import get_state, request_stop, start_autopilot_background
 
 try:
@@ -491,7 +491,7 @@ def build_app(config_path: str | None = None):
         return paths
 
     def on_auto_start(niches, clips_n, max_vids, interval, custom_kw):
-        niches = niches or ["gta6"]
+        niches = [n for n in (niches or []) if niche_is_enabled(n)] or list_autopilot_niche_ids() or ["anime"]
         custom = [k.strip() for k in (custom_kw or "").replace("\n", ",").split(",") if k.strip()]
         start_autopilot_background(
             niches=list(niches),
@@ -581,7 +581,7 @@ Free local multi-niche Shorts clipper — smart discovery, catchy headers, intro
                 niche_select = gr.CheckboxGroup(
                     choices=niche_ids,
                     value=autopilot_defaults or ["anime", "animation", "gta6"],
-                    label="Niches (reactions niche is experimental / off by default)",
+                    label="Niches (reactions + funny off by default; anime / animation / gameplay)",
                 )
                 custom_kw = gr.Textbox(
                     label="Custom keywords (for 'custom' niche, comma-separated)",

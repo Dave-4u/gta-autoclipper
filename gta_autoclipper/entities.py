@@ -470,16 +470,33 @@ def event_summary(es: EntitySet, title: str = "", transcript: str = "", reason: 
         return "streamer reaction"
 
     if action:
+        # Prefer full "X vs Y" from title for fights
+        mvs = re.search(r"(?i)\b([A-Za-z][A-Za-z ]{1,20}?)\s+vs\.?\s+([A-Za-z][A-Za-z ]{1,20})", title or "")
+        if mvs and action in ("fight", "battle", "vs", "moment"):
+            return f"{mvs.group(1).strip().title()} vs {mvs.group(2).strip().title()}"
         if es.characters and action in ("fight", "battle", "vs", "moment"):
             blob = (title or "").lower()
             named = [c for c in es.characters if c.lower() in blob]
             who = named[0] if named else None
-            # Prefer "X vs Y" from title
-            mvs = re.search(r"(?i)\b([A-Za-z][A-Za-z ]{1,20}?)\s+vs\.?\s+([A-Za-z][A-Za-z ]{1,20})", title or "")
-            if mvs:
-                return f"{mvs.group(1).strip().title()} vs {mvs.group(2).strip().title()}"
             if who:
                 return f"{who.title()} {action}"
+        # For trailer/teaser/gameplay: use cleaned title, not "Grand trailer"
+        if action in ("trailer", "teaser", "gameplay", "clutch", "fail"):
+            try:
+                from .write_llm import _clean_title_header
+                cleaned = _clean_title_header(title or "")
+            except Exception:
+                cleaned = ""
+            if cleaned and len(cleaned.split()) >= 2:
+                return cleaned
+            if es.franchises:
+                return f"{es.franchises[0].replace('_', ' ')} {action}"
+            if proper and proper[0].lower() != action.lower():
+                # Avoid single-token + trailer ("Turning trailer", "Grand trailer")
+                if len(proper) >= 2:
+                    return " ".join(proper[:3])
+                return f"{proper[0]} {action}"
+            return action
         if proper:
             # Avoid "Fight fight" when proper noun == action word
             if proper[0].lower() != action.lower():
