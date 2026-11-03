@@ -106,4 +106,4 @@ ranking:
   keywords: 3
   results_per_keyword: 5
   use_trending: false
-  search_timeout_seconds: 45
+  search_timeout_seconds: 30
