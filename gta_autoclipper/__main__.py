@@ -52,11 +52,18 @@ def run_once(cfg: dict, *, max_videos: int = 2, skip_whisper: bool | None = None
                 history.mark(cand.id, {"status": "no_highlights", "title": cand.title})
                 continue
 
+            clips_this = 0
             for i, seg in enumerate(segments):
                 print(f"[run] rendering clip {i+1}/{len(segments)} "
                       f"{seg.start:.1f}-{seg.end:.1f}s ({seg.reason})")
                 out = render_clip(
-                    path, seg, cfg, title=cand.title, index=i, video_id=cand.id
+                    path,
+                    seg,
+                    cfg,
+                    title=cand.title,
+                    index=i,
+                    video_id=cand.id,
+                    source_meta=dict(cand.extra or {}),
                 )
                 if not out:
                     continue
@@ -70,13 +77,14 @@ def run_once(cfg: dict, *, max_videos: int = 2, skip_whisper: bool | None = None
                 h = streams[0].get("height")
                 print(f"[run]   {w}x{h} duration≈{fmt.get('duration')} size={fmt.get('size')}")
                 produced.append(out)
+                clips_this += 1
 
             history.mark(
                 cand.id,
                 {
                     "status": "ok",
                     "title": cand.title,
-                    "clips": len(produced),
+                    "clips": clips_this,
                     "url": cand.url,
                 },
             )
@@ -144,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.ranking:
-        from .ranking import build_ranking_video, suggest_topic
+        from .ranking import build_ranking_video
         niches = args.niche or ["gta6"]
         niche = niches[0]
         out = build_ranking_video(
@@ -154,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
             config_path=args.config,
         )
         print(out or "[ranking] failed")
-        return
+        return 0
     if args.auto:
         from .autopilot import run_autopilot
 
