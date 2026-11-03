@@ -297,9 +297,9 @@ def _transcribe_wav(
         compression_ratio_threshold=2.2,
         log_prob_threshold=-0.65,
         condition_on_previous_text=False,
-        beam_size=5,
-        best_of=5,
-        temperature=[0.0, 0.2],
+        beam_size=1,
+        best_of=1,
+        temperature=0.0,
         initial_prompt=prompt,
     )
     words: list[dict[str, Any]] = []
@@ -389,9 +389,11 @@ def get_word_timestamps(
             ("vocals+model", model_name, True),
             ("plain+model", model_name, False),
         ]
-    if model_name in {"tiny", "base"}:
+    # CPU default: do NOT escalate tiny→small (that alone can take many minutes).
+    allow_escalate = str(__import__("os").environ.get("WHISPER_ESCALATE", "")).lower() in {"1", "true", "yes"}
+    if allow_escalate and model_name in {"tiny", "base"}:
         attempts.append(("plain+small", "small", False))
-    elif model_name == "small":
+    elif allow_escalate and model_name == "small":
         attempts.append(("plain+base", "base", False))  # never tiny
 
 
@@ -442,12 +444,14 @@ def transcribe_full_for_keywords(
     path: Path,
     boost_words: list[str],
     *,
-    model_name: str = "base",
+    model_name: str = "tiny",
     niche_id: str | None = None,
+    max_seconds: float = 90.0,
 ) -> list[tuple[float, float, str]]:
     wav = None
     try:
-        wav = extract_vocals_wav(path)
+        # Only the first max_seconds — full-source whisper on CPU is what hung the UI for hours
+        wav = extract_vocals_wav(path, start=0.0, end=float(max_seconds or 90.0))
         words = _transcribe_wav(wav, model_name, niche_id=niche_id)
         boost_lower = [w.lower() for w in boost_words]
         hits: list[tuple[float, float, str]] = []

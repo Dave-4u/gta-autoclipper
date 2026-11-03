@@ -39,6 +39,20 @@ def _cookie_args(cfg: dict[str, Any]) -> list[str]:
     return args
 
 
+
+def _cleanup_partials(out_dir: Path, video_id: str) -> None:
+    """Remove leftover yt-dlp .part / frag files after timeout or failure."""
+    if not video_id:
+        return
+    for pth in out_dir.glob(f"{video_id}*"):
+        name = pth.name.lower()
+        if name.endswith(".part") or ".f" in name and name.endswith(".part") or name.endswith(".ytdl"):
+            try:
+                pth.unlink(missing_ok=True)
+                print(f"[download] cleaned partial {pth.name}")
+            except OSError:
+                pass
+
 def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
     out_dir = Path(cfg["download"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -82,10 +96,12 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
         *_cookie_args(cfg),
         candidate.url,
     ]
+    print(f"[download] fetching {candidate.id} (timeout {timeout}s)…")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
         print(f"[download] timed out after {timeout}s for {candidate.url}")
+        _cleanup_partials(out_dir, candidate.id)
         return None
 
     err_blob = (proc.stderr or "") + "\n" + (proc.stdout or "")
@@ -102,6 +118,7 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
         except subprocess.TimeoutExpired:
             print(f"[download] timed out after {timeout}s for {candidate.url}")
+            _cleanup_partials(out_dir, candidate.id)
             return None
         err_blob = (proc.stderr or "") + "\n" + (proc.stdout or "")
         if proc.returncode != 0 and _is_bot_wall(err_blob):

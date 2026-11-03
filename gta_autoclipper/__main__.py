@@ -94,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         description="AutoClipper — free multi-niche Shorts/TikTok clipper"
     )
     parser.add_argument("--config", default=None, help="Path to config.yaml")
-    parser.add_argument("--ui", action="store_true", help="Launch Gradio web UI")
+    parser.add_argument("--ui", action="store_true", help="Launch Cutroom web UI (FastAPI)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--no-browser", action="store_true")

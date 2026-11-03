@@ -15,7 +15,7 @@ No paid APIs. Optional local [Ollama](https://ollama.com) for smarter headers. V
 5. **Intro VO** — Piper **speaks the header** over the first ~1–2s with a larger→smaller header animation, then the clip continues. Optional commentary VO + ducking + captions still work.
 6. **Whisper quality gates** — drops segments with low `avg_logprob`, high `no_speech_prob` / compression ratio, music-only loops, repeats, or off-niche text. Music-only clips get **no fake captions**.
 7. **Reaction peaks** — laughter/scream audio spikes + YuNet/OpenCV face-cam motion; centers the window on the peak with a short lead-in.
-6. **Autopilot** — CLI `--auto` and Gradio **Autopilot** tab: loop niches, render N clips each into `outputs/<niche>/` with metadata `.txt`. Optional schedule interval.
+6. **Autopilot** — CLI `--auto` and Cutroom **Autopilot** mode: loop niches, render N clips each into `outputs/<niche>/` with metadata `.txt`. Optional schedule interval.
 7. **Copyright-safer defaults** — ~18s source, slight zoom, 1.05× speed, commentary text layer.
 
 ---
@@ -54,7 +54,7 @@ Linux:
 
 ## Web UI
 
-`ui.bat` / `./ui.sh` / `run.bat --ui` opens **http://127.0.0.1:7860**.
+`ui.bat` / `./ui.sh` / `run.bat --ui` opens the Cutroom desk at **http://127.0.0.1:7860** (FastAPI + custom dark UI; Gradio removed).
 
 - **Manual** tab — paste URLs or auto-discover, toggles for commentary VO / captions / copyright-safe / fast / join-all.
 - **Autopilot** tab — multi-select niches, clips count, optional repeat interval, **Start / Stop**, live log + gallery.
@@ -149,7 +149,7 @@ gta-autoclipper/
     hooks.py       # header pool + scoring
     voiceover.py   # intro + commentary TTS
     autopilot.py   # hands-free loop
-    ui.py          # Gradio Manual + Autopilot
+    ui.py / webapp.py  # Cutroom FastAPI desk (Manual / Ranking / Autopilot)
   downloads/
   outputs/<niche>/
   models/piper/

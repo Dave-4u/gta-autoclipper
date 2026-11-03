@@ -1,5 +1,5 @@
 @echo off
-REM GTA AutoClipper — local Gradio web UI (Windows)
+REM AutoClipper — Cutroom local web desk (Windows)
 cd /d "%~dp0"
 
 where python >nul 2>&1
@@ -28,6 +28,6 @@ if not exist .venv (
 echo [ui] ensuring dependencies...
 python -m pip install -r requirements.txt -q
 
-echo [ui] opening http://127.0.0.1:7860 in your browser...
+echo [ui] opening Cutroom at http://127.0.0.1:7860 ...
 python -m gta_autoclipper --ui --host 127.0.0.1 --port 7860
 pause

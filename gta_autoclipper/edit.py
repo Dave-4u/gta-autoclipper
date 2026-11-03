@@ -548,26 +548,31 @@ def render_clip(
         if isinstance(gl.get("game_bbox"), (list, tuple)) and len(gl["game_bbox"]) == 4:
             gbox = tuple(float(x) for x in gl["game_bbox"])
         niche_for_gate = str(cfg.get("niche_id") or (cfg.get("niche") or {}).get("id") or "gta6")
+        niche_meta = cfg.get("niche") or {}
+        layout = str(cfg.get("layout") or niche_meta.get("layout") or "").lower()
+        fill_crop = layout in {"fill_crop", "fill", "full_frame"} or niche_for_gate in {"anime", "animation", "gta6", "gaming"}
         pre = bool((source_meta or {}).get("preconfirmed"))
+        # fill-crop anime/animation/gameplay often has little/no streamer speech — don't demand it
         gate = window_ok(
             source, segment.start, segment.end, game_box=gbox,
             niche_id=niche_for_gate,
-            min_speech_coverage=0.50, require_speech=not pre,
+            min_speech_coverage=0.50 if not fill_crop else 0.0,
+            require_speech=(not pre) and (not fill_crop),
         )
         if not gate.get("ok"):
             reasons = gate.get("reasons") or []
             # NEVER soft-pass a static logo / flat grey trailer panel
-            hard = any(
-                ("static_logo" in str(r)) or ("flat_panel" in str(r)) or ("low_trailer_motion" in str(r))
-                or ("player_ui" in str(r))
-                for r in reasons
-            )
+            hard_keys = ("static_logo", "flat_panel", "low_trailer_motion")
+            # player_ui is only a hard reject for reaction/face-cam niches
+            if not fill_crop:
+                hard_keys = hard_keys + ("player_ui",)
+            hard = any(any(k in str(r) for k in hard_keys) for r in reasons)
             if hard:
                 print(f"[edit] window rejected (trailer content): {reasons}")
                 return None
-            # Soft: preconfirmed upstream pick, or speech+motion close enough
-            if pre or (gate.get("speech_coverage", 0) >= 0.25 and gate.get("motion", 0) >= 6):
-                print(f"[edit] window soft-pass: {reasons} pre={pre}")
+            # Soft: preconfirmed upstream pick, fill-crop motion OK, or speech+motion close enough
+            if pre or fill_crop or (gate.get("speech_coverage", 0) >= 0.25 and gate.get("motion", 0) >= 6):
+                print(f"[edit] window soft-pass: {reasons} pre={pre} fill_crop={fill_crop}")
             else:
                 print(f"[edit] window rejected: {reasons}")
                 return None

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GTA AutoClipper — local Gradio web UI
+# GTA AutoClipper — local Cutroom web UI
 set -euo pipefail
 cd "$(dirname "$0")"
 

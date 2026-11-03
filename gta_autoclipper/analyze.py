@@ -449,6 +449,41 @@ def face_reaction_spike_scores(face: np.ndarray) -> np.ndarray:
 
 
 
+def _analysis_window_clip(path: Path, max_seconds: float) -> tuple[Path, float, Path | None]:
+    """Trim a short proxy for CPU analysis. Returns (path, dur, cleanup_or_None)."""
+    duration = _video_duration(path)
+    max_seconds = float(max_seconds or 0)
+    if max_seconds <= 0 or duration <= max_seconds + 0.5:
+        return path, duration, None
+    tmp = Path(tempfile.mktemp(suffix=".mp4"))
+    cmd = [
+        "ffmpeg", "-y", "-ss", "0", "-i", str(path),
+        "-t", f"{max_seconds:.2f}",
+        "-c", "copy", "-avoid_negative_ts", "make_zero",
+        str(tmp),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0 or not tmp.is_file() or tmp.stat().st_size < 10_000:
+        # Re-encode fallback (copy can fail on odd codecs)
+        cmd2 = [
+            "ffmpeg", "-y", "-ss", "0", "-i", str(path),
+            "-t", f"{max_seconds:.2f}",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-c:a", "aac", "-ac", "2", "-movflags", "+faststart",
+            str(tmp),
+        ]
+        subprocess.run(cmd2, capture_output=True, check=False)
+    if not tmp.is_file() or tmp.stat().st_size < 10_000:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"[analyze] window trim failed — analyzing full {duration:.0f}s (slow)")
+        return path, duration, None
+    print(f"[analyze] CPU window: first {max_seconds:.0f}s of {duration:.0f}s source")
+    return tmp, min(duration, max_seconds), tmp
+
+
 def find_highlights(
     path: Path, cfg: dict[str, Any]
 ) -> list[Segment]:
@@ -477,28 +512,39 @@ def find_highlights(
     # GTA clips often have a streamer PiP — require visible face reaction spikes too
     need_face_reaction = reaction_mode or niche_id in {"gta6", "reactions"}
 
-    duration = _video_duration(path)
-    if duration < min_d:
-        if duration >= 5:
-            return [Segment(0, duration, 1.0, "full_short")]
+    full_duration = _video_duration(path)
+    if full_duration < min_d:
+        if full_duration >= 5:
+            return [Segment(0, full_duration, 1.0, "full_short")]
         return []
 
-    print("[analyze] loudness…")
-    loud = extract_loudness_peaks(path, window=1.0)
-    print("[analyze] scenes…")
-    scenes = extract_scene_changes(path, threshold=float(ana.get("scene_threshold", 27)))
-    print("[analyze] motion…")
-    motion = extract_motion_scores(path)
+    # fill_crop niches (anime/animation/gameplay) do not need face-cam scoring
+    niche_meta = cfg.get("niche") or {}
+    layout = str(cfg.get("layout") or niche_meta.get("layout") or "").lower()
+    if (layout in {"fill_crop", "fill", "full_frame"} or niche_id in {"anime", "animation", "gta6", "gaming"}) and not reaction_mode:
+        need_face_reaction = False
+
+    max_analyze = float(ana.get("max_analyze_seconds", 90))
+    analyze_path, duration, _cleanup = _analysis_window_clip(path, max_analyze)
+    t0 = __import__("time").time()
+    print(f"[analyze] loudness… (window {duration:.0f}s)")
+    loud = extract_loudness_peaks(analyze_path, window=1.0)
+    print(f"[analyze] scenes… ({__import__('time').time()-t0:.1f}s elapsed)")
+    scenes = extract_scene_changes(analyze_path, threshold=float(ana.get("scene_threshold", 27)))
+    print(f"[analyze] motion… ({__import__('time').time()-t0:.1f}s elapsed)")
+    motion = extract_motion_scores(analyze_path)
 
     spikes = laugh = scream = face = face_spike = None
     if reaction_mode or need_face_reaction or ana.get("always_reaction_signals", False):
         print("[analyze] laughter/scream spikes…")
-        spikes, laugh, scream = extract_laughter_scream_scores(path)
+        spikes, laugh, scream = extract_laughter_scream_scores(analyze_path)
         print("[analyze] face motion…")
-        face = extract_face_motion_scores(path)
+        face = extract_face_motion_scores(analyze_path)
         face_spike = face_reaction_spike_scores(face) if face is not None else None
+    else:
+        print("[analyze] skip face/laugh signals (fill-crop / non-reaction)")
     print("[analyze] blackdetect…")
-    blacks = detect_black_ranges(path)
+    blacks = detect_black_ranges(analyze_path)
     if blacks:
         print(f"[analyze] black ranges: {len(blacks)}")
 
@@ -572,14 +618,16 @@ def find_highlights(
         print(f"[analyze] comment timestamps: {len(comment_times)}")
 
     transcript_hits: list[tuple[float, float, str]] = []
-    if ana.get("use_whisper", True):
-        print("[analyze] transcript (faster-whisper)…")
+    if ana.get("use_whisper", True) and ana.get("whisper_for_highlights", False):
+        print("[analyze] transcript (faster-whisper, windowed)…")
         transcript_hits = transcribe_keywords(
-            path,
+            analyze_path,
             ana.get("transcript_boost_words") or [],
-            model_name=str(ana.get("whisper_model", "base")),
+            model_name=str(ana.get("whisper_model", "tiny")),
             niche_id=niche_id or None,
         )
+    elif ana.get("use_whisper", True):
+        print("[analyze] skip full-source whisper for highlights (captions still run per-clip)")
         kw_arr = np.zeros(n, dtype=np.float32)
         for s, e, _txt in transcript_hits:
             for j in range(max(0, int(s)), min(n, int(e) + 1)):
@@ -731,6 +779,12 @@ def find_highlights(
         start = max(0, (duration - target) / 2)
         candidates = [Segment(start, min(duration, start + target), 0.5, "fallback_mid")]
 
+    print(f"[analyze] done in {__import__('time').time()-t0:.1f}s → {len(candidates)} clip window(s)")
+    if _cleanup is not None:
+        try:
+            _cleanup.unlink(missing_ok=True)
+        except OSError:
+            pass
     return candidates
 
 

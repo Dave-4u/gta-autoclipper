@@ -3,7 +3,7 @@ search:
   keywords: []
   results_per_keyword: 8
   keywords_per_run: 5
-  max_source_duration: 900
+  max_source_duration: 240
   min_source_duration: 15
   sort_by: recent_views
   max_age_days: 45
@@ -15,7 +15,7 @@ download:
   cookies_from_browser: ''
   # Or a Netscape cookies.txt exported from your browser:
   cookies: ''
-  timeout_seconds: 180
+  timeout_seconds: 120
   format: bv*[height<=1080][vcodec!~='av01'][vcodec!~='av1']+ba/b[height<=1080]/b
 history:
   file: history.json
@@ -51,6 +51,8 @@ analysis:
   - oh my god
   use_whisper: true
   whisper_model: tiny
+  max_analyze_seconds: 90
+  whisper_for_highlights: false
   scene_threshold: 27.0
   vocal_prefilter: true
 scheduler:

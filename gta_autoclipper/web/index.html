@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CUTROOM — AutoClip Desk</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/cutroom.css" />
+</head>
+<body>
+  <div class="crt">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">CR</span>
+        <div>
+          <div class="brand-title">CUTROOM</div>
+          <div class="brand-sub">LOCAL SHORTS DESK · 127.0.0.1</div>
+        </div>
+      </div>
+      <div class="tally">
+        <span class="tally-lamp" id="tallyLamp"></span>
+        <span id="tallyText">STANDBY</span>
+        <span class="tally-clock" id="jobClock">00:00</span>
+      </div>
+      <div class="top-meta" id="topMeta">outputs —</div>
+    </header>
+
+    <main class="desk">
+      <section class="panel rack">
+        <h2 class="panel-h">PROGRAM</h2>
+        <label class="field">
+          <span>NICHE</span>
+          <select id="niche"></select>
+        </label>
+        <label class="field">
+          <span>MODE</span>
+          <div class="seg" id="modeSeg">
+            <button type="button" data-mode="single" class="on">SINGLE CLIP</button>
+            <button type="button" data-mode="ranking">TOP 5 RANK</button>
+            <button type="button" data-mode="autopilot">AUTOPILOT</button>
+          </div>
+        </label>
+        <label class="field" id="topicField" hidden>
+          <span>RANK TOPIC</span>
+          <input id="topic" type="text" placeholder="Top 5 hardest anime fights" />
+        </label>
+        <div class="grid2">
+          <label class="field">
+            <span>SOURCES</span>
+            <input id="maxVideos" type="number" min="1" max="3" value="1" />
+          </label>
+          <label class="field">
+            <span>CLIPS</span>
+            <input id="maxClips" type="number" min="1" max="5" value="2" />
+          </label>
+        </div>
+        <label class="check"><input id="voiceover" type="checkbox" checked /> Intro + commentary VO</label>
+        <label class="check"><input id="captions" type="checkbox" checked /> Burn captions</label>
+        <label class="check"><input id="fast" type="checkbox" checked /> Fast CPU profile (timeouts + 90s analyze)</label>
+
+        <div class="actions">
+          <button id="btnStart" class="btn go" type="button">ARM &amp; RUN</button>
+          <button id="btnStop" class="btn stop" type="button" disabled>ABORT</button>
+        </div>
+        <p class="hint">Jobs fail fast with stage logs. Finished MP4s land in <code>outputs/&lt;niche&gt;/</code>.</p>
+      </section>
+
+      <section class="panel stage">
+        <div class="stage-head">
+          <h2 class="panel-h">PIPELINE</h2>
+          <div id="stageStrip" class="stage-strip"></div>
+        </div>
+        <pre id="log" class="log" aria-live="polite">Waiting for program…</pre>
+      </section>
+
+      <section class="panel bin">
+        <div class="bin-head">
+          <h2 class="panel-h">OUTPUT BIN</h2>
+          <button id="btnRefresh" class="btn ghost" type="button">RESCAN</button>
+        </div>
+        <div id="gallery" class="gallery"></div>
+        <video id="preview" class="preview" controls playsinline></video>
+      </section>
+    </main>
+  </div>
+  <script src="/static/cutroom.js"></script>
+</body>
+</html>
