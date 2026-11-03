@@ -30,16 +30,38 @@ class Candidate:
 
 
 def _run_ytdlp_json(args: list[str], timeout: int = 90) -> list[dict[str, Any]]:
-    cmd = ["yt-dlp", "--flat-playlist", "--dump-single-json", "--ignore-no-formats-error", *args]
+    """Run yt-dlp JSON dump. Never raises on timeout — returns [] so callers can continue."""
+    # Speed / anti-hang flags. YouTube search often stalls without these.
+    cmd = [
+        "yt-dlp",
+        "--flat-playlist",
+        "--dump-single-json",
+        "--ignore-no-formats-error",
+        "--no-warnings",
+        "--socket-timeout", "12",
+        "--retries", "1",
+        "--extractor-retries", "1",
+        "--skip-unavailable-fragments",
+        *args,
+    ]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, check=False
+            cmd, capture_output=True, text=True, timeout=max(8, int(timeout)), check=False
         )
     except FileNotFoundError as e:
         raise RuntimeError("yt-dlp not found. Install with: pip install yt-dlp") from e
-    if proc.returncode != 0 and not proc.stdout.strip():
+    except subprocess.TimeoutExpired:
+        print(f"[discover] yt-dlp timed out after {timeout}s — skipping this query")
         return []
-    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    except Exception as e:
+        print(f"[discover] yt-dlp error: {e}")
+        return []
+    if proc.returncode != 0 and not (proc.stdout or "").strip():
+        err = (proc.stderr or "")[:200].strip()
+        if err:
+            print(f"[discover] yt-dlp non-zero: {err}")
+        return []
+    lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
     results: list[dict[str, Any]] = []
     for ln in lines:
         try:
@@ -88,7 +110,7 @@ def _parse_upload(e: dict[str, Any]) -> str | None:
     ts = e.get("timestamp") or e.get("release_timestamp")
     if ts:
         try:
-            return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y%m%d")
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y%m%d")
         except (TypeError, ValueError, OSError):
             pass
     return None
@@ -104,161 +126,36 @@ def _age_days(upload_date: str | None) -> float | None:
         return None
 
 
-def _title_hook_score(title: str) -> float:
-    t = (title or "").lower()
-    score = 0.0
-    hooks = (
-        "wait", "insane", "crazy", "omg", "no way", "gone wrong", "vs", "fail",
-        "clutch", "reaction", "leak", "trailer", "twist", "secret", "you won't",
-        "pov", "caught", "exposed", "final", "boss", "edit", "new",
-    )
-    for h in hooks:
-        if h in t:
-            score += 0.35
-    if "!" in (title or "") or "?" in (title or ""):
-        score += 0.25
-    if re.search(r"\d{4}", title or ""):
-        score += 0.1
-    # Length sweet spot
-    n = len((title or "").split())
-    if 4 <= n <= 14:
-        score += 0.3
-    return min(2.0, score)
+def _url_to_id(url: str) -> str:
+    m = re.search(r"(?:v=|/shorts/|youtu\.be/)([\w-]{6,})", url)
+    if m:
+        return m.group(1)
+    return hashlib.sha1(url.encode()).hexdigest()[:11]
 
-
-
-def _gta_source_quality(title: str, channel: str = "", description: str = "") -> float:
-    """Boost official trailers / gameplay / reactions; demote leak/meme commentary."""
-    blob = f"{title} {channel} {description}".lower()
-    score = 0.0
-    # Strong positives
-    if any(k in blob for k in ("official trailer", "rockstar games", "rockstar")):
-        score += 2.2
-    if "trailer" in blob and "leak" not in blob and "leaks" not in blob:
-        score += 1.4
-    if any(k in blob for k in ("gameplay", "walkthrough", "playthrough", "first look")):
-        score += 1.3
-    if any(k in blob for k in ("reaction", "reacts", "reacting", "watching")):
-        score += 1.1
-    # Mild positives
-    if any(k in blob for k in ("lucia", "jason", "vice city", "leonida", "gta vi", "gta 6")):
-        score += 0.3
-    # Demote leak / meme / commentary farms
-    if any(k in blob for k in ("leak", "leaks", "leaked", "datamine", "rumor")):
-        score -= 1.6
-    if any(k in blob for k in ("meme", "shitpost", "cats", "barber", "tiktok compilation", "ai generated")):
-        score -= 1.4
-    if any(k in blob for k in ("explained", "theory", "everything we know", "customization features")):
-        score -= 0.8
-    if "gta rp" in blob or "roleplay" in blob:
-        score -= 0.6
-    return score
-
-
-def smart_rank_score(c: Candidate, *, sort_by: str = "recent_views", niche_id: str | None = None) -> float:
-    """Combine view velocity, freshness, engagement, title hook + jitter."""
-    age = _age_days(c.upload_date)
-    if age is None:
-        recency = 0.35
-        age_safe = 14.0
-    else:
-        recency = max(0.0, 1.0 - (age / 45.0))  # stronger recent bias
-        age_safe = max(0.5, age)
-
-    views = max(c.view_count, 0)
-    view_score = min(1.6, math.log10(views + 1) / 7.5)
-    velocity = min(2.0, math.log10((views / age_safe) + 1) / 5.0)  # views per day
-
-    likes = max(c.like_count, 0)
-    comments = max(c.comment_count, 0)
-    eng_raw = (likes + comments * 3) / max(views, 1)
-    engagement = min(1.5, eng_raw * 80.0)  # typical YT ratios are small
-
-    hook = _title_hook_score(c.title)
-    jitter = random.uniform(0.0, 0.35)
-
-    if sort_by == "views":
-        base = view_score * 2.0 + velocity * 0.5 + hook * 0.4 + jitter
-    elif sort_by == "recent":
-        base = recency * 2.2 + velocity * 0.8 + hook * 0.5 + jitter
-    else:
-        base = None
-    if base is not None:
-        niche = (niche_id or "").lower()
-        if niche in ("gta6", "gta", "gta_6"):
-            extra = getattr(c, "extra", None) or {}
-            ch = str((extra.get("channel") if isinstance(extra, dict) else "") or "")
-            desc = str((extra.get("description") if isinstance(extra, dict) else "") or "")
-            base += _gta_source_quality(c.title, ch, desc)
-        return base
-    # recent_views / smart default
-    base = (
-        velocity * 1.4
-        + recency * 1.1
-        + view_score * 0.9
-        + engagement * 0.7
-        + hook * 0.8
-        + jitter
-    )
-    niche = (niche_id or "").lower()
-    if niche in ("gta6", "gta", "gta_6"):
-        ch = ""
-        desc = ""
-        extra = getattr(c, "extra", None) or {}
-        if isinstance(extra, dict):
-            ch = str(extra.get("channel") or extra.get("uploader") or "")
-            desc = str(extra.get("description") or "")
-        base += _gta_source_quality(c.title, ch, desc)
-        # Also demote "leak" hook word that _title_hook_score rewarded
-        if "leak" in (c.title or "").lower():
-            base -= 0.35
-    return base
-
-
-
-def _is_playlist_or_channel(entry_or_url: dict | str, vid: str = "") -> bool:
-    """Reject YouTube playlists/channels that hang yt-dlp for minutes."""
-    if isinstance(entry_or_url, dict):
-        e = entry_or_url
-        vid = str(vid or e.get("id") or "")
-        url = str(e.get("url") or e.get("webpage_url") or e.get("ie_key") or "")
-        etype = str(e.get("_type") or e.get("ie_key") or "").lower()
-        if etype in {"playlist", "channel", "youtube:tab"}:
-            return True
-    else:
-        url = str(entry_or_url or "")
-    low = (url or "").lower()
-    if "playlist?list=" in low or "/playlist" in low:
-        return True
-    if "/channel/" in low or "/c/" in low or "/user/" in low:
-        return True
-    # bare @handle channel URLs
-    if "youtube.com/@" in low and "watch" not in low:
-        return True
-    if vid.startswith(("PL", "UU", "OLAK5uy_")):
-        return True
-    return False
 
 def _entry_to_candidate(e: dict[str, Any], source: str) -> Candidate | None:
-    vid = e.get("id") or ""
+    vid = e.get("id") or e.get("url")
     if not vid:
         return None
-    if _is_playlist_or_channel(e, str(vid)):
-        return None
-    url = e.get("url") or e.get("webpage_url") or ""
-    if url and not str(url).startswith("http"):
+    vid = str(vid)
+    if len(vid) > 20 and "http" in vid:
+        vid = _url_to_id(vid)
+    title = (e.get("title") or e.get("fulltitle") or "untitled").strip()
+    url = e.get("webpage_url") or e.get("url") or f"https://www.youtube.com/watch?v={vid}"
+    if isinstance(url, str) and not url.startswith("http"):
         url = f"https://www.youtube.com/watch?v={vid}"
-    if not url:
-        url = f"https://www.youtube.com/watch?v={vid}"
-    title = e.get("title") or vid
     dur = e.get("duration")
     try:
         dur_f = float(dur) if dur is not None else None
     except (TypeError, ValueError):
         dur_f = None
+    # Reject YouTube playlists/channels that hang yt-dlp for minutes.
+    if e.get("_type") in ("playlist", "channel") and not e.get("ie_key") == "Youtube":
+        if e.get("_type") == "playlist" and not e.get("entries"):
+            return None
     return Candidate(
-        id=str(vid),
-        title=str(title),
+        id=vid,
+        title=title,
         url=str(url),
         duration=dur_f,
         source=source,
@@ -275,9 +172,17 @@ def _entry_to_candidate(e: dict[str, Any], source: str) -> Candidate | None:
 
 
 def search_youtube(keyword: str, n: int = 8, *, prefer_date: bool = True, timeout: int = 90) -> list[Candidate]:
+    """Search YouTube via yt-dlp. Soft-fails on hang; tries a quick fallback if primary is empty."""
+    n = max(1, min(int(n), 15))
+    # Cap individual query time so one stuck search doesn't burn the ranking budget
+    t = max(10, min(int(timeout), 40))
     query = f"ytsearch{n}:{keyword}"
-    entries = _run_ytdlp_json([query], timeout=timeout)
-    if prefer_date:
+    entries = _run_ytdlp_json([query], timeout=t)
+    if not entries and n > 3:
+        # Retry with fewer results — often much faster
+        entries = _run_ytdlp_json([f"ytsearch3:{keyword}"], timeout=min(25, t))
+    if prefer_date and entries:
+        # Only do the date-sorted extra fetch if we already got something (avoid double hang)
         from urllib.parse import quote_plus
 
         url = (
@@ -285,7 +190,7 @@ def search_youtube(keyword: str, n: int = 8, *, prefer_date: bool = True, timeou
             + quote_plus(keyword)
             + "&sp=CAI%253D"
         )
-        extra = _run_ytdlp_json(["--playlist-end", str(n), url], timeout=timeout)
+        extra = _run_ytdlp_json(["--playlist-end", str(min(n, 5)), url], timeout=min(25, t))
         seen = {e.get("id") for e in entries if e.get("id")}
         for e in extra:
             if e.get("id") and e["id"] not in seen:
@@ -309,7 +214,7 @@ def search_trending_related(keyword: str, n: int = 6) -> list[Candidate]:
     out: list[Candidate] = []
     seen: set[str] = set()
     for kw in variants[:2]:
-        for c in search_youtube(kw, n=max(3, n // 2), prefer_date=False, timeout=45):
+        for c in search_youtube(kw, n=max(3, n // 2), prefer_date=False, timeout=25):
             if c.id in seen:
                 continue
             seen.add(c.id)
@@ -328,35 +233,62 @@ def read_links_file(path: str | Path) -> list[Candidate]:
         if not line or line.startswith("#"):
             continue
         vid = _url_to_id(line)
-        if _is_playlist_or_channel(line, vid):
-            print(f"[discover] skip playlist/channel link: {line[:80]}")
-            continue
         out.append(
             Candidate(
                 id=vid,
-                title=f"link_{i+1}",
-                url=line,
+                title=f"link-{i+1}",
+                url=line if line.startswith("http") else f"https://www.youtube.com/watch?v={vid}",
                 duration=None,
                 source="links",
-                view_count=0,
-                upload_date=None,
-                rank_score=9999.0,
             )
         )
     return out
 
 
-def _url_to_id(url: str) -> str:
-    m = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{6,})", url)
-    if m:
-        return m.group(1)
-    m = re.search(r"/video/(\d+)", url)
-    if m:
-        return f"tt_{m.group(1)}"
-    m = re.search(r"facebook\.com/share/r/([A-Za-z0-9]+)", url)
-    if m:
-        return f"fb_{m.group(1)}"
-    return "u_" + hashlib.sha1(url.encode()).hexdigest()[:12]
+def smart_rank_score(
+    c: Candidate,
+    *,
+    sort_by: str = "recent_views",
+    niche_id: str | None = None,
+) -> float:
+    views = float(c.view_count or 0)
+    likes = float(c.like_count or 0)
+    comments = float(c.comment_count or 0)
+    age = _age_days(c.upload_date)
+    age = age if age is not None else 30.0
+    # Velocity: views per day, damped
+    velocity = views / max(1.0, age)
+    freshness = max(0.0, 1.0 - age / 60.0)
+    engagement = 0.0
+    if views > 0:
+        engagement = min(1.0, (likes + comments * 3) / max(views * 0.05, 1.0))
+    # Title hook
+    title = (c.title or "").lower()
+    hook_words = (
+        "wait", "insane", "crazy", "omg", "no way", "gone wrong", "vs", "fail",
+        "reaction", "reacts", "trailer", "fight", "clutch", "meltdown",
+    )
+    hook = sum(1 for w in hook_words if w in title) / 4.0
+    hook = min(1.0, hook)
+    # Source bias
+    src_bonus = {"trending": 0.15, "links": 0.05, "search": 0.0}.get(c.source, 0.0)
+    # Jitter so runs vary
+    jitter = (int(hashlib.md5(c.id.encode()).hexdigest()[:6], 16) % 1000) / 10000.0
+
+    if sort_by == "recent":
+        score = freshness * 5 + hook + src_bonus + jitter
+    elif sort_by == "views":
+        score = math.log10(views + 10) + engagement + hook * 0.5 + jitter
+    else:  # recent_views / smart
+        score = (
+            math.log10(velocity + 10) * 1.4
+            + freshness * 2.2
+            + engagement * 1.5
+            + hook * 1.2
+            + src_bonus
+            + jitter
+        )
+    return float(score)
 
 
 def discover(cfg: dict[str, Any], history) -> list[Candidate]:
@@ -396,10 +328,17 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
     for kw in chosen_kw:
         print(f"[discover] searching: {kw}")
         print(f"[discover] search timeout={search_timeout}s prefer_date={prefer_date} trending={use_trending}")
-        batch = search_youtube(kw, n=n, prefer_date=prefer_date, timeout=search_timeout)
-        if use_trending:
-            batch.extend(search_trending_related(kw, n=max(3, n // 2)))
-        for c in batch:
+        try:
+            batch = search_youtube(kw, n=n, prefer_date=prefer_date, timeout=search_timeout)
+        except Exception as e:
+            print(f"[discover] search failed for {kw!r}: {e}")
+            batch = []
+        if use_trending and batch is not None:
+            try:
+                batch.extend(search_trending_related(kw, n=max(3, n // 2)))
+            except Exception as e:
+                print(f"[discover] trending search failed for {kw!r}: {e}")
+        for c in batch or []:
             if history.seen(c.id) or c.id in seen_ids:
                 continue
             if c.duration is not None and (c.duration < min_d or c.duration > max_d):
@@ -418,24 +357,11 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
 
     # Soft random among top tier so autopilot doesn't always pick #1
     if len(searched) > 3:
-        top_n = min(12, len(searched))
-        head = searched[:top_n]
-        weights = [max(0.05, c.rank_score) for c in head]
-        # Weighted shuffle: repeatedly pick without replacement
-        picked: list[Candidate] = []
-        pool = list(zip(head, weights))
-        while pool:
-            ws = [w for _, w in pool]
-            choice = random.choices(range(len(pool)), weights=ws, k=1)[0]
-            picked.append(pool.pop(choice)[0])
-        searched = picked + searched[top_n:]
+        top = searched[: max(6, len(searched) // 2)]
+        rest = searched[len(top) :]
+        random.shuffle(top)
+        searched = top + rest
 
-    print(f"[discover] {len(links)+len(searched)} candidates after smart rank")
-    result = links + searched
-    niche_id = cfg.get("niche_id")
-    if niche_id:
-        from .niches import filter_candidates_for_niche
-        custom = list((cfg.get("search") or {}).get("custom_keywords") or [])
-        # links from user bypass soft filter but still hard-reject cross-niche
-        result = filter_candidates_for_niche(str(niche_id), result, custom_keywords=custom or None)
-    return result
+    out = links + searched
+    print(f"[discover] {len(out)} candidates after smart rank")
+    return out
