@@ -29,9 +29,32 @@ class Candidate:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-def _run_ytdlp_json(args: list[str], timeout: int = 90) -> list[dict[str, Any]]:
+def _cookie_args(cfg: dict[str, Any] | None = None) -> list[str]:
+    """Build yt-dlp cookie flags from config (file path or browser)."""
+    if not cfg:
+        return []
+    dl = cfg.get("download") or {}
+    args: list[str] = []
+    browser = str(dl.get("cookies_from_browser") or "").strip()
+    if browser:
+        args.extend(["--cookies-from-browser", browser])
+    cookies = str(dl.get("cookies") or dl.get("cookies_file") or "").strip()
+    if cookies:
+        cp = Path(cookies)
+        if cp.is_file():
+            args.extend(["--cookies", str(cp)])
+        else:
+            print(f"[discover] cookies file not found: {cookies}")
+    return args
+
+
+def _run_ytdlp_json(
+    args: list[str],
+    timeout: int = 90,
+    *,
+    cookie_args: list[str] | None = None,
+) -> list[dict[str, Any]]:
     """Run yt-dlp JSON dump. Never raises on timeout — returns [] so callers can continue."""
-    # Speed / anti-hang flags. YouTube search often stalls without these.
     cmd = [
         "yt-dlp",
         "--flat-playlist",
@@ -42,6 +65,7 @@ def _run_ytdlp_json(args: list[str], timeout: int = 90) -> list[dict[str, Any]]:
         "--retries", "1",
         "--extractor-retries", "1",
         "--skip-unavailable-fragments",
+        *(cookie_args or []),
         *args,
     ]
     try:
@@ -149,10 +173,6 @@ def _entry_to_candidate(e: dict[str, Any], source: str) -> Candidate | None:
         dur_f = float(dur) if dur is not None else None
     except (TypeError, ValueError):
         dur_f = None
-    # Reject YouTube playlists/channels that hang yt-dlp for minutes.
-    if e.get("_type") in ("playlist", "channel") and not e.get("ie_key") == "Youtube":
-        if e.get("_type") == "playlist" and not e.get("entries"):
-            return None
     return Candidate(
         id=vid,
         title=title,
@@ -171,18 +191,23 @@ def _entry_to_candidate(e: dict[str, Any], source: str) -> Candidate | None:
     )
 
 
-def search_youtube(keyword: str, n: int = 8, *, prefer_date: bool = True, timeout: int = 90) -> list[Candidate]:
+def search_youtube(
+    keyword: str,
+    n: int = 8,
+    *,
+    prefer_date: bool = True,
+    timeout: int = 90,
+    cookie_args: list[str] | None = None,
+) -> list[Candidate]:
     """Search YouTube via yt-dlp. Soft-fails on hang; tries a quick fallback if primary is empty."""
     n = max(1, min(int(n), 15))
-    # Cap individual query time so one stuck search doesn't burn the ranking budget
     t = max(10, min(int(timeout), 40))
+    ca = cookie_args or []
     query = f"ytsearch{n}:{keyword}"
-    entries = _run_ytdlp_json([query], timeout=t)
+    entries = _run_ytdlp_json([query], timeout=t, cookie_args=ca)
     if not entries and n > 3:
-        # Retry with fewer results — often much faster
-        entries = _run_ytdlp_json([f"ytsearch3:{keyword}"], timeout=min(25, t))
+        entries = _run_ytdlp_json([f"ytsearch3:{keyword}"], timeout=min(25, t), cookie_args=ca)
     if prefer_date and entries:
-        # Only do the date-sorted extra fetch if we already got something (avoid double hang)
         from urllib.parse import quote_plus
 
         url = (
@@ -190,7 +215,9 @@ def search_youtube(keyword: str, n: int = 8, *, prefer_date: bool = True, timeou
             + quote_plus(keyword)
             + "&sp=CAI%253D"
         )
-        extra = _run_ytdlp_json(["--playlist-end", str(min(n, 5)), url], timeout=min(25, t))
+        extra = _run_ytdlp_json(
+            ["--playlist-end", str(min(n, 5)), url], timeout=min(25, t), cookie_args=ca
+        )
         seen = {e.get("id") for e in entries if e.get("id")}
         for e in extra:
             if e.get("id") and e["id"] not in seen:
@@ -204,7 +231,12 @@ def search_youtube(keyword: str, n: int = 8, *, prefer_date: bool = True, timeou
     return out
 
 
-def search_trending_related(keyword: str, n: int = 6) -> list[Candidate]:
+def search_trending_related(
+    keyword: str,
+    n: int = 6,
+    *,
+    cookie_args: list[str] | None = None,
+) -> list[Candidate]:
     """Approx 'new releases / trending' via date-sorted results + this week phrasing."""
     variants = [
         f"{keyword} this week",
@@ -214,7 +246,9 @@ def search_trending_related(keyword: str, n: int = 6) -> list[Candidate]:
     out: list[Candidate] = []
     seen: set[str] = set()
     for kw in variants[:2]:
-        for c in search_youtube(kw, n=max(3, n // 2), prefer_date=False, timeout=25):
+        for c in search_youtube(
+            kw, n=max(3, n // 2), prefer_date=False, timeout=25, cookie_args=cookie_args
+        ):
             if c.id in seen:
                 continue
             seen.add(c.id)
@@ -256,13 +290,11 @@ def smart_rank_score(
     comments = float(c.comment_count or 0)
     age = _age_days(c.upload_date)
     age = age if age is not None else 30.0
-    # Velocity: views per day, damped
     velocity = views / max(1.0, age)
     freshness = max(0.0, 1.0 - age / 60.0)
     engagement = 0.0
     if views > 0:
         engagement = min(1.0, (likes + comments * 3) / max(views * 0.05, 1.0))
-    # Title hook
     title = (c.title or "").lower()
     hook_words = (
         "wait", "insane", "crazy", "omg", "no way", "gone wrong", "vs", "fail",
@@ -270,16 +302,14 @@ def smart_rank_score(
     )
     hook = sum(1 for w in hook_words if w in title) / 4.0
     hook = min(1.0, hook)
-    # Source bias
     src_bonus = {"trending": 0.15, "links": 0.05, "search": 0.0}.get(c.source, 0.0)
-    # Jitter so runs vary
     jitter = (int(hashlib.md5(c.id.encode()).hexdigest()[:6], 16) % 1000) / 10000.0
 
     if sort_by == "recent":
         score = freshness * 5 + hook + src_bonus + jitter
     elif sort_by == "views":
         score = math.log10(views + 10) + engagement + hook * 0.5 + jitter
-    else:  # recent_views / smart
+    else:
         score = (
             math.log10(velocity + 10) * 1.4
             + freshness * 2.2
@@ -298,7 +328,6 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
         "anime fight scene",
         "funny viral video",
     ])
-    # Shuffle keywords so autopilot runs vary
     random.shuffle(keywords)
     n = int(search_cfg.get("results_per_keyword", 8))
     min_d = float(search_cfg.get("min_source_duration", 15))
@@ -311,6 +340,9 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
     ))
     use_trending = bool(search_cfg.get("use_trending", True))
     search_timeout = int(search_cfg.get("search_timeout_seconds", 60) or 60)
+    cookie_args = _cookie_args(cfg)
+    if cookie_args:
+        print(f"[discover] using cookies: {' '.join(cookie_args)}")
 
     seen_ids: set[str] = set()
     candidates: list[Candidate] = []
@@ -321,7 +353,6 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
         seen_ids.add(c.id)
         candidates.append(c)
 
-    # Sample a subset of keywords each run for variety
     k_take = min(len(keywords), max(3, int(search_cfg.get("keywords_per_run", 5))))
     chosen_kw = keywords[:k_take]
 
@@ -329,13 +360,17 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
         print(f"[discover] searching: {kw}")
         print(f"[discover] search timeout={search_timeout}s prefer_date={prefer_date} trending={use_trending}")
         try:
-            batch = search_youtube(kw, n=n, prefer_date=prefer_date, timeout=search_timeout)
+            batch = search_youtube(
+                kw, n=n, prefer_date=prefer_date, timeout=search_timeout, cookie_args=cookie_args
+            )
         except Exception as e:
             print(f"[discover] search failed for {kw!r}: {e}")
             batch = []
         if use_trending and batch is not None:
             try:
-                batch.extend(search_trending_related(kw, n=max(3, n // 2)))
+                batch.extend(
+                    search_trending_related(kw, n=max(3, n // 2), cookie_args=cookie_args)
+                )
             except Exception as e:
                 print(f"[discover] trending search failed for {kw!r}: {e}")
         for c in batch or []:
@@ -355,7 +390,6 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
     searched = [c for c in candidates if c.source != "links"]
     searched.sort(key=lambda c: c.rank_score, reverse=True)
 
-    # Soft random among top tier so autopilot doesn't always pick #1
     if len(searched) > 3:
         top = searched[: max(6, len(searched) // 2)]
         rest = searched[len(top) :]
