@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import json
 import random
 import re
@@ -12,10 +15,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .analyze import Segment, find_highlights
+from .analyze import Segment, find_highlights, find_highlights_light
 from .config import ensure_dirs, load_config
 from .discover import Candidate, discover
 from .download import download_video
+from . import procutil
 from .edit import _escape_drawtext, _fit_header, render_clip
 from .entities import extract_entities, event_summary, validate_copy
 from .history import History
@@ -363,6 +367,44 @@ def _topic_search_queries(niche_id: str, topic: str) -> list[str]:
 
 
 
+def _meta_prefilter_score(cand: Candidate, *, topic: str, niche_id: str, ttype: str) -> float:
+    """Cheap score from metadata only (no download). Higher = better to probe."""
+    title = (cand.title or "").lower()
+    topic_l = (topic or "").lower()
+    views = float(cand.view_count or 0)
+    dur = float(cand.duration or 0)
+    score = 0.0
+    # Prefer mid-length clips (not 3h streams, not 5s shorts)
+    if 20 <= dur <= 240:
+        score += 3.0
+    elif 12 <= dur <= 420:
+        score += 1.5
+    elif dur > 900:
+        score -= 4.0
+    elif dur and dur < 10:
+        score -= 2.0
+    # View band useful for Top-N diversity (avoid mega-viral only)
+    if views > 0:
+        score += min(4.0, __import__("math").log10(views + 10))
+    # Title token overlap with topic
+    stop = {"the", "a", "an", "to", "of", "and", "top", "best", "5", "10", "that", "hit", "different"}
+    t_toks = {w for w in __import__("re").findall(r"[a-z0-9]+", topic_l) if w not in stop and len(w) > 2}
+    title_toks = set(__import__("re").findall(r"[a-z0-9]+", title))
+    if t_toks:
+        score += 4.0 * (len(t_toks & title_toks) / max(1, len(t_toks)))
+    # Niche-ish keywords
+    niche = (niche_id or "").lower()
+    if niche == "anime" and any(k in title for k in ("anime", "fight", "vs", "amv", "edit", "manga")):
+        score += 1.5
+    if niche == "animation" and any(k in title for k in ("cartoon", "animation", "pixar", "disney")):
+        score += 1.5
+    if ttype == "fights" and any(k in title for k in ("fight", "vs", "battle", "clash", "duel")):
+        score += 2.0
+    if any(bad in title for bad in ("full episode", "full movie", "hour", "live stream", "livestream")):
+        score -= 3.0
+    return score
+
+
 def collect_rank_items(
     niche_id: str,
     topic: str,
@@ -370,96 +412,159 @@ def collect_rank_items(
     n: int = 5,
     cfg: dict[str, Any] | None = None,
     log=None,
+    deadline: float | None = None,
+    cancel_event=None,
+    max_probe: int | None = None,
 ) -> list[RankItem]:
     def _log(msg: str) -> None:
-        print(msg)
+        print(msg, flush=True)
         if log:
             log(msg)
 
+    def _timed_out() -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return True
+        if procutil.cancelled():
+            return True
+        if deadline is not None and time.time() >= deadline:
+            return True
+        return False
+
     cfg = apply_niche_to_config(cfg or load_config(), niche_id)
     root = Path(cfg.get("_root") or ".")
+    rk = dict(cfg.get("ranking") or {})
+    # Fast discovery knobs for ranking
     cfg.setdefault("search", {})
-    cfg["search"]["keywords"] = _topic_search_queries(niche_id, topic)
-    cfg["search"]["results_per_keyword"] = max(8, int(cfg["search"].get("results_per_keyword") or 8))
+    cfg["search"]["keywords"] = _topic_search_queries(niche_id, topic)[: int(rk.get("keywords", 3) or 3)]
+    cfg["search"]["results_per_keyword"] = int(rk.get("results_per_keyword", 5) or 5)
+    cfg["search"]["keywords_per_run"] = len(cfg["search"]["keywords"])
+    cfg["search"]["use_trending"] = bool(rk.get("use_trending", False))
+    cfg["search"]["prefer_date_search"] = False
+    cfg["search"]["search_timeout_seconds"] = int(rk.get("search_timeout_seconds", 45) or 45)
+    # Cap source duration for ranking shortlist
+    cfg["search"]["max_source_duration"] = int(rk.get("max_source_duration", 360) or 360)
     ttype = detect_topic_type(topic)
-    _log(f"[ranking] topic_type={ttype}")
+    _log(f"[ranking] topic_type={ttype} fast-discover kw={cfg['search']['keywords']}")
 
     hist = History(root / "history_ranking.json")
     cfg_rank = dict(cfg)
     cfg_rank.setdefault("history", {})
     cfg_rank["history"]["file"] = str((root / "history_ranking.json").resolve())
-    cands = discover(cfg_rank, hist)
-    _log(f"[ranking] {len(cands)} candidates for topic={topic!r}")
+    cfg_rank["download"] = dict(cfg_rank.get("download") or {})
+    # Only grab the first N seconds — huge win vs full episode downloads
+    cfg_rank["download"]["max_download_seconds"] = float(rk.get("download_seconds", 90) or 90)
+    cfg_rank["download"]["timeout_seconds"] = int(rk.get("download_timeout", 90) or 90)
+    cfg_rank["analysis"] = dict(cfg_rank.get("analysis") or {})
+    cfg_rank["analysis"]["max_analyze_seconds"] = float(rk.get("analyze_seconds", 75) or 75)
+    cfg_rank["analysis"]["whisper_for_highlights"] = False
+    cfg_rank["analysis"]["use_whisper"] = False
 
-    picked: list[tuple[Candidate, Path, Segment, str]] = []
-    seen_ids: set[str] = set()
-    # Over-fetch then filter strictly
+    t_disc = time.time()
+    # Temporarily disable prefer_date double-fetch via search_youtube monkeypatch flag on cfg
+    cands = discover(cfg_rank, hist)
+    _log(f"[ranking] {len(cands)} raw candidates in {time.time()-t_disc:.1f}s for topic={topic!r}")
+
+    # Metadata prefilter BEFORE any download
+    filtered: list[Candidate] = []
     for cand in cands:
-        if len(picked) >= n:
+        if _timed_out():
             break
-        if cand.id in seen_ids:
-            continue
         channel = str((cand.extra or {}).get("channel") or "")
         desc = str((cand.extra or {}).get("description") or "")
         tags = list((cand.extra or {}).get("tags") or [])
         ok, rel, reason = niche_relevance(
-            niche_id,
-            title=cand.title,
-            description=desc,
-            channel=channel,
-            tags=tags,
+            niche_id, title=cand.title, description=desc, channel=channel, tags=tags,
         )
         if not ok:
-            _log(f"[ranking] skip off-niche ({reason}): {cand.title[:70]}")
             continue
         ok_t, why_t = topic_matches(
             ttype, title=cand.title, channel=channel, description=desc, tags=tags, has_face_cam=None
         )
         if not ok_t:
-            _log(f"[ranking] skip topic ({why_t}): {cand.title[:70]}")
             continue
         from .meta_signals import is_mashup_title
         if ttype == "reactions" and is_mashup_title(cand.title):
-            _log(f"[ranking] skip mashup/compilation: {cand.title[:70]}")
             continue
+        cand.rank_score = _meta_prefilter_score(cand, topic=topic, niche_id=niche_id, ttype=ttype)
+        filtered.append(cand)
+
+    filtered.sort(key=lambda c: c.rank_score, reverse=True)
+    probe_n = int(max_probe or rk.get("max_probe", 7) or 7)
+    shortlist = filtered[: max(probe_n, n)]
+    _log(f"[ranking] prefilter {len(filtered)} → probe top {len(shortlist)} (target n={n})")
+
+    workers = max(1, min(3, int(rk.get("workers", 3) or 3)))
+    picked_lock = __import__("threading").Lock()
+    picked: list[tuple[Candidate, Path, Segment, str]] = []
+    seen_ids: set[str] = set()
+
+    def _process_one(cand: Candidate) -> tuple[Candidate, Path, Segment, str] | None:
+        if _timed_out():
+            return None
         try:
             path = download_video(cand, cfg_rank)
-            if not path:
-                continue
-            # Post-download face-cam gate for reaction topics
+            if not path or _timed_out():
+                return None
             face = None
             if ttype == "reactions":
                 face = _has_face_cam(path)
+                channel = str((cand.extra or {}).get("channel") or "")
+                desc = str((cand.extra or {}).get("description") or "")
+                tags = list((cand.extra or {}).get("tags") or [])
                 ok_f, why_f = topic_matches(
                     ttype, title=cand.title, channel=channel, description=desc, tags=tags, has_face_cam=face
                 )
                 if not ok_f:
                     _log(f"[ranking] skip after face check ({why_f}): {cand.title[:70]}")
-                    continue
-                from .scene_vlm import is_illegible_mashup_frame, reaction_emotion
-                # Sample mid-video for mashup density
-                try:
-                    from .download import probe_duration
-                    dur = probe_duration(path) or 30.0
-                    if is_illegible_mashup_frame(path, dur * 0.4):
-                        _log(f"[ranking] skip tiny multi-face mashup: {cand.title[:70]}")
-                        continue
-                except Exception as e:
-                    _log(f"[ranking] mashup-face check err: {e}")
-            segs = find_highlights(path, cfg_rank)
+                    return None
+            if _timed_out():
+                return None
+            # Lightweight analyze only for ranking
+            segs = find_highlights_light(path, cfg_rank)
             if not segs:
-                continue
+                return None
             seg = segs[0]
+            channel = str((cand.extra or {}).get("channel") or "")
             label = smart_rank_label(
                 title=cand.title, channel=channel, topic_type=ttype, niche_id=niche_id
             )
-            picked.append((cand, path, seg, label))
-            seen_ids.add(cand.id)
-            hist.mark(cand.id, {"status": "ranking", "niche": niche_id, "topic": topic, "topic_type": ttype})
-            _log(f"[ranking] keep {cand.title[:60]} views={cand.view_count} label={label!r} face={face}")
+            return (cand, path, seg, label)
         except Exception as e:
             _log(f"[ranking] error {cand.id}: {e}")
-            continue
+            return None
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_process_one, c): c for c in shortlist}
+        for fut in as_completed(futs):
+            if _timed_out():
+                _log("[ranking] deadline/cancel — stopping more probes")
+                procutil.request_cancel()
+                break
+            with picked_lock:
+                if len(picked) >= n:
+                    break
+            try:
+                row = fut.result()
+            except Exception as e:
+                _log(f"[ranking] worker err: {e}")
+                continue
+            if not row:
+                continue
+            cand, path, seg, label = row
+            with picked_lock:
+                if cand.id in seen_ids or len(picked) >= n:
+                    continue
+                picked.append(row)
+                seen_ids.add(cand.id)
+                hist.mark(cand.id, {"status": "ranking", "niche": niche_id, "topic": topic, "topic_type": ttype})
+                _log(f"[ranking] keep {cand.title[:60]} views={cand.view_count} label={label!r}")
+                if len(picked) >= n:
+                    _log("[ranking] target n reached — cancelling leftover probes")
+                    procutil.request_cancel()
+
+    # Ensure leftover worker downloads stop
+    if len(picked) >= n or _timed_out():
+        procutil.request_cancel()
 
     if not picked:
         return []
@@ -479,6 +584,7 @@ def collect_rank_items(
                 views=int(cand.view_count or 0),
             )
         )
+    _log(f"[ranking] collected {len(items)} item(s)")
     return items
 
 
@@ -710,15 +816,31 @@ def build_ranking_video(
     config_path: str | None = None,
     with_vo: bool = True,
     log=None,
+    deadline_s: float | None = None,
+    cancel_event=None,
 ) -> Path | None:
     def _log(msg: str) -> None:
-        print(msg)
+        print(msg, flush=True)
         if log:
             log(msg)
+
+    def _timed_out() -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return True
+        if procutil.cancelled():
+            return True
+        if deadline is not None and time.time() >= deadline:
+            return True
+        return False
 
     cfg = load_config(config_path)
     ensure_dirs(cfg)
     cfg = apply_niche_to_config(cfg, niche_id)
+    rk = dict(cfg.get("ranking") or {})
+    budget = float(deadline_s if deadline_s is not None else rk.get("timeout_seconds", 1500) or 1500)
+    deadline = time.time() + budget
+    min_on_timeout = int(rk.get("min_items_on_timeout", 3) or 3)
+    _log(f"[ranking] budget={budget:.0f}s min_on_timeout={min_on_timeout}")
     # Ranking clips should be short
     cfg.setdefault("clips", {})
     cfg["clips"]["max_clips_per_video"] = 1
@@ -741,10 +863,19 @@ def build_ranking_video(
     topic = (topic or "").strip() or suggest_topic(niche_id, n, cfg)
     _log(f"[ranking] topic={topic!r} niche={niche_id} n={n}")
 
-    items = collect_rank_items(niche_id, topic, n=n, cfg=cfg, log=log)
-    if len(items) < 2:
+    items = collect_rank_items(
+        niche_id, topic, n=n, cfg=cfg, log=log,
+        deadline=deadline, cancel_event=cancel_event,
+        max_probe=int(rk.get("max_probe", 7) or 7),
+    )
+    if _timed_out() and len(items) >= min_on_timeout:
+        _log(f"[ranking] time budget hit with {len(items)} items — rendering partial Top {len(items)}")
+        n = len(items)
+    elif len(items) < 2:
         _log(f"[ranking] not enough items ({len(items)}); need >=2")
         return None
+    elif len(items) < n:
+        _log(f"[ranking] proceeding with {len(items)}/{n} items")
 
     out_root = Path(cfg["clips"]["output_dir"]) / "ranking"
     out_root.mkdir(parents=True, exist_ok=True)
@@ -752,81 +883,42 @@ def build_ranking_video(
     work = out_root / f"_work_{stamp}"
     work.mkdir(parents=True, exist_ok=True)
 
-    # Gate every item (retry alt segments); then assign contiguous ranks and render once
-    from .analyze import find_highlights
+    # Fast path: trust light-analyze segments. Skip second full find_highlights (was 1–4 min each).
     from .scene_vlm import confirm_reaction_moment
 
     survivors: list[RankItem] = []
+    topic_type = detect_topic_type(topic)
+    need_reaction = niche_id == "reactions" or topic_type == "reactions"
     for item in items:
+        if _timed_out():
+            if len(survivors) >= min_on_timeout:
+                _log(f"[ranking] budget hit during gate — keeping {len(survivors)} survivor(s)")
+                break
+            _log("[ranking] budget hit during gate with too few survivors")
+            break
         _log(f"[ranking] gate {item.candidate.title[:50]} ({_format_views(item.views)})")
-        segs = [item.segment]
-        try:
-            more = find_highlights(item.path, cfg) or []
-            more = sorted(more, key=lambda s: (
-                ("heatmap" in s.reason) * 5 + ("face_react" in s.reason) * 4 +
-                ("laugh" in s.reason) * 3 + s.score
-            ), reverse=True)
-            for s in more:
-                if abs(s.start - item.segment.start) > 1.0:
-                    segs.append(s)
-        except Exception as e:
-            _log(f"[ranking] highlight refresh failed: {e}")
-        picked = None
-        # Prefer already Gemini-confirmed segments from upstream scan
-        pre = [s for s in segs if "gemini" in (s.reason or "")]
-        ordered = pre + [s for s in segs if s not in pre]
-        topic_type = detect_topic_type(topic)
-        need_reaction = niche_id == "reactions" or topic_type == "reactions"
-        for s in ordered[:6]:
+        if need_reaction:
             try:
-                # Trust a prior gemini_* reason after a quick confirm; skip if already confirmed
-                if "gemini" in (s.reason or "") and getattr(item, "_preconfirmed", False):
-                    item.segment = s
-                    picked = s
-                    _log(f"[ranking] trust preconfirmed @{s.start:.1f}")
-                    break
-                if need_reaction:
-                    gate = confirm_reaction_moment(
-                        item.path, s.start, s.end, cfg=cfg,
-                        title=item.candidate.title, require_trailer=True,
-                    )
-                    _log(f"[ranking] gate @{s.start:.1f}: ok={gate.get('ok')} emo={gate.get('emotion')} {gate.get('reasons')}")
-                    if gate.get("ok"):
-                        item.segment = s
-                        extra = dict(item.candidate.extra or {})
-                        extra["gate_emotion"] = gate.get("emotion")
-                        extra["gate_desc"] = gate.get("desc")
-                        item.candidate.extra = extra
-                        picked = s
-                        break
-                else:
-                    # anime / animation / gameplay: motion + no player UI
-                    from .window_gate import player_ui_visible, trailer_content_ok
-                    box = (0.05, 0.05, 0.90, 0.90)
-                    ui = player_ui_visible(item.path, s.start, s.end, box, cfg=cfg, use_gemini=True)
-                    mot = trailer_content_ok(item.path, s.start, s.end, box, min_motion=6.0)
-                    ok = (not ui.get("visible")) and bool(mot.get("ok"))
-                    _log(f"[ranking] content-gate @{s.start:.1f}: ok={ok} ui={ui.get('visible')} mot={mot.get('motion',0):.1f}")
-                    if ok:
-                        item.segment = s
-                        picked = s
-                        break
+                gate = confirm_reaction_moment(
+                    item.path, item.segment.start, item.segment.end, cfg=cfg,
+                    title=item.candidate.title, require_trailer=True,
+                )
+                _log(f"[ranking] gate @{item.segment.start:.1f}: ok={gate.get('ok')} emo={gate.get('emotion')}")
+                if not gate.get("ok"):
+                    _log(f"[ranking] DROPPED {item.candidate.id} (reaction gate)")
+                    continue
             except Exception as e:
                 _log(f"[ranking] gate err: {e}")
-        if picked is None:
-            # Non-reaction niches: keep best highlight rather than drop everything
-            if not need_reaction and ordered:
-                item.segment = ordered[0]
-                picked = ordered[0]
-                _log(f"[ranking] soft-keep @{picked.start:.1f} for fill-crop niche")
-            else:
-                _log(f"[ranking] DROPPED {item.candidate.id} (no strong reaction+trailer segment)")
                 continue
+        else:
+            _log(f"[ranking] soft-keep fill-crop @{item.segment.start:.1f}s ({item.segment.reason})")
         survivors.append(item)
 
     if len(survivors) < 2:
         _log(f"[ranking] too few survivors ({len(survivors)})")
         return None
+    if _timed_out() and len(survivors) >= min_on_timeout:
+        _log(f"[ranking] rendering partial with {len(survivors)} survivors after budget")
 
     total = len(survivors)
     # Assign contiguous ranks: first survivor = #total (lowest), last = #1 (best)
@@ -849,6 +941,9 @@ def build_ranking_video(
     rendered_items: list[RankItem] = []
     rendered_paths: list[Path] = []
     for item in survivors:
+        if _timed_out() and len(rendered_items) >= min_on_timeout:
+            _log(f"[ranking] budget hit mid-render — assembling {len(rendered_items)} finished parts")
+            break
         _log(f"[ranking] render #{item.rank} {item.candidate.title[:50]} ({_format_views(item.views)})")
         seg = _render_rank_segment(item, cfg, work, with_vo=with_vo)
         if seg:

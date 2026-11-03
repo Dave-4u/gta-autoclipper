@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .discover import Candidate
+from . import procutil
 
 _BOT_MARKERS = (
     "sign in to confirm you",
@@ -54,17 +55,29 @@ def _cleanup_partials(out_dir: Path, video_id: str) -> None:
                 pass
 
 def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
+    if procutil.cancelled():
+        print("[download] cancelled")
+        return None
     out_dir = Path(cfg["download"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     fmt = cfg["download"].get("format", "bv*[height<=1080]+ba/b[height<=1080]/b")
+    # Cap download length for ranking / fast CPU (seconds from start)
+    max_s = float((cfg.get("download") or {}).get("max_download_seconds") or 0)
+    suffix = f"_r{int(max_s)}" if max_s > 0 else ""
+    stem = f"{candidate.id}{suffix}"
     # Template: id.ext
-    outtmpl = str(out_dir / f"{candidate.id}.%(ext)s")
+    outtmpl = str(out_dir / f"{stem}.%(ext)s")
 
     # Already downloaded?
     for ext in ("mp4", "mkv", "webm", "mov"):
-        existing = out_dir / f"{candidate.id}.{ext}"
+        existing = out_dir / f"{stem}.{ext}"
         if existing.is_file() and existing.stat().st_size > 10_000:
             return existing
+        # Prefer section file; fall back to full only when not capping
+        if not suffix:
+            existing = out_dir / f"{candidate.id}.{ext}"
+            if existing.is_file() and existing.stat().st_size > 10_000:
+                return existing
 
     # Skip playlist / channel URLs — they hang for minutes even with --no-playlist
     url = str(candidate.url or "")
@@ -94,13 +107,17 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
         "after_move:filepath",
         "--no-warnings",
         *_cookie_args(cfg),
-        candidate.url,
     ]
-    print(f"[download] fetching {candidate.id} (timeout {timeout}s)…")
+    if max_s > 0:
+        # Download only the first max_s seconds (yt-dlp section syntax)
+        cmd.extend(["--download-sections", f"*{0}-{max_s:.0f}", "--force-keyframes-at-cuts"])
+    cmd.append(candidate.url)
+    print(f"[download] fetching {candidate.id}{suffix} (timeout {timeout}s, max_s={max_s or 'full'})…")
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        proc = procutil.run_tracked(cmd, timeout=timeout, text=True, check=False)
     except subprocess.TimeoutExpired:
         print(f"[download] timed out after {timeout}s for {candidate.url}")
+        _cleanup_partials(out_dir, stem)
         _cleanup_partials(out_dir, candidate.id)
         return None
 
@@ -115,9 +132,10 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
     if proc.returncode != 0:
         print("[download] retrying once…")
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+            proc = procutil.run_tracked(cmd, timeout=timeout, text=True, check=False)
         except subprocess.TimeoutExpired:
             print(f"[download] timed out after {timeout}s for {candidate.url}")
+            _cleanup_partials(out_dir, stem)
             _cleanup_partials(out_dir, candidate.id)
             return None
         err_blob = (proc.stderr or "") + "\n" + (proc.stdout or "")
@@ -132,8 +150,11 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
             return pth
     # Fallback scan
     for ext in ("mp4", "mkv", "webm", "mov"):
-        pth = out_dir / f"{candidate.id}.{ext}"
+        pth = out_dir / f"{stem}.{ext}"
         if pth.is_file() and pth.stat().st_size > 10_000:
+            return pth
+        pth = out_dir / f"{candidate.id}.{ext}"
+        if not suffix and pth.is_file() and pth.stat().st_size > 10_000:
             return pth
     # Sometimes yt-dlp uses title-based names; find newest in out_dir
     videos = sorted(

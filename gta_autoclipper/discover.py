@@ -29,8 +29,8 @@ class Candidate:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-def _run_ytdlp_json(args: list[str], timeout: int = 180) -> list[dict[str, Any]]:
-    cmd = ["yt-dlp", "--flat-playlist", "--dump-single-json", *args]
+def _run_ytdlp_json(args: list[str], timeout: int = 90) -> list[dict[str, Any]]:
+    cmd = ["yt-dlp", "--flat-playlist", "--dump-single-json", "--ignore-no-formats-error", *args]
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, check=False
@@ -274,9 +274,9 @@ def _entry_to_candidate(e: dict[str, Any], source: str) -> Candidate | None:
     )
 
 
-def search_youtube(keyword: str, n: int = 8, *, prefer_date: bool = True) -> list[Candidate]:
+def search_youtube(keyword: str, n: int = 8, *, prefer_date: bool = True, timeout: int = 90) -> list[Candidate]:
     query = f"ytsearch{n}:{keyword}"
-    entries = _run_ytdlp_json([query])
+    entries = _run_ytdlp_json([query], timeout=timeout)
     if prefer_date:
         from urllib.parse import quote_plus
 
@@ -285,7 +285,7 @@ def search_youtube(keyword: str, n: int = 8, *, prefer_date: bool = True) -> lis
             + quote_plus(keyword)
             + "&sp=CAI%253D"
         )
-        extra = _run_ytdlp_json(["--playlist-end", str(n), url])
+        extra = _run_ytdlp_json(["--playlist-end", str(n), url], timeout=timeout)
         seen = {e.get("id") for e in entries if e.get("id")}
         for e in extra:
             if e.get("id") and e["id"] not in seen:
@@ -309,7 +309,7 @@ def search_trending_related(keyword: str, n: int = 6) -> list[Candidate]:
     out: list[Candidate] = []
     seen: set[str] = set()
     for kw in variants[:2]:
-        for c in search_youtube(kw, n=max(3, n // 2), prefer_date=True):
+        for c in search_youtube(kw, n=max(3, n // 2), prefer_date=False, timeout=45):
             if c.id in seen:
                 continue
             seen.add(c.id)
@@ -373,8 +373,12 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
     max_d = float(search_cfg.get("max_source_duration", 900))
     sort_by = str(search_cfg.get("sort_by", "recent_views"))
     max_age = float(search_cfg.get("max_age_days", 45) or 0)
-    prefer_date = sort_by in ("recent", "recent_views", "smart")
+    prefer_date = bool(search_cfg.get(
+        "prefer_date_search",
+        sort_by in ("recent", "recent_views", "smart"),
+    ))
     use_trending = bool(search_cfg.get("use_trending", True))
+    search_timeout = int(search_cfg.get("search_timeout_seconds", 60) or 60)
 
     seen_ids: set[str] = set()
     candidates: list[Candidate] = []
@@ -391,7 +395,8 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
 
     for kw in chosen_kw:
         print(f"[discover] searching: {kw}")
-        batch = search_youtube(kw, n=n, prefer_date=prefer_date)
+        print(f"[discover] search timeout={search_timeout}s prefer_date={prefer_date} trending={use_trending}")
+        batch = search_youtube(kw, n=n, prefer_date=prefer_date, timeout=search_timeout)
         if use_trending:
             batch.extend(search_trending_related(kw, n=max(3, n // 2)))
         for c in batch:

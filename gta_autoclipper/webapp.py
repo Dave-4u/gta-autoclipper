@@ -76,7 +76,18 @@ def _apply_fast_defaults(cfg: dict[str, Any], *, fast: bool = True) -> dict[str,
         "overall_timeout_seconds": 15 * 60 if fast else 25 * 60,
         "analyze_timeout_seconds": 180 if fast else 300,
         "render_timeout_seconds": 240,
+        "ranking_timeout_seconds": int((cfg.get("ranking") or {}).get("timeout_seconds") or (25 * 60)),
     }
+    cfg.setdefault("ranking", {})
+    cfg["ranking"].setdefault("timeout_seconds", 25 * 60)
+    cfg["ranking"].setdefault("min_items_on_timeout", 3)
+    cfg["ranking"].setdefault("max_probe", 7)
+    cfg["ranking"].setdefault("workers", 3)
+    cfg["ranking"].setdefault("download_seconds", 90)
+    cfg["ranking"].setdefault("analyze_seconds", 75)
+    cfg["ranking"].setdefault("use_trending", False)
+    cfg["ranking"].setdefault("keywords", 3)
+    cfg["ranking"].setdefault("results_per_keyword", 5)
     return cfg
 
 
@@ -255,11 +266,20 @@ def _run_ranking(req: StartRequest) -> None:
     _progress.start_job()
     _stop_flag.clear()
     try:
+        from . import procutil
+        from .procutil import run_with_timeout_cancelable
+
         cfg = _apply_fast_defaults(_cfg(), fast=req.fast)
         niche = req.niche if niche_is_enabled(req.niche) else "anime"
         topic = (req.topic or "").strip() or suggest_topic(niche, int(req.rank_n or 5), cfg)
         _progress.begin("ranking", f"{niche} — {topic}")
-        overall = float((cfg.get("job") or {}).get("overall_timeout_seconds") or 900)
+        budget = float(
+            (cfg.get("job") or {}).get("ranking_timeout_seconds")
+            or (cfg.get("ranking") or {}).get("timeout_seconds")
+            or (25 * 60)
+        )
+        cancel = threading.Event()
+        procutil.clear_cancel()
 
         def _build():
             return build_ranking_video(
@@ -268,19 +288,31 @@ def _run_ranking(req: StartRequest) -> None:
                 n=max(3, min(7, int(req.rank_n or 5))),
                 config_path=_config_path,
                 log=lambda m: _progress.log(m),
+                deadline_s=budget,
+                cancel_event=cancel,
             )
 
-        ok, out, err = True, None, ""
-        from .progress import run_with_timeout
-        ok, out, err = run_with_timeout(_build, seconds=overall, label="ranking", progress=_progress)
-        if not ok or not out:
-            _progress.end("ranking", status="fail", detail=err or "failed")
-            _progress.finish_job(ok=False, error=err or "Ranking failed")
+        def _on_timeout():
+            cancel.set()
+            _stop_flag.set()
+            procutil.request_cancel()
+
+        # Hard wall slightly above budget so internal partial-render can finish
+        ok, out, err = run_with_timeout_cancelable(
+            _build,
+            seconds=budget + 90,
+            label="ranking",
+            progress=_progress,
+            on_timeout=_on_timeout,
+        )
+        if out:
+            _progress.end("ranking", status="ok", detail=str(out) + (" (partial/timeout)" if not ok else ""))
+            with _progress._lock:
+                _progress.produced.append(str(out))
+            _progress.finish_job(ok=True)
             return
-        _progress.end("ranking", status="ok", detail=str(out))
-        with _progress._lock:
-            _progress.produced.append(str(out))
-        _progress.finish_job(ok=True)
+        _progress.end("ranking", status="fail", detail=err or "failed")
+        _progress.finish_job(ok=False, error=err or "Ranking failed")
     except Exception as e:
         _progress.log(traceback.format_exc())
         _progress.finish_job(ok=False, error=str(e))
@@ -364,6 +396,11 @@ def create_app(config_path: str | None = None) -> FastAPI:
     def stop():
         _stop_flag.set()
         request_stop()
+        try:
+            from . import procutil
+            procutil.request_cancel()
+        except Exception:
+            pass
         _progress.log("[job] stop requested")
         return {"ok": True}
 
@@ -401,8 +438,46 @@ def launch_ui(
     port: int = 7860,
     open_browser: bool = True,
 ) -> None:
+    import asyncio
+    import logging
+    import sys
     import uvicorn
     import webbrowser
+
+    # Windows Proactor floods logs with ConnectionResetError (WinError 10054)
+    # when the browser closes SSE/long-poll sockets. Prefer Selector policy + filter.
+    if sys.platform.startswith("win"):
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            print("[ui] WindowsSelectorEventLoopPolicy enabled", flush=True)
+        except Exception as e:
+            print(f"[ui] could not set Selector policy: {e}", flush=True)
+
+        def _silence_proactor_connreset(loop, context):
+            exc = context.get("exception")
+            if isinstance(exc, ConnectionResetError):
+                return
+            msg = str(context.get("message", ""))
+            if "ConnectionResetError" in msg or "10054" in msg:
+                return
+            loop.default_exception_handler(context)
+
+        try:
+            loop = asyncio.new_event_loop()
+            loop.set_exception_handler(_silence_proactor_connreset)
+            asyncio.set_event_loop(loop)
+        except Exception:
+            pass
+
+        class _Drop10054(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                msg = record.getMessage()
+                if "10054" in msg or "ConnectionResetError" in msg or "_call_connection_lost" in msg:
+                    return False
+                return True
+
+        for name in ("asyncio", "uvicorn.error", "uvicorn.access"):
+            logging.getLogger(name).addFilter(_Drop10054())
 
     app = create_app(config_path)
     url = f"http://{host}:{port}"

@@ -484,6 +484,70 @@ def _analysis_window_clip(path: Path, max_seconds: float) -> tuple[Path, float, 
     return tmp, min(duration, max_seconds), tmp
 
 
+def find_highlights_light(path: Path, cfg: dict[str, Any]) -> list[Segment]:
+    """
+    Fast ranking/CPU analyzer: loudness peaks only (no motion/face/blackdetect/whisper).
+    Typically finishes in a few seconds on a 60–90s proxy.
+    """
+    clips_cfg = cfg.get("clips", {})
+    ana = cfg.get("analysis", {})
+    min_d = float(clips_cfg.get("min_duration", 8))
+    max_d = float(clips_cfg.get("max_duration", 18))
+    target = float(clips_cfg.get("target_duration", 15))
+    max_clips = max(1, int(clips_cfg.get("max_clips_per_video", 1)))
+    full_duration = _video_duration(path)
+    if full_duration < 5:
+        return []
+    if full_duration < min_d:
+        return [Segment(0, full_duration, 1.0, "light_full")]
+
+    max_analyze = float(ana.get("max_analyze_seconds", 75) or 75)
+    max_analyze = min(max_analyze, 90.0)
+    analyze_path, duration, cleanup = _analysis_window_clip(path, max_analyze)
+    t0 = __import__("time").time()
+    try:
+        print(f"[analyze-light] loudness only (window {duration:.0f}s)")
+        loud = extract_loudness_peaks(analyze_path, window=1.0)
+        loud_n = _normalize(loud)
+        n = max(len(loud_n), int(duration) + 1)
+        # Prefer peaks away from the very start bumper
+        order = list(np.argsort(loud_n)[::-1])
+        segs: list[Segment] = []
+        used = np.zeros(n, dtype=bool)
+        half = target / 2.0
+        for idx in order:
+            if len(segs) >= max_clips:
+                break
+            if idx < 2:
+                continue
+            if used[min(idx, n - 1)]:
+                continue
+            if float(loud_n[min(idx, len(loud_n) - 1)]) < 0.15 and segs:
+                break
+            start = max(0.0, float(idx) - half)
+            end = min(duration, start + target)
+            start = max(0.0, end - target)
+            if end - start < min_d * 0.8:
+                continue
+            if end - start > max_d:
+                end = start + max_d
+            for j in range(max(0, int(start) - 2), min(n, int(end) + 2)):
+                used[j] = True
+            segs.append(Segment(round(start, 2), round(end, 2), float(loud_n[min(idx, len(loud_n)-1)]), "light_loud"))
+        if not segs:
+            start = min(3.0, max(0.0, duration - target))
+            end = min(duration, start + target)
+            segs = [Segment(round(start, 2), round(end, 2), 0.5, "light_fallback")]
+        print(f"[analyze-light] done in {__import__('time').time()-t0:.1f}s → {len(segs)} window(s)")
+        return segs
+    finally:
+        if cleanup is not None:
+            try:
+                cleanup.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def find_highlights(
     path: Path, cfg: dict[str, Any]
 ) -> list[Segment]:

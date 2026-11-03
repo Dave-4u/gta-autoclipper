@@ -94,3 +94,16 @@ voiceover:
 gemini:
   api_key: ''
   model: gemini-flash-lite-latest
+
+
+ranking:
+  timeout_seconds: 1500
+  min_items_on_timeout: 3
+  max_probe: 7
+  workers: 3
+  download_seconds: 90
+  analyze_seconds: 75
+  keywords: 3
+  results_per_keyword: 5
+  use_trending: false
+  search_timeout_seconds: 45
