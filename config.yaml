@@ -13,8 +13,8 @@ download:
   output_dir: downloads
   # Optional: bypass YouTube bot check. Example: chrome  or  edge
   cookies_from_browser: ''
-  # Or a Netscape cookies.txt exported from your browser:
-  cookies: ''
+  # Netscape cookies.txt from Firefox export (also used for search):
+  cookies: 'C:/Users/DAVE.A/Downloads/cookies.txt'
   timeout_seconds: 120
   format: bv*[height<=1080][vcodec!~='av01'][vcodec!~='av1']+ba/b[height<=1080]/b
 history:
