@@ -126,6 +126,7 @@ def run_niche_pass(
                 history.mark(cand.id, {"status": "no_highlights", "niche": niche_id})
                 continue
             need = clips_per_niche - len(produced)
+            clips_this = 0
             for i, seg in enumerate(segments[: max(1, need)]):
                 if get_state().stop_requested:
                     break
@@ -170,6 +171,7 @@ def run_niche_pass(
                 meta = probe_clip(out)
                 _log(f"[auto] wrote {out} ({(meta.get('format') or {}).get('size')})", log)
                 produced.append(out)
+                clips_this += 1
                 with _LOCK:
                     _STATE.produced.append(str(out))
             history.mark(
@@ -178,7 +180,7 @@ def run_niche_pass(
                     "status": "ok",
                     "niche": niche_id,
                     "title": cand.title,
-                    "clips": len(produced),
+                    "clips": clips_this,
                     "url": cand.url,
                 },
             )
