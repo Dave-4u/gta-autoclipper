@@ -618,7 +618,28 @@ def _render_clip_impl(
     out_dir = Path(clips["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    segment = _cap_segment(segment, cfg)
+    # Multi-moment montage (all modes): several high-energy moments stitched with transitions
+    _mont_done = False
+    try:
+        from .montage import build_moment_montage, montage_cfg
+        if montage_cfg(cfg).get("enabled", True):
+            _mt = build_moment_montage(
+                source, cfg, ranking_part=bool(clips.get("ranking_part")),
+                anchor=(segment.start, segment.end), tag=f"{video_id or 'v'}_{index}",
+            )
+            if _mt is not None:
+                from .montage import _probe as _mprobe
+                _md = _mprobe(_mt)[0]
+                if _md > 4:
+                    source = _mt
+                    segment = Segment(start=0.0, end=round(_md - 0.05, 2), score=segment.score,
+                                      reason=(segment.reason or "") + "+montage")
+                    _mont_done = True
+                    source_meta = dict(source_meta or {}, preconfirmed=True)
+    except Exception as _e:
+        print(f"[montage] skip: {_e}")
+    if not _mont_done:
+        segment = _cap_segment(segment, cfg)
     # Motion / silence gate on the source window (skip frozen trailer / dead air)
     try:
         from .window_gate import window_ok
@@ -690,7 +711,7 @@ def _render_clip_impl(
 
     niche_id = str(cfg.get("niche_id") or (cfg.get("niche") or {}).get("id") or "gta6")
     # gta6: multi-cut transformative montage (25–35s) before captions/VO
-    if niche_id == "gta6" and int(cs.get("montage_cuts") or 0) >= 2:
+    if niche_id == "gta6" and int(cs.get("montage_cuts") or 0) >= 2 and not _mont_done:
         try:
             mont = build_transformative_montage(source, cfg)
             if mont is not None:

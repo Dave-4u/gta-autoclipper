@@ -1060,6 +1060,7 @@ def build_ranking_video(
     cfg["clips"]["review_soft_min"] = float(rk.get("review_soft_min", 6.0) or 6.0)
     # Per-part Gemini video review is the slowest step (≈1–5 min under free-tier 503s)
     cfg["clips"]["skip_final_review"] = not bool(rk.get("final_review", False))
+    cfg["clips"]["ranking_part"] = True  # montage: 2–4 moments, ~20–25s per part
     cfg["_no_watermark"] = True  # watermark the final assembled ranking once
     cs = cfg["clips"].setdefault("copyright_safe", {})
     cs["enabled"] = True

@@ -129,3 +129,18 @@ watermark:
   position: drift          # drift (centred, mid-lower, slow slide) | center-low | top-center | top-left | top-right
   opacity: 0.45
   size: 0.024              # fraction of video height
+
+# Multi-moment montage for every clip (and each ranking part)
+montage:
+  enabled: true
+  total_seconds: [45, 75]          # normal clips
+  segments: [4, 7]
+  ranking_total_seconds: [20, 25]  # each ranking part
+  ranking_segments: [2, 4]
+  segment_seconds: [4, 12]
+  transition_seconds: 0.3          # xfade + audio crossfade (whip/zoom/flash/fade mix)
+  min_gap_seconds: 2.0             # spread moments apart
+  skip_intro_frac: 0.06            # long sources: skip OP / intro
+  skip_outro_frac: 0.08            # and ED / end card
+  speed_range: [1.03, 1.08]        # pitch-preserving (atempo)
+  mirror: false                    # hflip alternate segments; off = safe for on-screen text
