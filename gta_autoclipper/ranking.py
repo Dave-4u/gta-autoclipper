@@ -341,6 +341,67 @@ def smart_rank_label(
     return label
 
 
+_FAN_RX = re.compile(
+    r"(?i)(fan[\s-]*(made|animation|animated|anim|project|film)|fanmade|\bamv\b|\bedit\b|"
+    r"\bedits\b|animator|animated by|my animation|i animated|sakuga fan|parody|what if|"
+    r"\bfan\b|blender|\bmmd\b|stick ?fight|\bdc2\b|remake by|re-?animated|sped up|reverb|"
+    r"sound re-?design|\bremix\b)"
+)
+_OFFICIAL_RX = re.compile(
+    r"(?i)(official|crunchyroll|netflix|toho|aniplex|mappa|ufotable|toei|funimation|"
+    r"\bepisode\b|\bep\s*\d+|season\s*\d+|\bs\d+\b|full fight|fight scene|\bmovie\b|trailer|\bpv\b)"
+)
+
+
+def wants_fan_made(topic: str) -> bool:
+    return bool(re.search(r"(?i)fan[\s-]*made|fanmade|fan animation|\bamv|\bedits?\b", topic or ""))
+
+
+def classify_origin(cands: list[Candidate], cfg: dict[str, Any], log=None) -> dict[str, str]:
+    """Return {id: 'fan'|'official'} from title/channel/description, Gemini for ambiguous ones."""
+    out: dict[str, str] = {}
+    unsure: list[Candidate] = []
+    for c in cands:
+        ex = c.extra or {}
+        blob = " ".join([c.title or "", str(ex.get("channel") or ""), str(ex.get("description") or "")[:400],
+                         " ".join(map(str, ex.get("tags") or []))])
+        fan = bool(_FAN_RX.search(blob))
+        off = bool(_OFFICIAL_RX.search(blob))
+        if fan and not off:
+            out[c.id] = "fan"
+        elif off and not fan:
+            out[c.id] = "official"
+        else:
+            unsure.append(c)
+    if unsure:
+        try:
+            from .gemini_client import generate, has_gemini
+            if has_gemini(cfg):
+                lines = "\n".join(
+                    f"{c.id}\t{(c.title or '')[:90]}\t{str((c.extra or {}).get('channel') or '')[:40]}"
+                    for c in unsure[:25]
+                )
+                raw = generate(prompt=(
+                    "Classify each YouTube video as FAN (fan animation, fan-made, AMV, edit, remix/sped-up edit, "
+                    "animator/hobby project) or OFFICIAL (unaltered footage from the real anime/studio/streamer). "
+                    "Reply ONLY with compact JSON {\"<id>\":\"fan\"|\"official\"}.\n" + lines
+                ), cfg=cfg, max_retries=2)
+                import json as _j
+                m = re.search(r"\{.*\}", raw or "", re.S)
+                data = _j.loads(m.group(0)) if m else {}
+                for c in unsure:
+                    v = str(data.get(c.id) or "").lower()
+                    if v in ("fan", "official"):
+                        out[c.id] = v
+        except Exception as e:
+            if log:
+                log(f"[ranking] origin check via Gemini failed ({e}) — using title rules")
+    for c in unsure:
+        # Still unsure: an explicit "edit/AMV"-style hint wins, else treat as official
+        out.setdefault(c.id, "fan" if _FAN_RX.search(c.title or "") else "official")
+    return out
+
+
 def _topic_search_queries(niche_id: str, topic: str) -> list[str]:
     base = re.sub(r"(?i)^top\s*\d+\s*", "", topic).strip()
     base = re.sub(r"\s+", " ", base)
@@ -358,6 +419,11 @@ def _topic_search_queries(niche_id: str, topic: str) -> list[str]:
         else:
             qs += ["streamer reaction funny", "trailer reaction", "twitch funny reaction"]
     elif ttype == "fights" or niche == "anime":
+        if not wants_fan_made(topic):
+            qs += [
+                "anime episode fight scene", "Crunchyroll fight scene", "Muse Asia fight scene",
+                "Ani-One fight scene", "anime full fight scene episode",
+            ]
         qs += [
             "anime fight edit", "best anime fight scene", "anime fight scene 4k",
             "best anime fight moments", "anime fight shorts", "epic anime battle",
@@ -415,6 +481,19 @@ def _meta_prefilter_score(cand: Candidate, *, topic: str, niche_id: str, ttype: 
     title_toks = set(__import__("re").findall(r"[a-z0-9]+", title))
     if t_toks:
         score += 4.0 * (len(t_toks & title_toks) / max(1, len(t_toks)))
+    # Official anime ranking: prefer real episode/scene uploads from official channels over
+    # compilations / "Top 10" lists / re-uploads
+    if (niche_id or "").lower() in {"anime", "animation"}:
+        ch = str((cand.extra or {}).get("channel") or "").lower()
+        if any(k in ch for k in ("crunchyroll", "muse", "ani-one", "aniplex", "toho", "netflix anime",
+                                 "funimation", "mappa", "ufotable", "toei", "viz", "hidive", "bilibili")):
+            score += 4.0
+        if __import__("re").search(r"(episode|\bep\.?\s*\d+|season\s*\d+|\bs\d+\s*e\d+|full fight|fight scene)", title):
+            score += 2.5
+        if __import__("re").search(r"(top\s*\d+|compilation|best .* fights|every |all fights|ranking)", title):
+            score -= 5.0
+        if "re-upload" in title or "reupload" in title:
+            score -= 3.0
     # Niche-ish keywords
     niche = (niche_id or "").lower()
     if niche == "anime" and any(k in title for k in ("anime", "fight", "vs", "amv", "edit", "manga")):
@@ -542,6 +621,21 @@ def collect_rank_items(
 
     filtered.sort(key=lambda c: c.rank_score, reverse=True)
     probe_n = int(max_probe or rk.get("max_probe", 7) or 7)
+    # Never mix fan-made and official footage in one video
+    origin = classify_origin(filtered, cfg, log=_log) if filtered else {}
+    for c in filtered:
+        c.extra = dict(c.extra or {})
+        c.extra["origin"] = origin.get(c.id, "official")
+        _log(f"[ranking] origin={c.extra['origin']:<8} {c.title[:70]}")
+    fan_c = [c for c in filtered if c.extra["origin"] == "fan"]
+    off_c = [c for c in filtered if c.extra["origin"] == "official"]
+    need = int(rk.get("min_parts", 3) or 3) + 1
+    if wants_fan_made(topic):
+        group, pool = ("fan", fan_c) if len(fan_c) >= need or len(fan_c) >= len(off_c) else ("official", off_c)
+    else:
+        group, pool = ("official", off_c) if len(off_c) >= need or len(off_c) >= len(fan_c) else ("fan", fan_c)
+    _log(f"[ranking] origin groups: official={len(off_c)} fan={len(fan_c)} → using {group.upper()} only")
+    filtered = pool
     shortlist = filtered[: max(probe_n, n)]
     _log(f"[ranking] prefilter {len(filtered)} → probe top {len(shortlist)} (target n={n})")
 
@@ -988,6 +1082,13 @@ def build_ranking_video(
     if _timed_out() and len(items) >= min_on_timeout:
         _log(f"[ranking] time budget hit with {len(items)} items — rendering partial Top {len(items)}")
         n = len(items)
+    if items and all((it.candidate.extra or {}).get("origin") == "fan" for it in items) \
+            and not re.search(r"(?i)fan[\s-]*made|fanmade", topic):
+        topic = re.sub(r"(?i)^(top\s*\d+\s+)(anime\s+)?", lambda m: f"{m.group(1)}Fan-Made {m.group(2) or 'Anime '}", topic) \
+            if re.match(r"(?i)top\s*\d+", topic) else f"Top {n} Fan-Made {topic}"
+        _log(f"[ranking] fan-made set → topic={topic!r}")
+    if False:
+        pass
     elif len(items) < min_parts:
         _log(f"[ranking] not enough items ({len(items)}); need >={min_parts}")
         return None

@@ -775,8 +775,15 @@ def _render_clip_impl(
     
     # Layout: Gemini bboxes > detected face split > fill-crop (no letterbox)
     from .face_layout import (
-        detect_at_segment, split_filter_complex, layout_from_gemini, fill_crop_filter,
+        detect_at_segment, split_filter_complex, layout_from_gemini, fill_crop_filter as _fcf, smart_frame,
     )
+    import functools as _ft
+    # Every fill-crop: strip baked black bars + centre on the action (full-screen 9:16, no bars)
+    try:
+        _pre, _acx = smart_frame(source, segment.start, segment.end)
+    except Exception:
+        _pre, _acx = "", 0.5
+    fill_crop_filter = _ft.partial(_fcf, pre_crop=_pre, cx=_acx)
     face_layout = None
     split_base = None
     # Streamer face-cam split is reactions-only (experimental). gta6/anime/animation = fill-crop.

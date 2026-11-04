@@ -578,18 +578,66 @@ def fill_crop_filter(
     out_label: str = "base",
     cx: float = 0.5,
     cy: float = 0.5,
+    pre_crop: str = "",
 ) -> str:
-    """9:16 crop-to-fill (no pillarbox/letterbox). Optional center bias cx/cy 0-1."""
+    """9:16 crop-to-fill (no pillarbox/letterbox). Optional center bias cx/cy 0-1.
+    pre_crop: 'w:h:x:y' to strip black bars baked into the source first."""
     z = max(1.0, float(zoom))
     speed = max(0.5, min(2.0, float(speed)))
     cx = max(0.0, min(1.0, float(cx)))
     cy = max(0.0, min(1.0, float(cy)))
     # Cover 9:16, then optional mild zoom; always crop — never pad
     return (
-        f"[{in_label}]format=rgb24,"
+        f"[{in_label}]" + (f"crop={pre_crop}," if pre_crop else "") + "format=rgb24,"
         f"scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height}:(iw-{width})*{cx}:(ih-{height})*{cy},"
         f"scale=iw*{z}:ih*{z},"
         f"crop={width}:{height}:(iw-{width})/2:(ih-{height})/2,"
         f"setsar=1,setpts=PTS/{speed},format=yuv420p[{out_label}]"
     )
+
+
+def smart_frame(source, start: float, end: float) -> tuple[str, float]:
+    """(pre_crop, action_cx): strip baked letterbox/pillarbox bars and find where the action is
+    horizontally (frame-difference centroid), so the 9:16 crop follows the fight."""
+    import re as _re
+    import subprocess as _sp
+    dur = max(1.0, float(end) - float(start))
+    pre = ""
+    try:
+        pr = _sp.run(
+            ["ffmpeg", "-v", "info", "-ss", f"{start:.2f}", "-t", f"{min(dur, 12):.2f}", "-i", str(source),
+             "-vf", "fps=2,cropdetect=limit=24:round=2:reset=0", "-f", "null", "-"],
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        crops = _re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", pr.stderr or "")
+        pw = _re.search(r"Stream.*Video.* (\d{3,5})x(\d{3,5})", pr.stderr or "")
+        if crops and pw:
+            w, h, x, y = map(int, crops[-1])
+            W, H = int(pw.group(1)), int(pw.group(2))
+            if w >= W * 0.4 and h >= H * 0.4 and (w < W * 0.97 or h < H * 0.97):
+                pre = f"{w}:{h}:{x}:{y}"
+                print(f"[layout] stripping baked bars {W}x{H} → {pre}")
+    except Exception as e:
+        print(f"[layout] cropdetect skip: {e}")
+    cx = 0.5
+    try:
+        import numpy as np
+        vf = (f"crop={pre}," if pre else "") + "fps=3,scale=160:90,format=gray"
+        pr = _sp.run(
+            ["ffmpeg", "-v", "error", "-ss", f"{start:.2f}", "-t", f"{min(dur, 10):.2f}", "-i", str(source),
+             "-vf", vf, "-f", "rawvideo", "-"],
+            capture_output=True, check=False, timeout=60,
+        )
+        buf = np.frombuffer(pr.stdout or b"", dtype=np.uint8)
+        n = buf.size // (160 * 90)
+        if n >= 3:
+            fr = buf[: n * 160 * 90].reshape(n, 90, 160).astype(np.int16)
+            diff = np.abs(np.diff(fr, axis=0)).sum(axis=(0, 1)).astype(np.float64)
+            if diff.sum() > 0:
+                c = float((diff * np.arange(160)).sum() / diff.sum()) / 159.0
+                cx = 0.5 + 0.8 * (c - 0.5)  # gentle follow, avoids over-cropping
+                print(f"[layout] action centre x={c:.2f} → crop cx={cx:.2f}")
+    except Exception as e:
+        print(f"[layout] motion centroid skip: {e}")
+    return pre, max(0.0, min(1.0, cx))
