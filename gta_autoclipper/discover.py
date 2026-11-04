@@ -61,10 +61,12 @@ def _run_ytdlp_json(
         "--dump-single-json",
         "--ignore-no-formats-error",
         "--no-warnings",
-        "--socket-timeout", "12",
-        "--retries", "1",
-        "--extractor-retries", "1",
+        "--socket-timeout", "15",
+        "--retries", "2",
+        "--extractor-retries", "2",
         "--skip-unavailable-fragments",
+        # Reduce bot/auth friction on search tabs
+        "--extractor-args", "youtube:player_client=web,android",
         *(cookie_args or []),
         *args,
     ]
@@ -80,10 +82,16 @@ def _run_ytdlp_json(
     except Exception as e:
         print(f"[discover] yt-dlp error: {e}")
         return []
-    if proc.returncode != 0 and not (proc.stdout or "").strip():
-        err = (proc.stderr or "")[:200].strip()
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0 and not stdout:
+        err = stderr[:300]
         if err:
-            print(f"[discover] yt-dlp non-zero: {err}")
+            print(f"[discover] yt-dlp non-zero ({proc.returncode}): {err}")
+        return []
+    if not stdout and stderr:
+        # Sometimes yt-dlp prints only to stderr on block
+        print(f"[discover] yt-dlp empty stdout: {stderr[:300]}")
         return []
     lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
     results: list[dict[str, Any]] = []
@@ -199,14 +207,18 @@ def search_youtube(
     timeout: int = 90,
     cookie_args: list[str] | None = None,
 ) -> list[Candidate]:
-    """Search YouTube via yt-dlp. Soft-fails on hang; tries a quick fallback if primary is empty."""
+    """Search YouTube via yt-dlp. Soft-fails on hang; retries without cookies if needed."""
     n = max(1, min(int(n), 15))
-    t = max(10, min(int(timeout), 40))
+    t = max(12, min(int(timeout), 55))
     ca = cookie_args or []
     query = f"ytsearch{n}:{keyword}"
     entries = _run_ytdlp_json([query], timeout=t, cookie_args=ca)
+    # Cookies can make ytsearch worse when stale — retry bare
+    if not entries and ca:
+        print(f"[discover] retry search without cookies for {keyword!r}")
+        entries = _run_ytdlp_json([query], timeout=t, cookie_args=None)
     if not entries and n > 3:
-        entries = _run_ytdlp_json([f"ytsearch3:{keyword}"], timeout=min(25, t), cookie_args=ca)
+        entries = _run_ytdlp_json([f"ytsearch5:{keyword}"], timeout=min(35, t), cookie_args=None)
     if prefer_date and entries:
         from urllib.parse import quote_plus
 
@@ -216,7 +228,7 @@ def search_youtube(
             + "&sp=CAI%253D"
         )
         extra = _run_ytdlp_json(
-            ["--playlist-end", str(min(n, 5)), url], timeout=min(25, t), cookie_args=ca
+            ["--playlist-end", str(min(n, 5)), url], timeout=min(30, t), cookie_args=ca or None
         )
         seen = {e.get("id") for e in entries if e.get("id")}
         for e in extra:
@@ -228,6 +240,10 @@ def search_youtube(
         c = _entry_to_candidate(e, "search")
         if c:
             out.append(c)
+    if not out:
+        print(f"[discover] 0 results for query {keyword!r}")
+    else:
+        print(f"[discover] {len(out)} results for {keyword!r}")
     return out
 
 
@@ -373,18 +389,28 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
                 )
             except Exception as e:
                 print(f"[discover] trending search failed for {kw!r}: {e}")
+        skipped_dur = skipped_age = skipped_seen = 0
         for c in batch or []:
             if history.seen(c.id) or c.id in seen_ids:
+                skipped_seen += 1
                 continue
             if c.duration is not None and (c.duration < min_d or c.duration > max_d):
+                skipped_dur += 1
                 continue
             if max_age > 0:
                 age = _age_days(c.upload_date)
                 if age is not None and age > max_age:
+                    skipped_age += 1
                     continue
             c.rank_score = smart_rank_score(c, sort_by=sort_by, niche_id=str(cfg.get("niche_id") or "") or None)
             seen_ids.add(c.id)
             candidates.append(c)
+        if (batch or []) and not any(c.source != "links" for c in candidates[-len(batch or []):]):
+            print(
+                f"[discover] filtered all for {kw!r}: "
+                f"seen={skipped_seen} duration={skipped_dur} age={skipped_age} "
+                f"(min_d={min_d} max_d={max_d} max_age={max_age})"
+            )
 
     links = [c for c in candidates if c.source == "links"]
     searched = [c for c in candidates if c.source != "links"]
