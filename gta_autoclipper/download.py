@@ -94,6 +94,14 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
         return None
 
     timeout = int((cfg.get("download") or {}).get("timeout_seconds") or 180)
+    # Ranking / section downloads need more wall-clock than media duration
+    if max_s > 0:
+        timeout = max(timeout, int(max_s * 2.5) + 45)
+        # Prefer lighter progressive formats so section downloads finish in time
+        fmt = (cfg.get("download") or {}).get(
+            "format_fast",
+            "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720]/bv*[height<=720]+ba/worst",
+        )
     cmd = [
         "yt-dlp",
         "-f",
@@ -106,6 +114,9 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
         "--print",
         "after_move:filepath",
         "--no-warnings",
+        "--concurrent-fragments", "4",
+        "--retries", "2",
+        "--fragment-retries", "2",
         *_cookie_args(cfg),
     ]
     if max_s > 0:
@@ -113,27 +124,48 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
         cmd.extend(["--download-sections", f"*{0}-{max_s:.0f}", "--force-keyframes-at-cuts"])
     cmd.append(candidate.url)
     print(f"[download] fetching {candidate.id}{suffix} (timeout {timeout}s, max_s={max_s or 'full'})…")
-    try:
-        proc = procutil.run_tracked(cmd, timeout=timeout, text=True, check=False)
-    except subprocess.TimeoutExpired:
-        print(f"[download] timed out after {timeout}s for {candidate.url}")
+    def _try_run(run_cmd, run_timeout: int):
+        try:
+            return procutil.run_tracked(run_cmd, timeout=run_timeout, text=True, check=False), None
+        except subprocess.TimeoutExpired:
+            return None, "timeout"
+
+    proc, err_kind = _try_run(cmd, timeout)
+    if err_kind == "timeout":
+        print(f"[download] timed out after {timeout}s — retrying lighter format…")
         _cleanup_partials(out_dir, stem)
         _cleanup_partials(out_dir, candidate.id)
-        return None
+        # Emergency fallback: progressive 360p/480p, no merge
+        light = list(cmd)
+        try:
+            fi = light.index("-f")
+            light[fi + 1] = "b[height<=480]/worst"
+        except ValueError:
+            pass
+        # Drop concurrent-fragments for flaky links
+        while "--concurrent-fragments" in light:
+            i = light.index("--concurrent-fragments")
+            del light[i:i + 2]
+        proc, err_kind = _try_run(light, min(timeout, 150))
+        if err_kind == "timeout" or proc is None:
+            print(f"[download] timed out again for {candidate.url}")
+            _cleanup_partials(out_dir, stem)
+            _cleanup_partials(out_dir, candidate.id)
+            return None
+        cmd = light  # for later path resolution context
 
-    err_blob = (proc.stderr or "") + "\n" + (proc.stdout or "")
-    if proc.returncode != 0 and _is_bot_wall(err_blob):
+    err_blob = ((proc.stderr or "") if proc else "") + "\n" + ((proc.stdout or "") if proc else "")
+    if proc is not None and proc.returncode != 0 and _is_bot_wall(err_blob):
         print(
             "[download] YouTube bot check — skip (set download.cookies_from_browser: chrome|edge "
             "in config.yaml, or download.cookies: path\\to\\cookies.txt)"
         )
         return None
 
-    if proc.returncode != 0:
+    if proc is not None and proc.returncode != 0:
         print("[download] retrying once…")
-        try:
-            proc = procutil.run_tracked(cmd, timeout=timeout, text=True, check=False)
-        except subprocess.TimeoutExpired:
+        proc, err_kind = _try_run(cmd, timeout)
+        if err_kind == "timeout" or proc is None:
             print(f"[download] timed out after {timeout}s for {candidate.url}")
             _cleanup_partials(out_dir, stem)
             _cleanup_partials(out_dir, candidate.id)
