@@ -100,8 +100,9 @@ ranking:
   timeout_seconds: 1500
   min_items_on_timeout: 3
   max_probe: 7
-  workers: 3
-  download_seconds: 90
+  workers: 2
+  download_seconds: 60
+  download_timeout: 180
   analyze_seconds: 75
   keywords: 3
   results_per_keyword: 5
