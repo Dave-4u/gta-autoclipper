@@ -99,6 +99,11 @@ gemini:
 ranking:
   timeout_seconds: 1500
   min_items_on_timeout: 3
+  min_parts: 3            # render Top N with N>=3 if some parts fail
+  spare_items: 2          # extra candidates to try when a part fails
+  assemble_reserve_seconds: 150
+  review_soft: true       # keep parts on Gemini review error / score>=6
+  review_soft_min: 6.0
   max_probe: 7
   workers: 2
   download_seconds: 60

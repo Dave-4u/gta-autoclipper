@@ -1339,14 +1339,21 @@ def render_clip(
               f"reasons={review.get('reasons')} desc={str(review.get('desc',''))[:160]}")
         rev_path = out_path.with_suffix(".review.json")
         rev_path.write_text(__import__("json").dumps(review, indent=2), encoding="utf-8")
-        if not review.get("ok"):
-            print("[review] FAIL — discarding clip")
+        soft = bool((cfg.get("clips") or {}).get("review_soft"))
+        if not review.get("ok") and soft and float(review.get("score") or 0) >= float(
+                (cfg.get("clips") or {}).get("review_soft_min", 6.0)):
+            print(f"[review] soft-keep (ranking part) score={review.get('score')}")
+        elif not review.get("ok"):
+            print(f"[review] FAIL — discarding clip (score={review.get('score')})")
             try:
                 out_path.unlink(missing_ok=True)
             except Exception:
                 pass
             return None
     except Exception as e:
+        if bool((cfg.get("clips") or {}).get("review_soft")):
+            print(f"[review] error (keeping ranking part; likely Gemini quota/network): {e}")
+            return out_path
         print(f"[review] error (discarding): {e}")
         try:
             out_path.unlink(missing_ok=True)

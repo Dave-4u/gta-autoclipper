@@ -747,6 +747,52 @@ def _render_rank_segment(
 
 
 
+_FAIL_MARKERS = ("rejected", "FAIL", "failed", "error", "discard", "Traceback", "timed out", "Invalid", "No such")
+
+
+class _Tee:
+    def __init__(self, real):
+        self.real, self.lines, self._buf = real, [], ""
+
+    def write(self, s):
+        try:
+            self.real.write(s)
+        except Exception:
+            pass
+        self._buf += s
+        while "\n" in self._buf:
+            ln, self._buf = self._buf.split("\n", 1)
+            self.lines.append(ln)
+            if len(self.lines) > 400:
+                del self.lines[:200]
+        return len(s)
+
+    def flush(self):
+        try:
+            self.real.flush()
+        except Exception:
+            pass
+
+
+def _render_part_logged(item, cfg, work, *, with_vo=True):
+    """Render one part; return (path|None, reason). Never raises."""
+    import contextlib, sys as _sys, traceback as _tb
+    tee = _Tee(_sys.stdout)
+    try:
+        with contextlib.redirect_stdout(tee):
+            seg = _render_rank_segment(item, cfg, work, with_vo=with_vo)
+    except Exception as e:
+        tail = _tb.format_exc().strip().splitlines()[-1]
+        return None, f"exception: {tail[:240]}"
+    if tee._buf:
+        tee.lines.append(tee._buf)
+    if seg:
+        return seg, ""
+    hits = [ln.strip() for ln in tee.lines if any(m in ln for m in _FAIL_MARKERS)]
+    why = " / ".join(hits[-3:]) if hits else (tee.lines[-1].strip() if tee.lines else "render_clip returned nothing")
+    return None, why[:400]
+
+
 def _ass_dialogue_count(ass_path: Path) -> int:
     if not ass_path.is_file():
         return 0
@@ -860,25 +906,35 @@ def build_ranking_video(
         cfg["clips"]["max_duration"] = 16
     # Assembled ranking length = title + all items; do not inherit quality.yaml's 30s clip cap as a total.
     cfg["clips"]["max_ranking_duration"] = 180
+    # A Gemini quota blip or a 7.5 review score must not delete a finished ranking part
+    cfg["clips"]["review_soft"] = bool(rk.get("review_soft", True))
+    cfg["clips"]["review_soft_min"] = float(rk.get("review_soft_min", 6.0) or 6.0)
     cs = cfg["clips"].setdefault("copyright_safe", {})
     cs["enabled"] = True
 
     topic = (topic or "").strip() or suggest_topic(niche_id, n, cfg)
     _log(f"[ranking] topic={topic!r} niche={niche_id} n={n}")
 
+    spares = int(rk.get("spare_items", 2) or 0)
+    min_parts = max(3, min(n, int(rk.get("min_parts", 3) or 3)))
     items = collect_rank_items(
-        niche_id, topic, n=n, cfg=cfg, log=log,
+        niche_id, topic, n=n + spares, cfg=cfg, log=log,
         deadline=deadline, cancel_event=cancel_event,
-        max_probe=int(rk.get("max_probe", 7) or 7),
+        max_probe=int(rk.get("max_probe", 7) or 7) + spares,
     )
+    # collect_rank_items sets the GLOBAL procutil cancel flag to stop leftover probes once it has
+    # enough. Left set, it made every later stage think the job was cancelled and killed tracked
+    # child processes mid-render. Clear it unless the user actually stopped / the budget is gone.
+    if not (cancel_event is not None and cancel_event.is_set()) and time.time() < deadline:
+        procutil.clear_cancel()
     if _timed_out() and len(items) >= min_on_timeout:
         _log(f"[ranking] time budget hit with {len(items)} items — rendering partial Top {len(items)}")
         n = len(items)
-    elif len(items) < 2:
-        _log(f"[ranking] not enough items ({len(items)}); need >=2")
+    elif len(items) < min_parts:
+        _log(f"[ranking] not enough items ({len(items)}); need >={min_parts}")
         return None
-    elif len(items) < n:
-        _log(f"[ranking] proceeding with {len(items)}/{n} items")
+    else:
+        _log(f"[ranking] {len(items)} candidate(s) for Top {n} (spares={max(0, len(items) - n)})")
 
     out_root = Path(cfg["clips"]["output_dir"]) / "ranking"
     out_root.mkdir(parents=True, exist_ok=True)
@@ -917,13 +973,13 @@ def build_ranking_video(
             _log(f"[ranking] soft-keep fill-crop @{item.segment.start:.1f}s ({item.segment.reason})")
         survivors.append(item)
 
-    if len(survivors) < 2:
-        _log(f"[ranking] too few survivors ({len(survivors)})")
+    if len(survivors) < min_parts:
+        _log(f"[ranking] too few survivors ({len(survivors)}); need >={min_parts}")
         return None
     if _timed_out() and len(survivors) >= min_on_timeout:
         _log(f"[ranking] rendering partial with {len(survivors)} survivors after budget")
 
-    total = len(survivors)
+    total = min(len(survivors), n)
     # Assign contiguous ranks: first survivor = #total (lowest), last = #1 (best)
     # Preserve existing order (collect_rank_items sorts ascending views → worst first)
     for i, item in enumerate(survivors):
@@ -943,21 +999,45 @@ def build_ranking_video(
     )
     rendered_items: list[RankItem] = []
     rendered_paths: list[Path] = []
-    for item in survivors:
-        if _timed_out() and len(rendered_items) >= min_on_timeout:
-            _log(f"[ranking] budget hit mid-render — assembling {len(rendered_items)} finished parts")
+    failures: list[str] = []
+    assemble_reserve = float(rk.get("assemble_reserve_seconds", 150) or 150)
+    part_times: list[float] = []
+    # Best (most-viewed) first so spares replace the weakest picks, then try next candidate on failure
+    queue = sorted(survivors, key=lambda it: it.views, reverse=True)
+    for k, item in enumerate(queue):
+        if len(rendered_items) >= n:
             break
-        _log(f"[ranking] render #{item.rank} {item.candidate.title[:50]} ({_format_views(item.views)})")
-        seg = _render_rank_segment(item, cfg, work, with_vo=with_vo)
+        if cancel_event is not None and cancel_event.is_set() or procutil.cancelled():
+            _log("[ranking] stopped — no more parts")
+            break
+        left = deadline - time.time()
+        est = (sum(part_times) / len(part_times)) if part_times else 120.0
+        if left < assemble_reserve + est:
+            _log(f"[ranking] budget: {left:.0f}s left, part≈{est:.0f}s + assemble {assemble_reserve:.0f}s — "
+                 f"stopping with {len(rendered_items)} part(s)")
+            break
+        _log(f"[ranking] render part {len(rendered_items) + 1}/{n} (candidate {k + 1}/{len(queue)}): "
+             f"{item.candidate.title[:50]} ({_format_views(item.views)})")
+        t0 = time.time()
+        seg, why = _render_part_logged(item, cfg, work, with_vo=with_vo)
+        part_times.append(time.time() - t0)
         if seg:
             rendered_items.append(item)
             rendered_paths.append(seg)
+            _log(f"[ranking] part OK {item.candidate.id} in {part_times[-1]:.0f}s")
         else:
-            _log(f"[ranking] render failed for #{item.rank} {item.candidate.id} — excluding")
+            failures.append(f"{item.candidate.id}: {why}")
+            _log(f"[ranking] PART FAILED {item.candidate.id} ({part_times[-1]:.0f}s) — {why} — trying next candidate")
 
-    if len(rendered_items) < 2:
-        _log(f"[ranking] too few rendered parts ({len(rendered_items)})")
+    if failures:
+        _log("[ranking] part failures: " + " | ".join(failures))
+    if len(rendered_items) < min_parts:
+        _log(f"[ranking] too few rendered parts ({len(rendered_items)}); need >={min_parts}")
         return None
+    # Back to ascending views (lowest first → #1 last)
+    order = sorted(range(len(rendered_items)), key=lambda i: rendered_items[i].views)
+    rendered_items = [rendered_items[i] for i in order]
+    rendered_paths = [rendered_paths[i] for i in order]
 
     # Re-rank / retitle from what ACTUALLY rendered (no missing #N)
     total = len(rendered_items)
