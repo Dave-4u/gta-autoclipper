@@ -144,3 +144,8 @@ montage:
   skip_outro_frac: 0.08            # and ED / end card
   speed_range: [1.03, 1.08]        # pitch-preserving (atempo)
   mirror: false                    # hflip alternate segments; off = safe for on-screen text
+
+# Cutroom UI job runner (jobs run as a separate process)
+job:
+  watchdog_minutes: 5
+  autopilot_timeout_seconds: 3600

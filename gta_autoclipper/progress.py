@@ -33,7 +33,7 @@ class JobProgress:
     produced: list[str] = field(default_factory=list)
     started_at: float | None = None
     ended_at: float | None = None
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def log(self, msg: str) -> None:
         line = msg if isinstance(msg, str) else str(msg)
@@ -72,6 +72,9 @@ class JobProgress:
         return st
 
     def end(self, name: str, *, status: str = "ok", detail: str = "") -> None:
+        # NOTE: never call self.log() while holding self._lock (non-reentrant) — that deadlocked
+        # the job thread on the first stage end and then every /api/status call (UI "hung").
+        msg = f"[stage] ■ {name} ({status})" + (f" — {detail}" if detail else "")
         with self._lock:
             for st in reversed(self.stages):
                 if st.name == name and st.status == "running":
@@ -80,11 +83,11 @@ class JobProgress:
                     if detail:
                         st.detail = detail
                     elapsed = (st.ended_at - (st.started_at or st.ended_at))
-                    self.log(f"[stage] ■ {name} ({status}, {elapsed:.1f}s)" + (f" — {detail}" if detail else ""))
+                    msg = f"[stage] ■ {name} ({status}, {elapsed:.1f}s)" + (f" — {detail}" if detail else "")
                     if self.current_stage == name:
                         self.current_stage = ""
-                    return
-        self.log(f"[stage] ■ {name} ({status})" + (f" — {detail}" if detail else ""))
+                    break
+        self.log(msg)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:

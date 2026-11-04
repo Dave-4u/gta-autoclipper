@@ -138,6 +138,9 @@ def main(argv: list[str] | None = None) -> int:
     vo_group.add_argument("--no-voiceover", action="store_true")
     parser.add_argument("--no-copyright-safe", action="store_true")
     parser.add_argument("--no-intro-vo", action="store_true", help="Disable header intro TTS")
+    parser.add_argument("--no-captions", action="store_true", help="Don't burn captions")
+    parser.add_argument("--max-clips", type=int, default=None, help="Clips per source video")
+    parser.add_argument("--deadline", type=float, default=None, help="Ranking time budget (s)")
     args = parser.parse_args(argv)
 
     if args.ui:
@@ -160,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
             topic=args.topic,
             n=max(3, min(7, args.rank_n)),
             config_path=args.config,
+            deadline_s=args.deadline,
         )
         print(out or "[ranking] failed")
         return 0
@@ -200,6 +204,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg.setdefault("clips", {}).setdefault("copyright_safe", {})["enabled"] = False
     if args.fast:
         cfg.setdefault("analysis", {})["whisper_model"] = "tiny"
+    if args.no_captions:
+        cfg.setdefault("clips", {})["burn_captions"] = False
+    if args.max_clips:
+        cfg.setdefault("clips", {})["max_clips_per_video"] = max(1, int(args.max_clips))
 
     interval = args.every
     if interval is None and not args.once:

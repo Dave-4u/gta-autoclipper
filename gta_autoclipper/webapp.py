@@ -369,28 +369,32 @@ def create_app(config_path: str | None = None) -> FastAPI:
         }
 
     @app.get("/api/status")
-    def status():
-        snap = _progress.snapshot()
-        ap = get_state()
-        snap["autopilot_running"] = ap.running
+    async def status():
+        # async + lock-free snapshot: never queued behind a busy threadpool or a job lock
+        from .jobrunner import JOB
+        snap = JOB.snapshot()
+        snap["autopilot_running"] = JOB.running() and "--auto" in JOB.cmd
         return snap
 
     @app.post("/api/start")
     def start(req: StartRequest):
-        global _job_thread
-        with _job_lock:
-            if _job_thread and _job_thread.is_alive():
-                raise HTTPException(409, "A job is already running")
-            _stop_flag.clear()
-            mode = (req.mode or "single").lower()
-            target = _run_single
-            if mode == "ranking":
-                target = _run_ranking
-            elif mode in {"autopilot", "auto"}:
-                target = _run_autopilot
-            _job_thread = threading.Thread(target=target, args=(req,), daemon=True, name="cutroom-job")
-            _job_thread.start()
-        return {"ok": True, "mode": req.mode, "niche": req.niche}
+        # Jobs run as a separate `python -m gta_autoclipper ...` process (see jobrunner.py):
+        # a stuck download/Gemini call/ffmpeg can never freeze the UI, and ABORT kills the tree.
+        from .jobrunner import JOB, cli_args_for
+        if JOB.running():
+            raise HTTPException(409, "A job is already running")
+        cfg = _cfg()
+        job_cfg = cfg.get("job") or {}
+        mode = (req.mode or "single").lower()
+        if mode == "ranking":
+            hard = float((cfg.get("ranking") or {}).get("timeout_seconds") or 1500) + 300
+        elif mode in {"autopilot", "auto"}:
+            hard = float(job_cfg.get("autopilot_timeout_seconds") or 3600)
+        else:
+            hard = float(job_cfg.get("overall_timeout_seconds") or 900) + 600
+        JOB.start(cli_args_for(req, _config_path), cwd=project_root(), hard_timeout_s=hard,
+                  stall_min=float(job_cfg.get("watchdog_minutes") or 5))
+        return {"ok": True, "mode": req.mode, "niche": req.niche, "pid": JOB.proc.pid if JOB.proc else None}
 
     @app.get("/api/watermarks")
     def wm_get():
@@ -425,6 +429,9 @@ def create_app(config_path: str | None = None) -> FastAPI:
 
     @app.post("/api/stop")
     def stop():
+        from .jobrunner import JOB
+        if JOB.running():
+            JOB.stop()
         _stop_flag.set()
         request_stop()
         try:
