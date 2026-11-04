@@ -442,7 +442,10 @@ def collect_rank_items(
     cfg["search"]["prefer_date_search"] = False
     cfg["search"]["search_timeout_seconds"] = int(rk.get("search_timeout_seconds", 45) or 45)
     # Cap source duration for ranking shortlist
-    cfg["search"]["max_source_duration"] = int(rk.get("max_source_duration", 360) or 360)
+    cfg["search"]["max_source_duration"] = int(rk.get("max_source_duration", 480) or 480)
+    # Ranking is evergreen (best fights ever) — don't drop older uploads / short clips
+    cfg["search"]["max_age_days"] = float(rk.get("max_age_days", 0) or 0)
+    cfg["search"]["min_source_duration"] = float(rk.get("min_source_duration", 8) or 8)
     ttype = detect_topic_type(topic)
     _log(f"[ranking] topic_type={ttype} fast-discover kw={cfg['search']['keywords']}")
 
