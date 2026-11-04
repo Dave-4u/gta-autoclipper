@@ -293,6 +293,17 @@ def smart_rank_label(
             return "GTA 6 reaction"
         return "Reaction"
 
+    # "A vs B" straight from the title beats any guessed character
+    m = re.search(r"([A-Z][\w'.]*(?:\s+[A-Z][\w'.]*)?)\s+(?:vs\.?|VS|Vs\.?|versus)\s+([A-Z][\w'.]*(?:\s+[A-Z][\w'.]*)?)", title or "")
+    if m:
+        b = re.sub(r"(?i)\s+(fight|scene|battle|amv|edit)$", "", m.group(2))
+        lab = f"{m.group(1)} vs {b}"
+        if len(lab) > 28:
+            lab = f"{m.group(1).split()[0]} vs {m.group(2).split()[0]}"
+        return lab[:28]
+    # Only trust extracted characters that are literally named in the title
+    es.characters = [c for c in (es.characters or []) if c.lower() in title_l]
+
     # Franchise + content type
     if es.franchises:
         show = es.franchises[0].replace("_", " ")
@@ -592,6 +603,9 @@ def collect_rank_items(
             if not row:
                 continue
             cand, path, seg, label = row
+            if not path or not Path(path).is_file():
+                _log(f"[ranking] skip {cand.id}: downloaded file vanished")
+                continue
             with picked_lock:
                 if cand.id in seen_ids or len(picked) >= n:
                     continue
@@ -815,6 +829,9 @@ class _Tee:
 def _render_part_logged(item, cfg, work, *, with_vo=True):
     """Render one part; return (path|None, reason). Never raises."""
     import contextlib, sys as _sys, traceback as _tb
+    src = Path(item.path) if item.path else None
+    if not src or not src.is_file() or src.stat().st_size < 10000:
+        return None, f"source file missing/empty after download ({src.name if src else 'none'})"
     tee = _Tee(_sys.stdout)
     try:
         with contextlib.redirect_stdout(tee):
@@ -947,6 +964,9 @@ def build_ranking_video(
     # A Gemini quota blip or a 7.5 review score must not delete a finished ranking part
     cfg["clips"]["review_soft"] = bool(rk.get("review_soft", True))
     cfg["clips"]["review_soft_min"] = float(rk.get("review_soft_min", 6.0) or 6.0)
+    # Per-part Gemini video review is the slowest step (≈1–5 min under free-tier 503s)
+    cfg["clips"]["skip_final_review"] = not bool(rk.get("final_review", False))
+    cfg["_no_watermark"] = True  # watermark the final assembled ranking once
     cs = cfg["clips"].setdefault("copyright_safe", {})
     cs["enabled"] = True
 
@@ -1319,4 +1339,6 @@ def build_ranking_video(
         ),
         encoding="utf-8",
     )
+    from .edit import apply_watermark
+    apply_watermark(final, cfg)
     return final

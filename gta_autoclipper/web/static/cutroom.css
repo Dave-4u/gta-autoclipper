@@ -234,3 +234,11 @@ select:focus, input:focus { outline: 1px solid var(--accent); border-color: var(
   .topbar { grid-template-columns: 1fr; justify-items: start; }
   .top-meta { justify-self: start; }
 }
+
+/* Watermark presets */
+.wm select { margin-top: 0.2rem; }
+.wm-row { display: flex; gap: 0.4rem; align-items: stretch; }
+.wm-row input { flex: 1; min-width: 0; }
+.btn.mini { padding: 0.35rem 0.6rem; font-size: 0.72rem; letter-spacing: 0.08em; }
+.btn.ghost { background: transparent; }
+.wm-msg { min-height: 1em; font-size: 0.7rem; opacity: 0.7; letter-spacing: 0.04em; }

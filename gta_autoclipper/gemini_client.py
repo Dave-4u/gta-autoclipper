@@ -70,7 +70,14 @@ def has_gemini(cfg: dict[str, Any] | None = None) -> bool:
 
 def _client(api_key: str):
     from google import genai
-    return genai.Client(api_key=api_key)
+    import os
+    # Without a timeout a stalled free-tier request hangs the whole job forever (seen in ranking).
+    t_ms = int(float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "90") or 90) * 1000)
+    try:
+        from google.genai import types
+        return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=t_ms))
+    except Exception:
+        return genai.Client(api_key=api_key)
 
 
 def generate(
@@ -100,8 +107,14 @@ def generate(
     contents = [types.Content(role="user", parts=parts)]
 
     last_err = ""
+    import os as _os, time as _time
+    _t0 = _time.time()
+    _wall = float(_os.environ.get("GEMINI_TOTAL_SECONDS", "150") or 150)
     for model_name in models:
         for attempt in range(max_retries):
+            if _time.time() - _t0 > _wall:
+                print(f"[gemini] gave up after {_wall:.0f}s total (models/retries) — using fallback")
+                return ""
             try:
                 resp = client.models.generate_content(
                     model=model_name,

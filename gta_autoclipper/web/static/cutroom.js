@@ -161,6 +161,46 @@
     poll();
   }
 
+  // ---- Watermark presets (saved to watermarks.json on this PC) ----
+  const wmOn = $("wmOn"), wmPreset = $("wmPreset"), wmText = $("wmText"), wmMsg = $("wmMsg");
+  let wmState = null;
+  function wmRender(st) {
+    wmState = st;
+    wmOn.checked = !!st.enabled;
+    wmPreset.innerHTML = "";
+    for (const [name, text] of Object.entries(st.presets)) {
+      const o = document.createElement("option");
+      o.value = name;
+      o.textContent = name === text ? text : `${name} — ${text}`;
+      if (name === st.active) o.selected = true;
+      wmPreset.appendChild(o);
+    }
+    wmText.value = st.presets[st.active] || "";
+  }
+  async function wmPost(payload, okMsg) {
+    const res = await fetch("/api/watermarks", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { wmMsg.textContent = data.detail || `Error ${res.status}`; return; }
+    wmRender(data);
+    wmMsg.textContent = okMsg || "";
+  }
+  fetch("/api/watermarks").then((r) => r.json()).then(wmRender).catch(() => {});
+  wmOn.addEventListener("change", () => wmPost({ enabled: wmOn.checked }, wmOn.checked ? "Watermark on" : "Watermark off"));
+  wmPreset.addEventListener("change", () => wmPost({ active: wmPreset.value }, "Using " + wmPreset.value));
+  $("wmSave").addEventListener("click", () => {
+    const text = wmText.value.trim();
+    if (!text) { wmMsg.textContent = "Type a handle first"; return; }
+    const name = (window.prompt("Preset name", text) || "").trim() || text;
+    wmPost({ save: { name, text } }, "Saved " + name);
+  });
+  $("wmDel").addEventListener("click", () => {
+    if (!wmState || !wmPreset.value) return;
+    if (!window.confirm(`Delete preset "${wmPreset.value}"?`)) return;
+    wmPost({ delete: wmPreset.value }, "Deleted");
+  });
+
   btnStart.addEventListener("click", startJob);
   btnStop.addEventListener("click", stopJob);
   $("btnRefresh").addEventListener("click", refreshOutputs);

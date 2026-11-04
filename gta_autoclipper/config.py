@@ -56,6 +56,11 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     dl["links_file"] = str((root / dl.get("links_file", "links.txt")).resolve())
     clips = data.setdefault("clips", {})
     clips["output_dir"] = str((root / clips.get("output_dir", "outputs")).resolve())
+    try:
+        from .watermarks import apply_to_cfg
+        apply_to_cfg(data)
+    except Exception as e:  # never block a run on a bad watermarks.json
+        print(f"[watermark] settings ignored: {e}")
     return data
 
 

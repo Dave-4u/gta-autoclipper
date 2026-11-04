@@ -83,6 +83,59 @@ def _font_opt(font: str) -> str:
     return f":fontfile='{_fc_path(font)}'"
 
 
+def apply_watermark(path: Path, cfg: dict[str, Any]) -> Path:
+    """Burn a small semi-transparent handle (e.g. @officialdevclips) in place. Never fails the clip."""
+    wm = dict(cfg.get("watermark") or {})
+    if not wm.get("enabled", True) or not path or not Path(path).is_file():
+        return path
+    text = _escape_drawtext(str(wm.get("text") or "@officialdevclips"))
+    op = max(0.05, min(1.0, float(wm.get("opacity", 0.45) or 0.45)))
+    pos = str(wm.get("position") or "drift").lower()
+    size = float(wm.get("size", 0.024) or 0.024)          # fraction of video height
+    mx = float(wm.get("margin_x", 0.045) or 0.045)        # fraction of width
+    # Top band ~9-10% down: below TikTok/Shorts status/search row, above rank/title chrome
+    my_top = float(wm.get("margin_top", 0.095) or 0.095)
+    my_bot = float(wm.get("margin_bottom", 0.20) or 0.20)  # clear of captions + platform UI
+    # Safe band on TikTok/Shorts/Reels ≈ 15–65% down, clear of the right action rail.
+    # Default "drift": centred handle in the mid-lower band (above captions) slowly sliding,
+    # like popular clip pages — natural, and harder to crop out.
+    if pos == "drift":
+        x = "(w-tw)/2-w*0.06+w*0.10*sin(2*PI*t/17)"
+        y = "h*0.60+h*0.035*sin(2*PI*t/11)"
+    elif pos in ("center-low", "center"):
+        x, y = "(w-tw)/2-w*0.04", "h*0.60"
+    elif pos == "top-center":
+        x, y = "(w-tw)/2", "h*0.16"
+    else:
+        x = f"w-tw-w*{max(mx, 0.12)}" if "right" in pos else f"w*{mx}"
+        y = f"h-th-h*{max(my_bot, 0.36)}" if "bottom" in pos else f"h*{max(my_top, 0.16)}"
+    font = _find_font(cfg)
+    vf = (
+        f"drawtext=text='{text}'{_font_opt(font)}:fontsize=h*{size}:"
+        f"fontcolor=white@{op:.2f}:borderw=1:bordercolor=black@{op * 0.7:.2f}:"
+        f"shadowx=2:shadowy=2:shadowcolor=black@{op * 0.6:.2f}:x={x}:y={y}"
+    )
+    src = Path(path)
+    tmp = src.with_name(src.stem + "._wm" + src.suffix)
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vf", vf,
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p",
+         "-c:a", "copy", "-movflags", "+faststart", str(tmp)],
+        capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0 or not tmp.is_file() or tmp.stat().st_size < 2000:
+        print(f"[watermark] failed (keeping clip unmarked): {(proc.stderr or '')[-240:]}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return src
+    import os as _os
+    _os.replace(tmp, src)
+    print(f"[watermark] {wm.get('text') or '@officialdevclips'} @ {pos} opacity={op:.2f}")
+    return src
+
+
 def _run_ffmpeg_with_script(
     cmd_prefix: list[str],
     filter_complex: str,
@@ -530,6 +583,24 @@ def build_transformative_montage(
 
 
 def render_clip(
+    source: Path,
+    segment: Segment,
+    cfg: dict[str, Any],
+    *,
+    title: str = "",
+    index: int = 0,
+    video_id: str = "",
+    source_meta: dict[str, Any] | None = None,
+) -> Path | None:
+    out = _render_clip_impl(source, segment, cfg, title=title, index=index,
+                            video_id=video_id, source_meta=source_meta)
+    # Ranking burns its watermark once on the assembled video, not on every part
+    if out and not cfg.get("_no_watermark"):
+        apply_watermark(out, cfg)
+    return out
+
+
+def _render_clip_impl(
     source: Path,
     segment: Segment,
     cfg: dict[str, Any],
@@ -1324,6 +1395,9 @@ def render_clip(
         pass
 
     # Final VIDEO gate — upload rendered clip; require score >= 7
+    if (cfg.get("clips") or {}).get("skip_final_review"):
+        print("[review] skipped (ranking part — saves a Gemini video upload)")
+        return out_path
     try:
         from .video_vlm import final_gate_video
         review = final_gate_video(
@@ -1340,7 +1414,10 @@ def render_clip(
         rev_path = out_path.with_suffix(".review.json")
         rev_path.write_text(__import__("json").dumps(review, indent=2), encoding="utf-8")
         soft = bool((cfg.get("clips") or {}).get("review_soft"))
-        if not review.get("ok") and soft and float(review.get("score") or 0) >= float(
+        infra = any(str(r).startswith(("gate_error", "proxy_fail")) for r in (review.get("reasons") or []))
+        if not review.get("ok") and infra:
+            print("[review] Gemini unavailable (quota/503/403) — keeping clip unreviewed")
+        elif not review.get("ok") and soft and float(review.get("score") or 0) >= float(
                 (cfg.get("clips") or {}).get("review_soft_min", 6.0)):
             print(f"[review] soft-keep (ranking part) score={review.get('score')}")
         elif not review.get("ok"):

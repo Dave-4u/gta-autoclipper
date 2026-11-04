@@ -63,7 +63,16 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
     fmt = cfg["download"].get("format", "bv*[height<=1080]+ba/b[height<=1080]/b")
     # Cap download length for ranking / fast CPU (seconds from start)
     max_s = float((cfg.get("download") or {}).get("max_download_seconds") or 0)
-    suffix = f"_r{int(max_s)}" if max_s > 0 else ""
+    # Long sources (episodes, compilations): don't grab the cold open / OP / channel intro.
+    # Start the section ~35% in (configurable), keeping clear of the ending/credits.
+    sec_start = 0.0
+    dur = float(candidate.duration or 0)
+    dl = cfg.get("download") or {}
+    if max_s > 0 and dur > max_s * float(dl.get("section_long_factor", 3) or 3):
+        frac = float(dl.get("section_start_frac", 0.35) or 0.35)
+        sec_start = max(20.0, min(dur * frac, dur - max_s - 45.0))
+        sec_start = max(0.0, sec_start)
+    suffix = (f"_r{int(max_s)}" + (f"s{int(sec_start)}" if sec_start else "")) if max_s > 0 else ""
     stem = f"{candidate.id}{suffix}"
     # Template: id.ext
     outtmpl = str(out_dir / f"{stem}.%(ext)s")
@@ -121,9 +130,10 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
     ]
     if max_s > 0:
         # Download only the first max_s seconds (yt-dlp section syntax)
-        cmd.extend(["--download-sections", f"*{0}-{max_s:.0f}", "--force-keyframes-at-cuts"])
+        cmd.extend(["--download-sections", f"*{sec_start:.0f}-{sec_start + max_s:.0f}", "--force-keyframes-at-cuts"])
     cmd.append(candidate.url)
-    print(f"[download] fetching {candidate.id}{suffix} (timeout {timeout}s, max_s={max_s or 'full'})…")
+    print(f"[download] fetching {candidate.id}{suffix} (timeout {timeout}s, max_s={max_s or 'full'}"
+          f"{f', from {sec_start:.0f}s of {dur:.0f}s' if sec_start else ''})…")
     def _try_run(run_cmd, run_timeout: int):
         try:
             return procutil.run_tracked(run_cmd, timeout=run_timeout, text=True, check=False), None
@@ -188,21 +198,16 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
         pth = out_dir / f"{candidate.id}.{ext}"
         if not suffix and pth.is_file() and pth.stat().st_size > 10_000:
             return pth
-    # Sometimes yt-dlp uses title-based names; find newest in out_dir
+    # Only ever pick up files for THIS video. (The old "newest file in downloads" fallback
+    # grabbed and renamed another worker's download during parallel ranking probes,
+    # so that item's file vanished → "Error opening input".)
     videos = sorted(
-        [p for p in out_dir.glob("*") if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}],
+        [p for p in out_dir.glob(f"{candidate.id}*")
+         if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"} and p.stat().st_size > 10_000],
         key=lambda x: x.stat().st_mtime,
         reverse=True,
     )
-    if videos and videos[0].stat().st_size > 10_000:
-        # Rename to stable id
-        dest = out_dir / f"{candidate.id}{videos[0].suffix}"
-        if videos[0] != dest:
-            try:
-                videos[0].rename(dest)
-                return dest
-            except OSError:
-                return videos[0]
+    if videos:
         return videos[0]
     err = (proc.stderr or proc.stdout or "unknown error")[:500]
     print(f"[download] failed for {candidate.url}: {err}")

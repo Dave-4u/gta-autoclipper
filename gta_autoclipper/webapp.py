@@ -392,6 +392,37 @@ def create_app(config_path: str | None = None) -> FastAPI:
             _job_thread.start()
         return {"ok": True, "mode": req.mode, "niche": req.niche}
 
+    @app.get("/api/watermarks")
+    def wm_get():
+        from . import watermarks as W
+        return W.load()
+
+    @app.post("/api/watermarks")
+    def wm_post(body: dict):
+        """{enabled?, active?, save?: {name, text}, delete?: name}"""
+        from . import watermarks as W
+        st = W.load()
+        if "enabled" in body:
+            st["enabled"] = bool(body["enabled"])
+        sv = body.get("save") or None
+        if isinstance(sv, dict):
+            text = str(sv.get("text") or "").strip()[:40]
+            name = (str(sv.get("name") or "").strip() or text)[:40]
+            if not text:
+                raise HTTPException(400, "Watermark text is empty")
+            st["presets"][name] = text
+            st["active"] = name
+        dl = str(body.get("delete") or "").strip()
+        if dl and dl in st["presets"]:
+            if len(st["presets"]) <= 1:
+                raise HTTPException(400, "Keep at least one preset")
+            st["presets"].pop(dl)
+        if body.get("active") in st["presets"]:
+            st["active"] = body["active"]
+        if st["active"] not in st["presets"]:
+            st["active"] = next(iter(st["presets"]))
+        return W.save(st)
+
     @app.post("/api/stop")
     def stop():
         _stop_flag.set()

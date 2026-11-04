@@ -60,6 +60,18 @@
         <label class="check"><input id="captions" type="checkbox" checked /> Burn captions</label>
         <label class="check"><input id="fast" type="checkbox" checked /> Fast CPU profile (timeouts + 90s analyze)</label>
 
+        <div class="field wm">
+          <span>WATERMARK</span>
+          <label class="check"><input id="wmOn" type="checkbox" checked /> Burn handle on every render</label>
+          <select id="wmPreset" aria-label="Saved watermarks"></select>
+          <div class="wm-row">
+            <input id="wmText" type="text" maxlength="40" placeholder="@yourhandle" />
+            <button id="wmSave" class="btn mini" type="button">SAVE</button>
+            <button id="wmDel" class="btn mini ghost" type="button" title="Delete preset">DEL</button>
+          </div>
+          <small id="wmMsg" class="wm-msg"></small>
+        </div>
+
         <div class="actions">
           <button id="btnStart" class="btn go" type="button">ARM &amp; RUN</button>
           <button id="btnStop" class="btn stop" type="button" disabled>ABORT</button>
