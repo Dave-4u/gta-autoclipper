@@ -109,7 +109,14 @@ ranking:
   download_seconds: 60
   download_timeout: 180
   analyze_seconds: 75
-  keywords: 3
-  results_per_keyword: 5
+  keywords: 6                 # search queries per ranking (pass 1)
+  results_per_keyword: 25     # ytsearch25 per query
+  max_source_duration: 2400   # only a short section is downloaded
+  seen_fallback_min: 12       # top up with already-seen videos if fewer fresh
+  ignore_seen: false
+  second_pass: true           # wider search if too few usable candidates
+  second_pass_results: 40
+  second_pass_keywords: 8
+  second_pass_max_duration: 7200
   use_trending: false
   search_timeout_seconds: 45

@@ -208,7 +208,7 @@ def search_youtube(
     cookie_args: list[str] | None = None,
 ) -> list[Candidate]:
     """Search YouTube via yt-dlp. Soft-fails on hang; retries without cookies if needed."""
-    n = max(1, min(int(n), 15))
+    n = max(1, min(int(n), 50))  # flat search: ytsearch30 is still one fast request
     t = max(12, min(int(timeout), 55))
     ca = cookie_args or []
     query = f"ytsearch{n}:{keyword}"
@@ -218,7 +218,7 @@ def search_youtube(
         print(f"[discover] retry search without cookies for {keyword!r}")
         entries = _run_ytdlp_json([query], timeout=t, cookie_args=None)
     if not entries and n > 3:
-        entries = _run_ytdlp_json([f"ytsearch5:{keyword}"], timeout=min(35, t), cookie_args=None)
+        entries = _run_ytdlp_json([f"ytsearch{min(n, 10)}:{keyword}"], timeout=min(35, t), cookie_args=None)
     if prefer_date and entries:
         from urllib.parse import quote_plus
 
@@ -356,6 +356,11 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
     ))
     use_trending = bool(search_cfg.get("use_trending", True))
     search_timeout = int(search_cfg.get("search_timeout_seconds", 60) or 60)
+    # ignore_seen: history never filters. seen_fallback_min: if fewer fresh results than this,
+    # top up with already-seen ones (fresh first). 0 = strict (default behaviour).
+    ignore_seen = bool(search_cfg.get("ignore_seen", False))
+    seen_fallback_min = int(search_cfg.get("seen_fallback_min", 0) or 0)
+    seen_pool: list[Candidate] = []
     cookie_args = _cookie_args(cfg)
     if cookie_args:
         print(f"[discover] using cookies: {' '.join(cookie_args)}")
@@ -391,9 +396,9 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
                 print(f"[discover] trending search failed for {kw!r}: {e}")
         skipped_dur = skipped_age = skipped_seen = 0
         for c in batch or []:
-            if history.seen(c.id) or c.id in seen_ids:
-                skipped_seen += 1
+            if c.id in seen_ids:
                 continue
+            was_seen = (not ignore_seen) and history.seen(c.id)
             if c.duration is not None and (c.duration < min_d or c.duration > max_d):
                 skipped_dur += 1
                 continue
@@ -404,6 +409,10 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
                     continue
             c.rank_score = smart_rank_score(c, sort_by=sort_by, niche_id=str(cfg.get("niche_id") or "") or None)
             seen_ids.add(c.id)
+            if was_seen:
+                skipped_seen += 1
+                seen_pool.append(c)
+                continue
             candidates.append(c)
         if (batch or []) and not any(c.source != "links" for c in candidates[-len(batch or []):]):
             print(
@@ -415,6 +424,13 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
     links = [c for c in candidates if c.source == "links"]
     searched = [c for c in candidates if c.source != "links"]
     searched.sort(key=lambda c: c.rank_score, reverse=True)
+    if seen_fallback_min and len(searched) < seen_fallback_min and seen_pool:
+        seen_pool.sort(key=lambda c: c.rank_score, reverse=True)
+        add = seen_pool[: seen_fallback_min - len(searched) + 5]
+        print(f"[discover] only {len(searched)} fresh — adding {len(add)} previously-seen candidate(s)")
+        fresh = searched
+    else:
+        add, fresh = [], None
 
     if len(searched) > 3:
         top = searched[: max(6, len(searched) // 2)]
@@ -422,6 +438,8 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
         random.shuffle(top)
         searched = top + rest
 
+    if fresh is not None:
+        searched = searched + add  # fresh always ahead of seen
     out = links + searched
     print(f"[discover] {len(out)} candidates after smart rank")
     return out

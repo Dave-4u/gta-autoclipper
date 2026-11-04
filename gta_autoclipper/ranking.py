@@ -347,7 +347,11 @@ def _topic_search_queries(niche_id: str, topic: str) -> list[str]:
         else:
             qs += ["streamer reaction funny", "trailer reaction", "twitch funny reaction"]
     elif ttype == "fights" or niche == "anime":
-        qs += ["anime fight scene 4k", "best anime fight moments", "anime edit fight"]
+        qs += [
+            "anime fight edit", "best anime fight scene", "anime fight scene 4k",
+            "best anime fight moments", "anime fight shorts", "epic anime battle",
+            "anime fight compilation", "most hype anime fight",
+        ]
     elif ttype == "gameplay":
         qs += ["GTA 6 gameplay", "gameplay clutch", "gameplay funny"]
     elif ttype == "trailers":
@@ -363,7 +367,15 @@ def _topic_search_queries(niche_id: str, topic: str) -> list[str]:
         if k and k not in seen:
             seen.add(k)
             out.append(q)
-    return out[:8]
+    return out[:12]
+
+
+_WIDE_QUERIES = {
+    "anime": ["anime fight", "anime battle scene", "anime fight amv", "anime best fights ever",
+              "anime fight edit 4k", "demon slayer fight scene", "jujutsu kaisen fight scene",
+              "one piece fight scene", "naruto fight scene", "dragon ball fight scene"],
+    "gta6": ["GTA 6", "GTA 6 trailer reaction", "GTA VI reaction", "GTA 6 gameplay leak"],
+}
 
 
 
@@ -435,14 +447,17 @@ def collect_rank_items(
     rk = dict(cfg.get("ranking") or {})
     # Fast discovery knobs for ranking
     cfg.setdefault("search", {})
-    cfg["search"]["keywords"] = _topic_search_queries(niche_id, topic)[: int(rk.get("keywords", 3) or 3)]
-    cfg["search"]["results_per_keyword"] = int(rk.get("results_per_keyword", 5) or 5)
+    cfg["search"]["keywords"] = _topic_search_queries(niche_id, topic)[: int(rk.get("keywords", 6) or 6)]
+    cfg["search"]["results_per_keyword"] = int(rk.get("results_per_keyword", 25) or 25)
     cfg["search"]["keywords_per_run"] = len(cfg["search"]["keywords"])
     cfg["search"]["use_trending"] = bool(rk.get("use_trending", False))
     cfg["search"]["prefer_date_search"] = False
     cfg["search"]["search_timeout_seconds"] = int(rk.get("search_timeout_seconds", 45) or 45)
     # Cap source duration for ranking shortlist
-    cfg["search"]["max_source_duration"] = int(rk.get("max_source_duration", 480) or 480)
+    # Only a ~60–90s section is downloaded, so long sources are fine
+    cfg["search"]["max_source_duration"] = int(rk.get("max_source_duration", 2400) or 2400)
+    cfg["search"]["ignore_seen"] = bool(rk.get("ignore_seen", False))
+    cfg["search"]["seen_fallback_min"] = int(rk.get("seen_fallback_min", 12) or 0)
     # Ranking is evergreen (best fights ever) — don't drop older uploads / short clips
     cfg["search"]["max_age_days"] = float(rk.get("max_age_days", 0) or 0)
     cfg["search"]["min_source_duration"] = float(rk.get("min_source_duration", 8) or 8)
@@ -462,34 +477,57 @@ def collect_rank_items(
     cfg_rank["analysis"]["whisper_for_highlights"] = False
     cfg_rank["analysis"]["use_whisper"] = False
 
+    def _prefilter(cands: list[Candidate]) -> list[Candidate]:
+        filtered: list[Candidate] = []
+        for cand in cands:
+            if _timed_out():
+                break
+            channel = str((cand.extra or {}).get("channel") or "")
+            desc = str((cand.extra or {}).get("description") or "")
+            tags = list((cand.extra or {}).get("tags") or [])
+            ok, rel, reason = niche_relevance(
+                niche_id, title=cand.title, description=desc, channel=channel, tags=tags,
+            )
+            if not ok:
+                continue
+            ok_t, why_t = topic_matches(
+                ttype, title=cand.title, channel=channel, description=desc, tags=tags, has_face_cam=None
+            )
+            if not ok_t:
+                continue
+            from .meta_signals import is_mashup_title
+            if ttype == "reactions" and is_mashup_title(cand.title):
+                continue
+            cand.rank_score = _meta_prefilter_score(cand, topic=topic, niche_id=niche_id, ttype=ttype)
+            filtered.append(cand)
+        return filtered
+
     t_disc = time.time()
-    # Temporarily disable prefer_date double-fetch via search_youtube monkeypatch flag on cfg
     cands = discover(cfg_rank, hist)
     _log(f"[ranking] {len(cands)} raw candidates in {time.time()-t_disc:.1f}s for topic={topic!r}")
-
-    # Metadata prefilter BEFORE any download
-    filtered: list[Candidate] = []
-    for cand in cands:
-        if _timed_out():
-            break
-        channel = str((cand.extra or {}).get("channel") or "")
-        desc = str((cand.extra or {}).get("description") or "")
-        tags = list((cand.extra or {}).get("tags") or [])
-        ok, rel, reason = niche_relevance(
-            niche_id, title=cand.title, description=desc, channel=channel, tags=tags,
+    filtered = _prefilter(cands)
+    min_parts = int(rk.get("min_parts", 3) or 3)
+    want = max(min_parts, int(rk.get("second_pass_below", n) or n))
+    if len(filtered) < want and not _timed_out() and bool(rk.get("second_pass", True)):
+        _log(f"[ranking] only {len(filtered)} usable after pass 1 (<{want}) — wider pass 2")
+        cfg2 = dict(cfg_rank)
+        cfg2["search"] = dict(cfg_rank["search"])
+        wide = _WIDE_QUERIES.get((niche_id or "").lower(), []) + list(rk.get("wide_queries") or [])
+        kw2 = [q for q in wide + cfg_rank["search"]["keywords"] if q]
+        kw2 = list(dict.fromkeys(kw2))[: int(rk.get("second_pass_keywords", 8) or 8)]
+        cfg2["search"].update(
+            keywords=kw2, keywords_per_run=len(kw2),
+            results_per_keyword=int(rk.get("second_pass_results", 40) or 40),
+            max_source_duration=int(rk.get("second_pass_max_duration", 7200) or 7200),
+            min_source_duration=float(rk.get("second_pass_min_duration", 5) or 5),
+            ignore_seen=True, max_age_days=0,
         )
-        if not ok:
-            continue
-        ok_t, why_t = topic_matches(
-            ttype, title=cand.title, channel=channel, description=desc, tags=tags, has_face_cam=None
-        )
-        if not ok_t:
-            continue
-        from .meta_signals import is_mashup_title
-        if ttype == "reactions" and is_mashup_title(cand.title):
-            continue
-        cand.rank_score = _meta_prefilter_score(cand, topic=topic, niche_id=niche_id, ttype=ttype)
-        filtered.append(cand)
+        have = {c.id for c in filtered}
+        t2 = time.time()
+        extra = [c for c in discover(cfg2, hist) if c.id not in have]
+        f2 = _prefilter(extra)
+        _log(f"[ranking] pass 2: {len(extra)} raw → {len(f2)} usable in {time.time()-t2:.1f}s")
+        filtered += f2
 
     filtered.sort(key=lambda c: c.rank_score, reverse=True)
     probe_n = int(max_probe or rk.get("max_probe", 7) or 7)
