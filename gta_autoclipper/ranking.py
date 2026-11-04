@@ -780,9 +780,9 @@ def _render_rank_segment(
         f"drawtext=text='{rank_txt}':fontsize=72:fontcolor=yellow:"
         f"borderw=5:bordercolor=black:x=36:y=48,"
         f"drawtext=text='{label}':fontsize=36:fontcolor=white:"
-        f"borderw=3:bordercolor=black:x=36:y=130,"
+        f"borderw=3:bordercolor=black:x=36:y=205,"
         f"drawtext=text='{views}':fontsize=30:fontcolor=yellow:"
-        f"borderw=3:bordercolor=black:x=36:y=178"
+        f"borderw=3:bordercolor=black:x=36:y=252"
     )
     cmd = [
         "ffmpeg", "-y", "-i", str(base),
@@ -1121,8 +1121,8 @@ def build_ranking_video(
         )
         n_dlg = _ass_dialogue_count(base.with_suffix(".ass"))
         if n_dlg <= 0:
-            _log(f"[ranking] ASSERT FAIL #{item.rank} {item.label}: ASS Dialogue count is 0")
-            return None
+            # Music-only fight scenes legitimately have no dialogue — keep the part, just no captions
+            _log(f"[ranking] note #{item.rank} {item.label}: no dialogue to caption (music/SFX only) — keeping part")
         fixed = work / f"rank_{item.rank:02d}_{item.candidate.id}_final.mp4"
         # Re-render overlay from original source clip via _render_rank_segment again would
         # re-call Gemini; instead redraw number/label on the already-rendered base.
@@ -1135,9 +1135,9 @@ def build_ranking_video(
             f"drawtext=text='{rank_txt}':fontsize=72:fontcolor=yellow:"
             f"borderw=5:bordercolor=black:x=36:y=48,"
             f"drawtext=text='{label}':fontsize=36:fontcolor=white:"
-            f"borderw=3:bordercolor=black:x=36:y=130,"
+            f"borderw=3:bordercolor=black:x=36:y=205,"
             f"drawtext=text='{views}':fontsize=30:fontcolor=yellow:"
-            f"borderw=3:bordercolor=black:x=36:y=178"
+            f"borderw=3:bordercolor=black:x=36:y=252"
         )
         pr = subprocess.run(
             ["ffmpeg", "-y", "-i", str(base), "-vf", vf,
