@@ -860,6 +860,10 @@ def _render_rank_segment(
     )
     if not base or not base.is_file():
         return None
+    # Rank chrome (#N / label / views) is burned ONCE in the final pass with the final numbers.
+    # Burning it here too stacked an interim rank under the final one (e.g. "#1" over "#-1" → "#11").
+    if True:
+        return base
 
     # Burn rank overlays on top
     width = int((cfg.get("clips") or {}).get("width", 1080))
