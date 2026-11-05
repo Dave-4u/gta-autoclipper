@@ -109,7 +109,11 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
         # Prefer lighter progressive formats so section downloads finish in time
         fmt = (cfg.get("download") or {}).get(
             "format_fast",
-            "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720]/bv*[height<=720]+ba/worst",
+            # Prefer real 720p+ when available; never grab sub-480p trash for ranking/clips
+            "bv*[height>=720][height<=1080][ext=mp4]+ba[ext=m4a]/"
+            "bv*[height>=720][height<=1080]+ba/"
+            "b[height>=720][height<=1080]/"
+            "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]",
         )
     cmd = [
         "yt-dlp",
@@ -149,7 +153,8 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
         light = list(cmd)
         try:
             fi = light.index("-f")
-            light[fi + 1] = "b[height<=480]/worst"
+            # Still refuse sub-480p — better to fail than ship mush
+            light[fi + 1] = "b[height<=720][height>=480]/bv*[height<=720][height>=480]+ba/b[height<=720]"
         except ValueError:
             pass
         # Drop concurrent-fragments for flaky links
@@ -184,20 +189,42 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
         if proc.returncode != 0 and _is_bot_wall(err_blob):
             print("[download] YouTube bot check on retry — skip")
             return None
+    def _reject_lowres(pth: Path) -> Path | None:
+        try:
+            import json as _j
+            pr = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "json", str(pth)],
+                capture_output=True, text=True, check=False,
+            )
+            st = (_j.loads(pr.stdout).get("streams") or [{}])[0]
+            w, h = int(st.get("width") or 0), int(st.get("height") or 0)
+            short = min(w, h)
+            if short and short < 480:
+                print(f"[download] REJECT low-res {w}x{h} (<480p) for {pth.name}")
+                try: pth.unlink(missing_ok=True)
+                except Exception: pass
+                return None
+            if short and short < 720:
+                print(f"[download] WARN sub-720p source {w}x{h} — keeping but crop quality limited")
+        except Exception as e:
+            print(f"[download] res probe skip: {e}")
+        return pth
+
     # Prefer printed filepath
     path_line = (proc.stdout or "").strip().splitlines()
     if path_line:
         pth = Path(path_line[-1].strip())
         if pth.is_file():
-            return pth
+            return _reject_lowres(pth)
     # Fallback scan
     for ext in ("mp4", "mkv", "webm", "mov"):
         pth = out_dir / f"{stem}.{ext}"
         if pth.is_file() and pth.stat().st_size > 10_000:
-            return pth
+            return _reject_lowres(pth)
         pth = out_dir / f"{candidate.id}.{ext}"
         if not suffix and pth.is_file() and pth.stat().st_size > 10_000:
-            return pth
+            return _reject_lowres(pth)
     # Only ever pick up files for THIS video. (The old "newest file in downloads" fallback
     # grabbed and renamed another worker's download during parallel ranking probes,
     # so that item's file vanished → "Error opening input".)
@@ -208,7 +235,7 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
         reverse=True,
     )
     if videos:
-        return videos[0]
+        return _reject_lowres(videos[0])
     err = (proc.stderr or proc.stdout or "unknown error")[:500]
     print(f"[download] failed for {candidate.url}: {err}")
     return None

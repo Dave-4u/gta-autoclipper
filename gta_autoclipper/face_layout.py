@@ -598,8 +598,8 @@ def fill_crop_filter(
 
 
 def smart_frame(source, start: float, end: float) -> tuple[str, float]:
-    """(pre_crop, action_cx): strip baked letterbox/pillarbox bars and find where the action is
-    horizontally (frame-difference centroid), so the 9:16 crop follows the fight."""
+    """(pre_crop, action_cx): strip baked bars; centre crop on face if found, else motion.
+    cx is clamped to [0.28, 0.72] so the subject is never shoved off the 9:16 edge."""
     import re as _re
     import subprocess as _sp
     dur = max(1.0, float(end) - float(start))
@@ -621,23 +621,57 @@ def smart_frame(source, start: float, end: float) -> tuple[str, float]:
     except Exception as e:
         print(f"[layout] cropdetect skip: {e}")
     cx = 0.5
+    face_cx = None
+    # Prefer OpenCV face cascade when available (cheap, CPU-only)
     try:
+        import cv2  # type: ignore
         import numpy as np
-        vf = (f"crop={pre}," if pre else "") + "fps=3,scale=160:90,format=gray"
+        mid = start + min(dur, 8.0) * 0.4
         pr = _sp.run(
-            ["ffmpeg", "-v", "error", "-ss", f"{start:.2f}", "-t", f"{min(dur, 10):.2f}", "-i", str(source),
-             "-vf", vf, "-f", "rawvideo", "-"],
-            capture_output=True, check=False, timeout=60,
+            ["ffmpeg", "-v", "error", "-ss", f"{mid:.2f}", "-i", str(source), "-frames:v", "1",
+             "-vf", (f"crop={pre}," if pre else "") + "scale=640:-1,format=gray",
+             "-f", "rawvideo", "-"],
+            capture_output=True, check=False, timeout=30,
         )
-        buf = np.frombuffer(pr.stdout or b"", dtype=np.uint8)
-        n = buf.size // (160 * 90)
-        if n >= 3:
-            fr = buf[: n * 160 * 90].reshape(n, 90, 160).astype(np.int16)
-            diff = np.abs(np.diff(fr, axis=0)).sum(axis=(0, 1)).astype(np.float64)
-            if diff.sum() > 0:
-                c = float((diff * np.arange(160)).sum() / diff.sum()) / 159.0
-                cx = 0.5 + 0.8 * (c - 0.5)  # gentle follow, avoids over-cropping
-                print(f"[layout] action centre x={c:.2f} → crop cx={cx:.2f}")
+        # Infer height from buffer (640 wide)
+        if pr.stdout and len(pr.stdout) >= 640:
+            hgt = len(pr.stdout) // 640
+            img = np.frombuffer(pr.stdout[: 640 * hgt], dtype=np.uint8).reshape(hgt, 640)
+            if not hasattr(cv2, "CascadeClassifier") or not hasattr(cv2, "data"):
+                raise RuntimeError("opencv incomplete")
+            cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+            faces = cascade.detectMultiScale(img, scaleFactor=1.15, minNeighbors=4, minSize=(40, 40))
+            if len(faces):
+                # Largest face
+                x, y, fw, fh = max(faces, key=lambda r: r[2] * r[3])
+                face_cx = (x + fw / 2) / 640.0
+                print(f"[layout] face centre x={face_cx:.2f} (n={len(faces)})")
     except Exception as e:
-        print(f"[layout] motion centroid skip: {e}")
-    return pre, max(0.0, min(1.0, cx))
+        print(f"[layout] face detect skip: {e}")
+    if face_cx is not None:
+        cx = face_cx
+    else:
+        try:
+            import numpy as np
+            vf = (f"crop={pre}," if pre else "") + "fps=3,scale=160:90,format=gray"
+            pr = _sp.run(
+                ["ffmpeg", "-v", "error", "-ss", f"{start:.2f}", "-t", f"{min(dur, 10):.2f}", "-i", str(source),
+                 "-vf", vf, "-f", "rawvideo", "-"],
+                capture_output=True, check=False, timeout=60,
+            )
+            buf = np.frombuffer(pr.stdout or b"", dtype=np.uint8)
+            n = buf.size // (160 * 90)
+            if n >= 3:
+                fr = buf[: n * 160 * 90].reshape(n, 90, 160).astype(np.int16)
+                diff = np.abs(np.diff(fr, axis=0)).sum(axis=(0, 1)).astype(np.float64)
+                if diff.sum() > 0:
+                    c = float((diff * np.arange(160)).sum() / diff.sum()) / 159.0
+                    # Mild follow — never yank the crop to the edge
+                    cx = 0.5 + 0.45 * (c - 0.5)
+                    print(f"[layout] action centre x={c:.2f} → crop cx={cx:.2f}")
+        except Exception as e:
+            print(f"[layout] motion centroid skip: {e}")
+    # Hard clamp: leave the subject inside the 9:16 frame
+    cx = max(0.28, min(0.72, float(cx)))
+    return pre, cx
+

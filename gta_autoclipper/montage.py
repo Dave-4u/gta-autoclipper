@@ -47,6 +47,53 @@ def _has_audio(path: Path) -> bool:
     return bool((pr.stdout or "").strip())
 
 
+def _snap_to_silence(path: Path, t: float, *, window: float = 0.6, prefer: str = "near") -> float:
+    """Nudge a cut point to the quietest nearby sample so we don't chop mid-word."""
+    import subprocess as _sp
+    import numpy as np
+    t0 = max(0.0, t - window)
+    dur = window * 2
+    try:
+        pr = _sp.run(
+            ["ffmpeg", "-v", "error", "-ss", f"{t0:.3f}", "-t", f"{dur:.3f}", "-i", str(path),
+             "-vn", "-ac", "1", "-ar", "8000", "-f", "f32le", "-"],
+            capture_output=True, check=False, timeout=20,
+        )
+        a = np.frombuffer(pr.stdout or b"", dtype=np.float32)
+        if a.size < 200:
+            return t
+        # 20ms hop energy
+        hop = 160
+        energies = [float(np.sqrt(np.mean(a[i:i+hop] ** 2) + 1e-12)) for i in range(0, len(a) - hop, hop)]
+        if not energies:
+            return t
+        # Quietest sample near the middle (original t)
+        mid = int((t - t0) / (hop / 8000.0))
+        lo = max(0, mid - 8); hi = min(len(energies), mid + 9)
+        local = energies[lo:hi]
+        if not local:
+            return t
+        best = lo + int(np.argmin(local))
+        return t0 + best * (hop / 8000.0)
+    except Exception:
+        return t
+
+
+def _mean_luma(path: Path, t: float) -> float:
+    """0–255 mean luma of one frame — used to reject black intro freezes."""
+    import subprocess as _sp, numpy as np
+    try:
+        pr = _sp.run(
+            ["ffmpeg", "-v", "error", "-ss", f"{max(0,t):.2f}", "-i", str(path), "-frames:v", "1",
+             "-vf", "scale=160:90,format=gray", "-f", "rawvideo", "-"],
+            capture_output=True, check=False, timeout=15,
+        )
+        buf = np.frombuffer(pr.stdout or b"", dtype=np.uint8)
+        return float(buf.mean()) if buf.size else 0.0
+    except Exception:
+        return 0.0
+
+
 def energy_curve(path: Path, dur: float) -> tuple[np.ndarray, list[float]]:
     """Per-second energy = loudness + motion + scene-change density. One cheap pass each."""
     from .analyze import extract_loudness_peaks
@@ -146,25 +193,35 @@ def build_moment_montage(source: Path, cfg: dict[str, Any], *, ranking_part: boo
     if not m.get("enabled", True):
         return None
     if ranking_part:
-        lo, hi = m.get("ranking_total_seconds", [20, 25])
+        lo, hi = m.get("ranking_total_seconds", [18, 25])
         n_lo, n_hi = m.get("ranking_segments", [2, 4])
+        min_total = float(m.get("ranking_min_seconds", 18) or 18)
     else:
         lo, hi = m.get("total_seconds", [45, 75])
         n_lo, n_hi = m.get("segments", [4, 7])
-    s_lo, s_hi = m.get("segment_seconds", [4, 12])
+        min_total = float(m.get("min_seconds", 30) or 30)
+    s_lo, s_hi = m.get("segment_seconds", [5, 12])
     dur, w, h = _probe(source)
     if dur <= 0 or w <= 0:
         return None
+    if h < 480 and w < 480:
+        print(f"[montage] reject low-res source {w}x{h} (<480p)")
+        return None
     td = float(m.get("transition_seconds", 0.3))
-    # Fit to what the source can give (short sources → shorter montage)
-    target = min(float(hi), max(float(lo), (float(lo) + float(hi)) / 2))
-    target = min(target, dur * 0.7)
+    # Never shrink below the hard floor — reject the source instead of outputting a 6s stub
+    if dur < min_total + 2:
+        print(f"[montage] source too short ({dur:.0f}s < min {min_total:.0f}s) — skip")
+        return None
+    target = min(float(hi), max(float(lo), float(min_total), (float(lo) + float(hi)) / 2))
+    target = min(target, max(min_total, dur * 0.75))
     n_seg = int(max(n_lo, min(n_hi, round(target / 9.0))))
     seg_len = max(float(s_lo), min(float(s_hi), target / n_seg + td))
-    while n_seg > n_lo and seg_len * n_seg > dur * 0.8:
-        n_seg -= 1
-    if seg_len * n_seg > dur * 0.85 or n_seg < 2:
-        print(f"[montage] source too short ({dur:.0f}s) for {n_seg}×{seg_len:.1f}s — single stretch")
+    # Prefer more shorter segments over fewer that leave us under the floor
+    while n_seg * (seg_len - td) < min_total and n_seg < n_hi:
+        n_seg += 1
+        seg_len = max(float(s_lo), min(float(s_hi), target / n_seg + td))
+    if n_seg * (seg_len - td) < min_total * 0.9 or n_seg < 2:
+        print(f"[montage] cannot hit min {min_total:.0f}s from {dur:.0f}s source — skip")
         return None
     moments = pick_moments(source, cfg, n_seg=n_seg, seg_len=seg_len, anchor=anchor)
     if len(moments) < 2:
@@ -178,24 +235,61 @@ def build_moment_montage(source: Path, cfg: dict[str, Any], *, ranking_part: boo
     inputs: list[str] = []
     fc: list[str] = []
     seg_out: list[float] = []
+    # Snap cut points to nearby silence so we don't chop mid-word
+    snapped = []
+    for st, en in moments:
+        st2 = _snap_to_silence(source, st)
+        en2 = _snap_to_silence(source, en)
+        if en2 - st2 < float(s_lo) * 0.7:
+            en2 = st2 + (en - st)
+        snapped.append((round(st2, 2), round(en2, 2)))
+    moments = snapped
+    # Drop moments that are mostly black / blank (causes black VO freezes and trashy cuts)
+    kept = []
+    for st, en in moments:
+        mid = (st + en) / 2
+        lu = _mean_luma(source, mid)
+        if lu < 14:
+            print(f"[montage] drop blackish moment {st:.0f}-{en:.0f}s (luma={lu:.0f})")
+            continue
+        kept.append((st, en))
+    if len(kept) < 2:
+        print(f"[montage] too few non-black moments ({len(kept)}) — skip")
+        return None
+    moments = kept
+
+    from .face_layout import smart_frame
+    fade = float(m.get("audio_fade_seconds", 0.15) or 0.15)
     for i, (st, en) in enumerate(moments):
         inputs += ["-ss", f"{st:.2f}", "-t", f"{en - st:.2f}", "-i", str(source)]
         sp = rng.uniform(*m.get("speed_range", [1.03, 1.08]))
-        z = rng.uniform(1.03, 1.09)
-        bx = rng.uniform(-0.03, 0.03)
+        z = rng.uniform(1.02, 1.06)  # mild zoom — big zooms + random bias cut faces off
+        # Subject-aware horizontal crop (face > motion > centre); NO random edge shove
+        try:
+            _pre, cx = smart_frame(source, st, en)
+        except Exception:
+            cx = 0.5
+        bx = (cx - 0.5) * 0.35  # map face centre into a gentle crop bias
+        bx = max(-0.08, min(0.08, bx))
         flip = ",hflip" if (mirror_ok and i % 2 == 1) else ""
-        sat = rng.uniform(1.04, 1.14)
-        con = rng.uniform(1.02, 1.08)
-        hue = rng.uniform(-4, 4)
+        sat = rng.uniform(1.02, 1.10)
+        con = rng.uniform(1.01, 1.06)
+        hue = rng.uniform(-2, 2)
         fc.append(
             f"[{i}:v]scale={ow}:{oh},setsar=1,fps=30,"
-            f"scale=iw*{z:.3f}:ih*{z:.3f},crop={ow}:{oh}:(iw-{ow})/2+iw*{bx:.3f}:(ih-{oh})/2{flip},"
+            f"scale=iw*{z:.3f}:ih*{z:.3f},"
+            f"crop={ow}:{oh}:(iw-{ow})/2+iw*{bx:.3f}:(ih-{oh})/2{flip},"
             f"eq=contrast={con:.3f}:saturation={sat:.3f},hue=h={hue:.1f},"
             f"setpts=(PTS-STARTPTS)/{sp:.3f},fps=30,settb=1/30,format=yuv420p[v{i}]"
         )
         if audio:
-            fc.append(f"[{i}:a]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
-                      f"asetpts=PTS-STARTPTS,atempo={sp:.3f}[a{i}]")
+            seg_d = (en - st) / sp
+            afade = (f",afade=t=in:st=0:d={fade:.2f},"
+                     f"afade=t=out:st={max(0.05, seg_d - fade):.2f}:d={fade:.2f}")
+            fc.append(
+                f"[{i}:a]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                f"asetpts=PTS-STARTPTS,atempo={sp:.3f}{afade}[a{i}]"
+            )
         seg_out.append((en - st) / sp)
     # Chain xfade/acrossfade
     vlab, alab, off = "v0", "a0", seg_out[0]
@@ -227,4 +321,9 @@ def build_moment_montage(source: Path, cfg: dict[str, Any], *, ranking_part: boo
     print(f"[montage] {len(moments)} moments "
           + ", ".join(f"{a:.0f}-{b:.0f}s" for a, b in moments)
           + f" → {md:.1f}s ({'ranking part' if ranking_part else 'clip'}, xfade {td:.2f}s)")
+    if md + 0.3 < min_total:
+        print(f"[montage] REJECT under-length result {md:.1f}s < {min_total:.0f}s")
+        try: out.unlink(missing_ok=True)
+        except Exception: pass
+        return None
     return out

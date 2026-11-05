@@ -1088,7 +1088,13 @@ def build_ranking_video(
         n = len(items)
     if items and all((it.candidate.extra or {}).get("origin") == "fan" for it in items) \
             and not re.search(r"(?i)fan[\s-]*made|fanmade", topic):
-        topic = re.sub(r"(?i)^(top\s*\d+\s+)(anime\s+)?", lambda m: f"{m.group(1)}Fan-Made {m.group(2) or 'Anime '}", topic) \
+        niche_word = {"anime": "Anime", "animation": "Animation", "gta6": "GTA", "gaming": "Gaming"}.get(
+            (niche_id or "").lower(), ""
+        )
+        def _fan_title(m):
+            mid = m.group(2) or ((niche_word + " ") if niche_word else "")
+            return f"{m.group(1)}Fan-Made {mid}"
+        topic = re.sub(r"(?i)^(top\s*\d+\s+)(anime\s+|animation\s+)?", _fan_title, topic) \
             if re.match(r"(?i)top\s*\d+", topic) else f"Top {n} Fan-Made {topic}"
         _log(f"[ranking] fan-made set → topic={topic!r}")
     if False:

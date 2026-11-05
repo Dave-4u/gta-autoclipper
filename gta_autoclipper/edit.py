@@ -661,6 +661,26 @@ def _render_clip_impl(
         print(f"[montage] skip: {_e}")
     if not _mont_done:
         segment = _cap_segment(segment, cfg)
+        # Still enforce the length floor even without a montage (short sources → skip, don't ship 6s trash)
+        _floor = float((cfg.get("montage") or {}).get(
+            "ranking_min_seconds" if clips.get("ranking_part") else "min_seconds"
+        ) or (18 if clips.get("ranking_part") else 30))
+        # Try to expand the window toward the middle of the source if it's under the floor
+        try:
+            from .montage import _probe as _mp
+            _sd = _mp(source)[0]
+        except Exception:
+            _sd = segment.end
+        need = _floor - (segment.end - segment.start)
+        if need > 0.5 and _sd > segment.end + 1:
+            expand = min(need, max(0.0, _sd - segment.end - 0.3))
+            segment = type(segment)(start=segment.start, end=segment.end + expand,
+                                    score=segment.score, reason=(segment.reason or "") + "+expand")
+            print(f"[edit] expanded window to {segment.end - segment.start:.1f}s (floor {_floor:.0f}s)")
+        if (segment.end - segment.start) + 0.3 < _floor:
+            print(f"[edit] REJECT source too short for floor {_floor:.0f}s "
+                  f"(window {segment.end - segment.start:.1f}s, source~{_sd:.0f}s)")
+            return None
     # Motion / silence gate on the source window (skip frozen trailer / dead air)
     try:
         from .window_gate import window_ok
@@ -1197,13 +1217,38 @@ def _render_clip_impl(
                     intro_dur = min(2.5, max(1.5, d1 + 0.05))
                     print(f"[edit] VO resampled 48k stereo dur={d1:.3f}s")
 
-                # Title-card intro: blurred first frame + dark veil + huge centered header
-                # (VO speaks the same header text). Clearly distinct from the reaction body.
+                # Title-card intro: NEVER freeze a black/blank first frame.
+                # Pick the brightest sharp-ish frame in the first ~4s; if still dark, play
+                # real motion under the VO instead of a frozen still.
                 frame0 = td_path / "frame0.png"
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", str(out_path), "-frames:v", "1", "-q:v", "2", str(frame0)],
-                    capture_output=True, check=False,
-                )
+                best_t, best_luma = 0.0, -1.0
+                try:
+                    import numpy as _np
+                    for _t in (0.4, 0.8, 1.2, 1.8, 2.5, 3.2):
+                        _pr = subprocess.run(
+                            ["ffmpeg", "-v", "error", "-ss", f"{_t:.2f}", "-i", str(out_path),
+                             "-frames:v", "1", "-vf", "scale=160:90,format=gray", "-f", "rawvideo", "-"],
+                            capture_output=True, check=False, timeout=15,
+                        )
+                        _buf = _np.frombuffer(_pr.stdout or b"", dtype=_np.uint8)
+                        if _buf.size:
+                            _lu = float(_buf.mean())
+                            # Prefer non-black AND somewhat detailed (std as sharpness proxy)
+                            _sc = _lu + 0.4 * float(_buf.std())
+                            if _sc > best_luma:
+                                best_luma, best_t = _sc, _t
+                except Exception as _e:
+                    print(f"[edit] intro frame scan skip: {_e}")
+                use_motion_intro = best_luma < 18  # essentially black across candidates
+                if not use_motion_intro:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-ss", f"{best_t:.2f}", "-i", str(out_path),
+                         "-frames:v", "1", "-q:v", "2", str(frame0)],
+                        capture_output=True, check=False,
+                    )
+                    print(f"[edit] intro freeze @ {best_t:.1f}s luma~{best_luma:.0f}")
+                else:
+                    print("[edit] intro: body starts dark — playing motion under VO (no black freeze)")
                 # Title-card intro via textfile + filter script (Windows-safe)
                 hw = hook_display.split()
                 header_files = []
@@ -1229,7 +1274,7 @@ def _render_clip_impl(
                 intro_vf = (
                     f"scale={width}:{height}:force_original_aspect_ratio=increase,"
                     f"crop={width}:{height},"
-                    f"gblur=sigma=18,eq=brightness=-0.25:saturation=0.7,"
+                    f"gblur=sigma=8,eq=brightness=-0.15:saturation=0.85,"
                     f"drawbox=x=0:y=ih*0.38:w=iw:h=ih*0.24:color=black@0.55:t=fill,"
                     f"{title_draw},"
                     f"fps=30,format=yuv420p,setsar=1"
@@ -1241,12 +1286,23 @@ def _render_clip_impl(
                     f"asetpts=PTS-STARTPTS[a]"
                 )
                 intro_script = td_path / "intro_fc.txt"
-                pr_i = _run_ffmpeg_with_script(
-                    [
+                if use_motion_intro:
+                    # Soft-blur moving footage under the title card (no black still)
+                    intro_prefix = [
+                        "ffmpeg", "-y",
+                        "-ss", "0", "-t", f"{intro_dur:.3f}", "-i", str(out_path),
+                        "-i", str(vo48),
+                    ]
+                    # Tone down blur a bit so the subject is still readable
+                    intro_fc = intro_fc.replace("gblur=sigma=18", "gblur=sigma=10")
+                else:
+                    intro_prefix = [
                         "ffmpeg", "-y",
                         "-loop", "1", "-framerate", "30", "-t", f"{intro_dur:.3f}", "-i", str(frame0),
                         "-i", str(vo48),
-                    ],
+                    ]
+                pr_i = _run_ffmpeg_with_script(
+                    intro_prefix,
                     intro_fc,
                     [
                         "-map", "[v]", "-map", "[a]",
@@ -1436,6 +1492,89 @@ def _render_clip_impl(
         )
     except Exception:
         pass
+
+    # ---- Quality floor (length + header match) ----
+    try:
+        import json as _jq
+        _pr = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(out_path)],
+            capture_output=True, text=True, check=False,
+        )
+        _odur = float(((_jq.loads(_pr.stdout).get("format") or {}).get("duration")) or 0)
+    except Exception:
+        _odur = 0.0
+    if cfg.get("clips", {}).get("ranking_part"):
+        _min = float((cfg.get("montage") or {}).get("ranking_min_seconds") or 18)
+    else:
+        _min = float((cfg.get("montage") or {}).get("min_seconds")
+                     or (cfg.get("clips") or {}).get("min_output_seconds") or 30)
+    if _odur + 0.25 < _min:
+        print(f"[edit] REJECT under-length output {_odur:.1f}s < {_min:.0f}s")
+        try: out_path.unlink(missing_ok=True)
+        except Exception: pass
+        return None
+    # Reject clips with a black intro or long black stretches (Dave's Homelander stub)
+    try:
+        prb = subprocess.run(
+            ["ffmpeg", "-i", str(out_path), "-vf", "blackdetect=d=0.25:pix_th=0.12", "-f", "null", "-"],
+            capture_output=True, text=True, check=False, timeout=90,
+        )
+        black_intro = False
+        black_total = 0.0
+        for ln in (prb.stderr or "").splitlines():
+            if "black_start:" not in ln:
+                continue
+            # black_start:X black_end:Y black_duration:Z
+            parts = {kv.split(":")[0].strip(): float(kv.split(":")[1]) for kv in ln.split() if ":" in kv and kv.split(":")[0].startswith("black_")}
+            bs, bd = parts.get("black_start", 0), parts.get("black_duration", 0)
+            black_total += bd
+            if bs < 2.5 and bd >= 0.4:
+                black_intro = True
+        if black_intro or black_total >= 2.0:
+            print(f"[edit] REJECT black content intro={black_intro} total_black={black_total:.1f}s")
+            try: out_path.unlink(missing_ok=True)
+            except Exception: pass
+            return None
+    except Exception as _be:
+        print(f"[edit] blackdetect skip: {_be}")
+    # Soft outro fade so we don't end mid-word / mid-slash
+    try:
+        from .perf import encode_args, run_ffmpeg
+        _fade = float((cfg.get("clips") or {}).get("outro_fade_seconds") or 0.2)
+        if _fade > 0 and _odur > 3:
+            _faded = out_path.with_name(out_path.stem + "._fade" + out_path.suffix)
+            _st = max(0.05, _odur - _fade)
+            prf = run_ffmpeg(
+                ["ffmpeg", "-y", "-i", str(out_path),
+                 "-af", f"afade=t=out:st={_st:.2f}:d={_fade:.2f}",
+                 "-c:v", "copy", "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "160k",
+                 "-movflags", "+faststart", str(_faded)],
+                label="outro-fade",
+            )
+            if prf.returncode == 0 and _faded.is_file():
+                import shutil as _shf
+                _shf.move(str(_faded), str(out_path))
+    except Exception as _fe:
+        print(f"[edit] outro fade skip: {_fe}")
+    # Header must match on-screen content (Gemini self-review)
+    try:
+        from .scene_vlm import self_review
+        _hdr = ""
+        try:
+            import json as _jh
+            _hdr = str((_jh.loads(out_path.with_suffix(".hook.json").read_text()).get("hook")) or title or "")
+        except Exception:
+            _hdr = title or ""
+        if _hdr.strip() and not cfg.get("_skip_header_match"):
+            rev = self_review(out_path, _hdr, cfg=cfg, title=title or "")
+            print(f"[edit] header-match ok={rev.get('ok')} reasons={rev.get('reasons')} desc={str(rev.get('desc',''))[:120]}")
+            if not rev.get("ok") and not rev.get("skipped"):
+                print(f"[edit] REJECT header mismatch for {_hdr!r}")
+                try: out_path.unlink(missing_ok=True)
+                except Exception: pass
+                return None
+    except Exception as _he:
+        print(f"[edit] header-match skip: {_he}")
 
     # Final VIDEO gate — upload rendered clip; require score >= 7
     if (cfg.get("clips") or {}).get("skip_final_review"):

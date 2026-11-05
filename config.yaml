@@ -135,9 +135,12 @@ montage:
   enabled: true
   total_seconds: [45, 75]          # normal clips
   segments: [4, 7]
-  ranking_total_seconds: [20, 25]  # each ranking part
+  ranking_total_seconds: [18, 26]  # each ranking part
+  ranking_min_seconds: 18           # hard floor — never ship a 6s stub
+  min_seconds: 30                   # hard floor for normal clips
   ranking_segments: [2, 4]
-  segment_seconds: [4, 12]
+  segment_seconds: [5, 12]
+  audio_fade_seconds: 0.15
   transition_seconds: 0.3          # xfade + audio crossfade (whip/zoom/flash/fade mix)
   min_gap_seconds: 2.0             # spread moments apart
   skip_intro_frac: 0.06            # long sources: skip OP / intro
@@ -157,8 +160,10 @@ job:
 performance:
   low_cpu: auto              # auto | true | false
   auto_cpu_count: 8
-  preset: ultrafast          # libx264 preset when low_cpu
-  crf: 23
+  preset: veryfast           # ultrafast looked trashy; veryfast still fast on slow CPUs
+  crf: 20
+  maxrate: 3500k              # floor so dark/anime motion isn't crushed
+  bufsize: 7000k
   width: 720                 # render 720x1280 on low_cpu (still 9:16 full-screen)
   height: 1280
   whisper_model: tiny        # faster-whisper tiny int8

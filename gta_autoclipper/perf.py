@@ -57,8 +57,8 @@ def apply_performance(cfg: dict[str, Any]) -> dict[str, Any]:
     low = detect_low_cpu(cfg)
     perf["low_cpu"] = low
     if low:
-        preset = str(perf.get("preset") or "ultrafast")
-        crf = int(perf.get("crf") or 23)
+        preset = str(perf.get("preset") or "veryfast")  # ultrafast looked trashy on Dave's clips
+        crf = int(perf.get("crf") or 20)
         width = int(perf.get("width") or 720)
         height = int(perf.get("height") or 1280)
         whisper = str(perf.get("whisper_model") or "tiny")
@@ -115,15 +115,21 @@ def profile(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
         return dict(cfg["performance"])
     if _PROFILE:
         return dict(_PROFILE)
-    return {"low_cpu": True, "preset": "ultrafast", "crf": 23, "threads": "0"}
+    return {"low_cpu": True, "preset": "veryfast", "crf": 20, "threads": "0"}
 
 
 def encode_args(cfg: dict[str, Any] | None = None, *, audio_copy: bool = False) -> list[str]:
     p = profile(cfg)
+    crf = int(p.get("crf") or 20)
+    # Floor bitrate so dark/motiony anime isn't crushed into mush at CRF 20–23
+    w = int(p.get("width") or 720); h = int(p.get("height") or 1280)
+    maxrate = str(p.get("maxrate") or (f"{max(2500, int(w * h * 2.2 / 1000))}k"))
+    bufsize = str(p.get("bufsize") or (f"{max(5000, int(w * h * 4.4 / 1000))}k"))
     args = [
         "-c:v", "libx264",
-        "-preset", str(p.get("preset") or "ultrafast"),
-        "-crf", str(p.get("crf") or 23),
+        "-preset", str(p.get("preset") or "veryfast"),
+        "-crf", str(crf),
+        "-maxrate", maxrate, "-bufsize", bufsize,
         "-pix_fmt", "yuv420p",
         "-threads", str(p.get("threads") or "0"),
         "-movflags", "+faststart",
