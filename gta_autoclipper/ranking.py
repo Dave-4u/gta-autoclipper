@@ -24,6 +24,7 @@ from .edit import _escape_drawtext, _fit_header, render_clip
 from .entities import extract_entities, event_summary, validate_copy
 from .history import History
 from .niches import apply_niche_to_config, niche_relevance
+from .style_kind import classify_candidates, classify_style_kind, vision_style_check
 from .voiceover import make_intro_vo
 
 
@@ -109,6 +110,16 @@ def suggest_topic(niche_id: str, n: int = 5, cfg: dict[str, Any] | None = None) 
             # Sanitize leak-heavy seeds for gta
             if niche == "gta6" and "leak" in topic.lower():
                 topic = f"Top {n} GTA 6 trailer moments"
+    # Force correct niche word in topic (never "Anime" on animation, never "Cartoon" on anime)
+    if niche == "animation":
+        topic = re.sub(r"(?i)\banime\b", "Animation", topic)
+        if not re.search(r"(?i)animation|cartoon|disney|pixar", topic):
+            topic = f"Top {n} Animation moments"
+    elif niche == "anime":
+        topic = re.sub(r"(?i)\b(disney|pixar|cartoon network)\b", "anime", topic)
+        topic = re.sub(r"(?i)\bcartoons?\b", "anime", topic)
+        if not re.search(r"(?i)\banime\b", topic):
+            topic = f"Top {n} anime moments"
     return topic
 
 
@@ -163,6 +174,7 @@ def topic_matches(
     description: str = "",
     tags: list[str] | None = None,
     has_face_cam: bool | None = None,
+    topic: str = "",
 ) -> tuple[bool, str]:
     """Strict topic relevance. Returns (ok, reason)."""
     blob = f"{title} {channel} {description} {' '.join(tags or [])}".lower()
@@ -236,7 +248,7 @@ def topic_matches(
         return True, "ok"
 
     # general: reject pure official trailers unless topic asks for them
-    if is_official and "trailer" not in (topic or "").lower():
+    if is_official and "trailer" not in (topic or "").lower() and "moment" not in (topic or "").lower():
         return False, "official_trailer"
     return True, "ok"
 
@@ -418,7 +430,7 @@ def _topic_search_queries(niche_id: str, topic: str) -> list[str]:
             ]
         else:
             qs += ["streamer reaction funny", "trailer reaction", "twitch funny reaction"]
-    elif ttype == "fights" or niche == "anime":
+    elif niche == "anime" or (ttype == "fights" and niche != "animation"):
         if not wants_fan_made(topic):
             qs += [
                 "anime episode fight scene", "Crunchyroll fight scene", "Muse Asia fight scene",
@@ -428,7 +440,17 @@ def _topic_search_queries(niche_id: str, topic: str) -> list[str]:
             "anime fight edit", "best anime fight scene", "anime fight scene 4k",
             "best anime fight moments", "anime fight shorts", "epic anime battle",
             "anime fight compilation", "most hype anime fight",
+            "naruto vs sasuke fight", "demon slayer fight 4k", "jujutsu kaisen domain expansion",
         ]
+    elif niche == "animation":
+        qs += [
+            "disney cartoon funny moment", "pixar movie clip", "dreamworks funny scene",
+            "cartoon network best moments", "adventure time clip", "steven universe moment",
+            "arcane fight scene fortiche", "invincible fight scene", "hazbin hotel clip",
+            "indie western animation short", "spider-verse action scene",
+        ]
+        if wants_fan_made(topic):
+            qs += ["fan made cartoon animation", "indie animatic western", "fan animation disney style"]
     elif ttype == "gameplay":
         qs += ["GTA 6 gameplay", "gameplay clutch", "gameplay funny"]
     elif ttype == "trailers":
@@ -436,21 +458,31 @@ def _topic_search_queries(niche_id: str, topic: str) -> list[str]:
     elif niche == "gta6":
         qs += ["GTA 6 trailer reaction", "GTA 6 gameplay"]
     # Never add bare "official trailer" when topic is reactions
+    # Niche-lock: strip cross-polluting words from queries
+    ban_anime = ("disney", "pixar", "dreamworks", "cartoon network", "western cartoon")
+    ban_anim = ("anime", "manga", "shonen", "crunchyroll", "sakuga", "amv")
     out, seen = [], set()
     for q in qs:
         k = q.lower()
         if ttype == "reactions" and "official trailer" in k and "react" not in k:
             continue
+        if niche == "animation" and any(b in k for b in ban_anim):
+            continue
+        if niche == "anime" and any(b in k for b in ban_anime):
+            continue
         if k and k not in seen:
             seen.add(k)
             out.append(q)
-    return out[:12]
+    return out[:14]
 
 
 _WIDE_QUERIES = {
     "anime": ["anime fight", "anime battle scene", "anime fight amv", "anime best fights ever",
               "anime fight edit 4k", "demon slayer fight scene", "jujutsu kaisen fight scene",
               "one piece fight scene", "naruto fight scene", "dragon ball fight scene"],
+    "animation": ["disney cartoon moment", "pixar clip", "dreamworks scene", "cartoon network clip",
+                  "adventure time best moments", "arcane fight scene", "invincible vs omni man",
+                  "steven universe clip", "spider-verse scene", "indie western animation"],
     "gta6": ["GTA 6", "GTA 6 trailer reaction", "GTA VI reaction", "GTA 6 gameplay leak"],
 }
 
@@ -581,7 +613,8 @@ def collect_rank_items(
             if not ok:
                 continue
             ok_t, why_t = topic_matches(
-                ttype, title=cand.title, channel=channel, description=desc, tags=tags, has_face_cam=None
+                ttype, title=cand.title, channel=channel, description=desc, tags=tags,
+                has_face_cam=None, topic=topic,
             )
             if not ok_t:
                 continue
@@ -618,6 +651,10 @@ def collect_rank_items(
         f2 = _prefilter(extra)
         _log(f"[ranking] pass 2: {len(extra)} raw → {len(f2)} usable in {time.time()-t2:.1f}s")
         filtered += f2
+
+    # Batched Gemini style resolve for ambiguous anime/animation leftovers
+    if (niche_id or "").lower() in {"anime", "animation", "cartoon", "cartoons"} and filtered:
+        filtered = classify_candidates(filtered, niche_id=niche_id, cfg=cfg_rank, log=_log)
 
     filtered.sort(key=lambda c: c.rank_score, reverse=True)
     probe_n = int(max_probe or rk.get("max_probe", 7) or 7)
@@ -1063,6 +1100,8 @@ def build_ranking_video(
     cfg["clips"]["review_soft_min"] = float(rk.get("review_soft_min", 6.0) or 6.0)
     # Per-part Gemini video review is the slowest step (≈1–5 min under free-tier 503s)
     cfg["clips"]["skip_final_review"] = not bool(rk.get("final_review", False))
+    # Header-match is soft for ranking; niche style gate is the hard self_review
+    cfg["_ranking_soft_header"] = True
     cfg["clips"]["ranking_part"] = True  # montage: 2–4 moments, ~20–25s per part
     cfg["_no_watermark"] = True  # watermark the final assembled ranking once
     cs = cfg["clips"].setdefault("copyright_safe", {})
@@ -1140,6 +1179,28 @@ def build_ranking_video(
                 continue
         else:
             _log(f"[ranking] soft-keep fill-crop @{item.segment.start:.1f}s ({item.segment.reason})")
+        # Niche style gate: drop wrong tradition (anime vs western animation)
+        if (niche_id or "").lower() in {"anime", "animation", "cartoon", "cartoons"}:
+            try:
+                sk = vision_style_check(
+                    item.path, niche_id=niche_id, cfg=cfg,
+                    title=item.candidate.title, header=item.label or item.header or "",
+                    start=float(item.segment.start), end=float(item.segment.end),
+                )
+                _log(
+                    f"[niche-check] vision kind={sk.get('kind')} franchise={sk.get('franchise')} "
+                    f"ok={sk.get('ok')} | {item.candidate.title[:60]}"
+                )
+                if sk.get("ok") is False and not sk.get("skipped"):
+                    _log(f"[ranking] DROPPED {item.candidate.id} (style niche gate: {sk.get('reasons')})")
+                    continue
+                item.candidate.extra = dict(item.candidate.extra or {})
+                if sk.get("franchise"):
+                    item.candidate.extra["franchise"] = sk.get("franchise")
+                if sk.get("kind"):
+                    item.candidate.extra["style_kind"] = sk.get("kind")
+            except Exception as e:
+                _log(f"[niche-check] vision skip: {e}")
         survivors.append(item)
 
     if len(survivors) < min_parts:

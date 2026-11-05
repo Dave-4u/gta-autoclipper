@@ -37,11 +37,13 @@ NICHES: dict[str, dict[str, Any]] = {
             "anime fight scene 4k",
             "anime plot twist",
             "anime edit shorts",
-            "best anime moments 2025",
-            "anime trailer new",
-            "anime reaction funny",
+            "best anime moments 2026",
             "shonen fight scene",
             "anime goated moment",
+            "naruto fight scene",
+            "jujutsu kaisen fight",
+            "demon slayer fight scene",
+            "one piece fight scene",
         ],
         "header_styles": ["pov", "hype", "reaction", "question", "when_you", "hot_take"],
         "voice": "af_bella",
@@ -52,7 +54,7 @@ NICHES: dict[str, dict[str, Any]] = {
             "wait", "no way", "bro", "insane", "peak", "goat", "aura",
         ],
         # Franchise slang (bankai, domain expansion, etc.) lives in entities.FRANCHISE_PACKS
-        "vocab": ["aura", "peak fiction", "goat", "shonen", "animation", "fight"],
+        "vocab": ["aura", "peak fiction", "goat", "shonen", "sakuga", "fight"],
     },
     "animation": {
         "enabled": True,
@@ -60,18 +62,21 @@ NICHES: dict[str, dict[str, Any]] = {
         "label": "Animation / Cartoons",
         "keywords": [
             "cartoon funny moments",
-            "pixar trailer",
-            "animated movie trailer",
-            "cartoon edit shorts",
-            "disney animation clip",
-            "cartoon fail funny",
-            "indie animation short",
+            "pixar trailer clip",
+            "disney cartoon clip",
+            "dreamworks funny moment",
+            "cartoon network moment",
+            "adventure time clip",
+            "indie western animation short",
+            "arcane fight scene",
+            "invincible fight scene",
+            "steven universe clip",
         ],
         "header_styles": ["pov", "when_you", "hype", "question", "reaction", "hot_take"],
         "voice": "af_nicole",
         "voice_style": "commentary",
         "hashtags": ["#Animation", "#Cartoon", "#Shorts", "#FYP", "#Pixar", "#Disney", "#Animated"],
-        "boost_words": ["cartoon", "animation", "funny", "wait", "look", "omg", "crazy", "trailer"],
+        "boost_words": ["cartoon", "disney", "pixar", "funny", "wait", "look", "omg", "crazy", "trailer"],
         "vocab": ["toon force", "frame one", "cinema", "animated"],
     },
     "reactions": {
@@ -295,19 +300,32 @@ NICHE_RELEVANCE: dict[str, dict[str, list[str]]] = {
             "bleach", "dbz", "dragon ball", "chainsaw", "solo leveling", "studio ghibli",
             "crunchyroll", "my hero", "tokyo ghoul", "evangelion", "sakuga", "amv",
             "code geass", "spy x family", "frieren", "bocchi", "haikyuu", "hxh",
+            "donghua", "manhwa", "boruto", "bleach", "vinland", "cyberpunk edgerunners",
         ],
         "hard_reject": [
             "gta 6", "gta6", "gta vi", "gta 5", "gta rp", "rockstar games", "lucia trailer",
             "fortnite", "call of duty", "minecraft",
+            "disney", "pixar", "dreamworks", "illumination", "cartoon network", "nickelodeon",
+            "adventure time", "steven universe", "spongebob", "family guy", "the simpsons",
+            "rick and morty", "invincible", "hazbin", "helluva", "western cartoon",
+            "indie animation", "adult swim",
         ],
     },
     "animation": {
         "must_any": [
-            "cartoon", "animation", "animated", "pixar", "disney", "dreamworks", "illumination",
-            "toon", "indie animation", "2d animation", "3d animation", "cartoon network",
+            "cartoon", "pixar", "disney", "dreamworks", "illumination", "toon",
+            "indie animation", "cartoon network", "nickelodeon", "adventure time",
+            "steven universe", "arcane", "invincible", "hazbin", "helluva", "spongebob",
+            "rick and morty", "family guy", "adult swim", "western animation",
+            "gravity falls", "owl house", "spider-verse", "spider verse",
+            "animated short", "animated movie", "cg animation", "2d cartoon", "3d cartoon",
+            "fortiche", "bluey", "regular show", "gumball",
         ],
         "hard_reject": [
-            "anime fight", "manga", "gta 6", "gta vi", "live action trailer only",
+            "anime", "manga", "shonen", "sakuga", "amv", "crunchyroll", "donghua", "manhwa",
+            "naruto", "one piece", "demon slayer", "jujutsu", "jjk", "attack on titan",
+            "bleach", "dragon ball", "dbz", "solo leveling", "studio ghibli", "my hero",
+            "gta 6", "gta vi", "live action trailer only",
         ],
     },
     "reactions": {
@@ -407,8 +425,33 @@ def niche_relevance(
         if best_hard >= best_must and key in ("anime", "gta6", "animation", "movies"):
             return False, 0.0, f"cross_niche:{hard_hits[0]}"
 
+    # Strict anime ↔ western-animation separation (keyword banks + franchises)
+    style_kind = style_reason = None
+    style_conf = 0.0
+    if key in {"anime", "animation"}:
+        try:
+            from .style_kind import classify_style_kind, fits_niche
+            style_kind, style_reason, style_conf = classify_style_kind(
+                title=title or "", channel=channel or "", description=description or "", tags=tags,
+            )
+            print(f"[niche-check] kind={style_kind:<10} reason={style_reason} | {(title or '')[:70]}", flush=True)
+            if style_conf >= 0.5 and not fits_niche(key, style_kind):
+                return False, 0.0, f"style_reject:{style_kind}:{style_reason}"
+        except Exception as e:
+            print(f"[niche-check] classifier err: {e}", flush=True)
+
     if must and not must_hits:
+        # Style classifier can rescue a miss when confident this IS the niche
+        if style_kind and style_conf >= 0.55 and style_kind == ("anime" if key == "anime" else "animation"):
+            score = 0.55 + 0.4 * style_conf
+            return True, min(2.5, score), f"ok_style_rescue:{style_kind}:{style_reason}"
         return False, 0.0, "missing_must_keyword"
+
+    if key in {"anime", "animation"} and style_kind and style_conf >= 0.5:
+        from .style_kind import fits_niche
+        if fits_niche(key, style_kind):
+            score = 0.5 + 0.35 * len(must_hits) + 0.4 * style_conf
+            return True, min(2.5, score), f"ok_style:{style_kind}:{style_reason}"
 
     score = 0.5 + 0.35 * len(must_hits)
     return True, min(2.5, score), f"ok:{must_hits[0] if must_hits else 'pass'}"

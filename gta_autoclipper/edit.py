@@ -1569,7 +1569,25 @@ def _render_clip_impl(
             rev = self_review(out_path, _hdr, cfg=cfg, title=title or "")
             print(f"[edit] header-match ok={rev.get('ok')} reasons={rev.get('reasons')} desc={str(rev.get('desc',''))[:120]}")
             if not rev.get("ok") and not rev.get("skipped"):
-                print(f"[edit] REJECT header mismatch for {_hdr!r}")
+                if cfg.get("_ranking_soft_header"):
+                    print(f"[edit] soft header mismatch (ranking keep): {_hdr!r} reasons={rev.get('reasons')}")
+                else:
+                    print(f"[edit] REJECT header mismatch for {_hdr!r}")
+                    try: out_path.unlink(missing_ok=True)
+                    except Exception: pass
+                    return None
+        # Final niche style self-review: anime vs western animation
+        if niche_id in {"anime", "animation", "cartoon", "cartoons"} and not cfg.get("_skip_style_match"):
+            from .style_kind import vision_style_check
+            sk = vision_style_check(
+                out_path, niche_id=niche_id, cfg=cfg, title=title or "", header=_hdr,
+            )
+            print(
+                f"[niche-check] final kind={sk.get('kind')} franchise={sk.get('franchise')} "
+                f"ok={sk.get('ok')} reasons={sk.get('reasons')}"
+            )
+            if sk.get("ok") is False and not sk.get("skipped"):
+                print(f"[edit] REJECT style niche mismatch for niche={niche_id}")
                 try: out_path.unlink(missing_ok=True)
                 except Exception: pass
                 return None
