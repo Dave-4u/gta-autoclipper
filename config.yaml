@@ -148,4 +148,24 @@ montage:
 # Cutroom UI job runner (jobs run as a separate process)
 job:
   watchdog_minutes: 5
-  autopilot_timeout_seconds: 3600
+  overall_timeout_seconds: 5400   # 90 min — slow CPUs need this
+  autopilot_timeout_seconds: 5400
+  watchdog_minutes: 8
+
+# Slow-CPU profile (auto-on when os.cpu_count()<=8 or a quick encode bench is slow).
+# Force with GTA_LOW_CPU=1 / performance.low_cpu: true. Force off with GTA_LOW_CPU=0.
+performance:
+  low_cpu: auto              # auto | true | false
+  auto_cpu_count: 8
+  preset: ultrafast          # libx264 preset when low_cpu
+  crf: 23
+  width: 720                 # render 720x1280 on low_cpu (still 9:16 full-screen)
+  height: 1280
+  whisper_model: tiny        # faster-whisper tiny int8
+  skip_vocals: true          # skip vocals-separation ffmpeg pass
+  skip_final_whisper_if_captions: true
+  skip_final_review: true    # skip Gemini video final-gate (slow + flaky on free tier)
+  threads: "0"               # 0 = ffmpeg auto
+  overall_timeout_seconds: 5400   # 90 min hard job budget
+  ranking_timeout_seconds: 5400
+  watchdog_minutes: 8

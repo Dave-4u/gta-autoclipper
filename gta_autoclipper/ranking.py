@@ -812,7 +812,7 @@ def _render_title_card(
             cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
             cmd += ["-map", "0:v:0", "-map", "1:a:0"]
         cmd += ["-vf", vf, "-t", f"{dur:.2f}",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p", "-r", "30", "-threads", "0",
                 "-c:a", "aac", "-shortest", str(card)]
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode == 0 and card.is_file():
@@ -997,8 +997,7 @@ def _ensure_part_captions(
         [
             "ffmpeg", "-y", "-i", str(clip),
             "-vf", f"ass='{ass_esc}'",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-c:a", "copy", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            *(__import__("gta_autoclipper.perf", fromlist=["encode_args"]).encode_args(cfg, audio_copy=True)),
             str(out),
         ],
         capture_output=True, text=True, check=False,
@@ -1248,7 +1247,7 @@ def build_ranking_video(
         pr = subprocess.run(
             ["ffmpeg", "-y", "-i", str(base), "-vf", vf,
              "-af", "aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo",
-             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p", "-r", "30", "-threads", "0",
              "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k", str(fixed)],
             capture_output=True, text=True, check=False,
         )
@@ -1301,9 +1300,8 @@ def build_ranking_video(
             f"aresample=48000,asetpts=PTS-STARTPTS[a0];"
             f"[a0][1:a]amix=inputs=2:duration=first:dropout_transition=0[a]",
             "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            *(__import__("gta_autoclipper.perf", fromlist=["encode_args"]).encode_args(cfg)),
             "-r", "30",
-            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
             "-shortest", str(npth),
         ]
         pr = subprocess.run(cmd_n, capture_output=True, text=True, check=False)

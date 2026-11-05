@@ -378,8 +378,18 @@ def get_word_timestamps(
     duration = max(0.5, end - start)
     # Prefer small/medium int8; never fall back to tiny (hallucinates trailer lines).
     niche = (niche_id or "").lower()
+    # Slow CPUs: skip the vocals-separation ffmpeg pass (often as slow as whisper itself)
+    skip_vocals = False
+    try:
+        from .perf import profile as _perf
+        skip_vocals = bool(_perf().get("skip_vocals"))
+    except Exception:
+        pass
     # Loud streamer yells (Kai "omg") degrade under bandpass vocals — try plain first for reactions.
-    if niche in {"reactions", "gta6", "funny"}:
+    if skip_vocals:
+        attempts = [("plain+model", model_name, False)]
+        print("[transcribe] low_cpu: vocals separation skipped")
+    elif niche in {"reactions", "gta6", "funny"}:
         attempts: list[tuple[str, str, bool]] = [
             ("plain+model", model_name, False),
             ("vocals+model", model_name, True),

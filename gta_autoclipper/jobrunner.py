@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any
 
 _STAGE_RX = re.compile(r"^\[(discover|download|analyze|analyze-light|edit|montage|ranking|review|transcribe|"
-                       r"intro-vo|voiceover|watermark|layout|auto|run|stage)\]")
+                       r"intro-vo|voiceover|watermark|layout|auto|run|stage|ffmpeg|perf|job|watchdog)\]")
+_FFMPEG_PROG_RX = re.compile(r"^\[ffmpeg\].*(?:\d+%|t=\d+|done in)")
 _OUT_RX = re.compile(r"((?:[A-Za-z]:)?[^\s'\"]+\.mp4)\b")
 
 
@@ -104,6 +105,11 @@ class Job:
             m = _STAGE_RX.match(line)
             if m:
                 self.stage = m.group(1)
+            # ffmpeg -progress ticks count as progress (don't false-stall during long encodes)
+            if _FFMPEG_PROG_RX.match(line):
+                self.last_output_at = time.time()
+                if "ffmpeg" not in (self.stage or ""):
+                    self.stage = "ffmpeg"
             st = line.strip()
             is_final = st.endswith(".mp4") and os.path.isabs(st) and "_montage" not in st
             if " wrote " in line or line.startswith(("[auto] wrote", "[run] wrote")) or is_final:

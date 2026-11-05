@@ -73,7 +73,7 @@ def _apply_fast_defaults(cfg: dict[str, Any], *, fast: bool = True) -> dict[str,
         120 if fast else 180,
     )
     cfg["job"] = {
-        "overall_timeout_seconds": 15 * 60 if fast else 25 * 60,
+        "overall_timeout_seconds": int((cfg.get("job") or {}).get("overall_timeout_seconds") or 5400),
         "analyze_timeout_seconds": 180 if fast else 300,
         "render_timeout_seconds": 240,
         "ranking_timeout_seconds": int((cfg.get("ranking") or {}).get("timeout_seconds") or (25 * 60)),
@@ -387,13 +387,14 @@ def create_app(config_path: str | None = None) -> FastAPI:
         job_cfg = cfg.get("job") or {}
         mode = (req.mode or "single").lower()
         if mode == "ranking":
-            hard = float((cfg.get("ranking") or {}).get("timeout_seconds") or 1500) + 300
+            hard = float((cfg.get("ranking") or {}).get("timeout_seconds")
+                         or job_cfg.get("ranking_timeout_seconds") or 5400) + 300
         elif mode in {"autopilot", "auto"}:
-            hard = float(job_cfg.get("autopilot_timeout_seconds") or 3600)
+            hard = float(job_cfg.get("autopilot_timeout_seconds") or 5400)
         else:
-            hard = float(job_cfg.get("overall_timeout_seconds") or 900) + 600
+            hard = float(job_cfg.get("overall_timeout_seconds") or 5400)
         JOB.start(cli_args_for(req, _config_path), cwd=project_root(), hard_timeout_s=hard,
-                  stall_min=float(job_cfg.get("watchdog_minutes") or 5))
+                  stall_min=float(job_cfg.get("watchdog_minutes") or 8))
         return {"ok": True, "mode": req.mode, "niche": req.niche, "pid": JOB.proc.pid if JOB.proc else None}
 
     @app.get("/api/watermarks")

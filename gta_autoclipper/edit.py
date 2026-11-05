@@ -85,6 +85,8 @@ def _font_opt(font: str) -> str:
 
 def apply_watermark(path: Path, cfg: dict[str, Any]) -> Path:
     """Burn a small semi-transparent handle (e.g. @officialdevclips) in place. Never fails the clip."""
+    if cfg.get("_wm_burned"):
+        return path
     wm = dict(cfg.get("watermark") or {})
     if not wm.get("enabled", True) or not path or not Path(path).is_file():
         return path
@@ -117,11 +119,19 @@ def apply_watermark(path: Path, cfg: dict[str, Any]) -> Path:
     )
     src = Path(path)
     tmp = src.with_name(src.stem + "._wm" + src.suffix)
-    proc = subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vf", vf,
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p",
-         "-c:a", "copy", "-movflags", "+faststart", str(tmp)],
-        capture_output=True, text=True, check=False,
+    from .perf import encode_args, run_ffmpeg
+    try:
+        import json as _j
+        _pr = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(src)],
+            capture_output=True, text=True, check=False,
+        )
+        _dur = float(((_j.loads(_pr.stdout).get("format") or {}).get("duration")) or 0)
+    except Exception:
+        _dur = 0.0
+    proc = run_ffmpeg(
+        ["ffmpeg", "-y", "-i", str(src), "-vf", vf, *encode_args(cfg, audio_copy=True), str(tmp)],
+        label="watermark", duration_s=_dur or None,
     )
     if proc.returncode != 0 or not tmp.is_file() or tmp.stat().st_size < 2000:
         print(f"[watermark] failed (keeping clip unmarked): {(proc.stderr or '')[-240:]}")
@@ -143,17 +153,28 @@ def _run_ffmpeg_with_script(
     script_path: Path,
 ) -> subprocess.CompletedProcess:
     """Write filtergraph to a file; use -filter_complex_script (Windows-safe)."""
+    from .perf import run_ffmpeg
     body = filter_complex.replace("\r\n", "\n").replace("\r", "\n")
     script_path.write_text(body, encoding="utf-8", newline="\n")
     script_arg = Path(script_path).resolve().as_posix()  # C:/... not C:\...
     cmd = list(cmd_prefix) + ["-filter_complex_script", script_arg] + list(cmd_suffix)
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    dur = None
+    try:
+        if "-ss" in cmd_prefix and "-to" in cmd_prefix:
+            ss = float(cmd_prefix[cmd_prefix.index("-ss") + 1])
+            to = float(cmd_prefix[cmd_prefix.index("-to") + 1])
+            dur = max(0.5, to - ss)
+        elif "-t" in cmd_prefix:
+            dur = float(cmd_prefix[cmd_prefix.index("-t") + 1])
+    except Exception:
+        dur = None
+    proc = run_ffmpeg(cmd, label=script_path.stem, duration_s=dur)
     if proc.returncode != 0 and "filter_complex_script" in (proc.stderr or ""):
-        # Fallback: inline graph (our graphs are small enough for the cmdline)
         print("[edit] filter_complex_script rejected — retrying inline -filter_complex")
         cmd2 = list(cmd_prefix) + ["-filter_complex", body] + list(cmd_suffix)
-        proc = subprocess.run(cmd2, capture_output=True, text=True, check=False)
+        proc = run_ffmpeg(cmd2, label=script_path.stem + "-inline", duration_s=dur)
     return proc
+
 
 
 def _fit_header(text: str, max_chars: int = 36) -> str:
@@ -1102,13 +1123,11 @@ def _render_clip_impl(
                 "-to", str(segment.end),
                 "-i", str(source),
             ]
+            from .perf import encode_args
             cmd_suffix = [
                 "-map", "[vout]",
                 "-map", "[aout]",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
-                "-movflags", "+faststart",
-                "-pix_fmt", "yuv420p",
+                *encode_args(cfg),
                 "-r", "30",
                 str(out_path),
             ]
@@ -1151,7 +1170,7 @@ def _render_clip_impl(
         if prepend_vo is not None and intro_dur >= 1.4 and out_path.is_file():
             try:
                 intro_mp4 = td_path / "vo_intro.mp4"
-                body_norm = td_path / "body_norm.mp4"
+                # body_norm removed — body is reused as-is for concat
                 vo48 = td_path / "intro_48k.wav"
                 # Explicit resample VO → 48k stereo (prevents 24k-as-48k chipmunk)
                 pr_rs = subprocess.run(
@@ -1231,52 +1250,44 @@ def _render_clip_impl(
                     intro_fc,
                     [
                         "-map", "[v]", "-map", "[a]",
-                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
-                        "-pix_fmt", "yuv420p", "-r", "30",
+                        *(__import__("gta_autoclipper.perf", fromlist=["encode_args"]).encode_args(cfg)),
+                        "-r", "30",
                         "-shortest", str(intro_mp4),
                     ],
                     intro_script,
                 )
-                # Body: force 30fps + 48kHz with aresample (never asetrate)
-                pr_b = subprocess.run(
-                    [
-                        "ffmpeg", "-y", "-i", str(out_path),
-                        "-filter_complex",
-                        f"[0:v]fps=30,scale={width}:{height},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v];"
-                        f"[0:a]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
-                        f"asetpts=PTS-STARTPTS[a]",
-                        "-map", "[v]", "-map", "[a]",
-                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
-                        "-r", "30", str(body_norm),
-                    ],
-                    capture_output=True, text=True, check=False,
-                )
+                # Body already 30fps/48k from the first encode — never re-encode it just to concat.
+                from .perf import encode_args, run_ffmpeg
                 final_tmp = td_path / "with_intro.mp4"
-                if intro_mp4.is_file() and body_norm.is_file() and pr_i.returncode == 0 and pr_b.returncode == 0:
-                    pr_c = subprocess.run(
-                        [
-                            "ffmpeg", "-y",
-                            "-i", str(intro_mp4), "-i", str(body_norm),
-                            "-filter_complex",
-                            "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]",
-                            "-map", "[v]", "-map", "[a]",
-                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k",
-                            "-pix_fmt", "yuv420p", "-r", "30",
-                            "-movflags", "+faststart",
-                            str(final_tmp),
-                        ],
-                        capture_output=True, text=True, check=False,
+                if intro_mp4.is_file() and pr_i.returncode == 0:
+                    concat_list = td_path / "intro_concat.txt"
+                    concat_list.write_text(
+                        "file '" + intro_mp4.resolve().as_posix() + "'" + chr(10)
+                        + "file '" + out_path.resolve().as_posix() + "'" + chr(10),
+                        encoding="utf-8",
                     )
+                    pr_c = run_ffmpeg(
+                        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
+                         "-c", "copy", "-movflags", "+faststart", str(final_tmp)],
+                        label="intro-concat-copy",
+                    )
+                    if pr_c.returncode != 0 or not final_tmp.is_file():
+                        pr_c = run_ffmpeg(
+                            ["ffmpeg", "-y", "-i", str(intro_mp4), "-i", str(out_path),
+                             "-filter_complex", "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]",
+                             "-map", "[v]", "-map", "[a]", *encode_args(cfg), "-r", "30",
+                             str(final_tmp)],
+                            label="intro-concat",
+                            duration_s=intro_dur + max(1.0, float(segment.end - segment.start)),
+                        )
                     if pr_c.returncode == 0 and final_tmp.is_file():
-                        out_path.write_bytes(final_tmp.read_bytes())
-                        print(f"[edit] prepended VO intro {intro_dur:.2f}s (48k resampled, frozen frame)")
+                        import shutil as _sh
+                        _sh.move(str(final_tmp), str(out_path))
+                        print(f"[edit] prepended VO intro {intro_dur:.2f}s (stream-copy concat, no body re-encode)")
                     else:
                         print("[edit] intro concat failed:", (pr_c.stderr or "")[-400:])
                 else:
-                    print("[edit] intro build failed:", (pr_i.stderr or "")[-300:], (pr_b.stderr or "")[-200:])
+                    print("[edit] intro build failed:", (pr_i.stderr or "")[-300:])
             except Exception as e:
                 print(f"[edit] VO prepend skip: {e}")
 
@@ -1297,15 +1308,22 @@ def _render_clip_impl(
                 # Prefer source-window streamer words (shifted). Only replace with final
                 # whisper if it yields MORE confident streamer-like tokens (not trailer OCR).
                 final_words = list(caption_words) if caption_words else []
-                whispered = get_word_timestamps(
-                    out_path, float(intro_dur), _dur, model_name=model_name, niche_id=niche_id
-                )
-                if len(whispered) < 3 and model_name in {"tiny", "base"}:
+                from .perf import profile as _perf
+                _p = _perf(cfg)
+                skip_2nd = bool(_p.get("skip_final_whisper_if_captions")) and len(final_words) >= 3
+                if skip_2nd:
+                    print(f"[edit] low_cpu: skipping 2nd whisper (keeping {len(final_words)} source captions)")
+                    whispered = []
+                else:
                     whispered = get_word_timestamps(
-                        out_path, float(intro_dur), _dur,
-                        model_name="small",
-                        niche_id=niche_id,
+                        out_path, float(intro_dur), _dur, model_name=model_name, niche_id=niche_id
                     )
+                    if len(whispered) < 3 and model_name in {"tiny", "base"} and not _p.get("low_cpu"):
+                        whispered = get_word_timestamps(
+                            out_path, float(intro_dur), _dur,
+                            model_name="small",
+                            niche_id=niche_id,
+                        )
                 from .transcribe import matches_trailer_line as _trailer_line
                 def _streamer_like(ws):
                     text = " ".join(str(w.get("word","")) for w in ws).lower()
@@ -1336,29 +1354,26 @@ def _render_clip_impl(
                 if final_words:
                     ass2 = td_path / "captions_final.ass"
                     n2 = _write_ass_captions(final_words, ass2, width, height, font_name=font_name, mask_swears=mask_swears)
-                    print(f"[edit] final-audio whisper captions: {n2} events / {len(final_words)} words")
+                    print(f"[edit] final captions: {n2} events / {len(final_words)} words (ASS+watermark one pass)")
                     tmp_out = td_path / "reburn.mp4"
-                    ass_esc = str(ass2).replace("\\", "/").replace(":", chr(92) + ":")
-                    vf = f"ass='{ass_esc}'"
-                    # Keep existing burned captions? Replace by stripping is hard —
-                    # overlay fresh ASS (karaoke style) on top of current frame.
-                    pr2 = subprocess.run(
-                        [
-                            "ffmpeg", "-y", "-i", str(out_path),
-                            "-vf", vf,
-                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                            "-c:a", "copy", "-pix_fmt", "yuv420p",
-                            "-movflags", "+faststart",
-                            str(tmp_out),
-                        ],
-                        capture_output=True, text=True, check=False,
+                    ass_esc = _fc_path(ass2)
+                    from .perf import encode_args, run_ffmpeg, watermark_vf
+                    wm = watermark_vf(cfg)
+                    vf = f"ass='{ass_esc}'" + (f",{wm}" if wm else "")
+                    pr2 = run_ffmpeg(
+                        ["ffmpeg", "-y", "-i", str(out_path), "-vf", vf,
+                         *encode_args(cfg, audio_copy=True), str(tmp_out)],
+                        label="captions+wm", duration_s=_dur,
                     )
                     if pr2.returncode == 0 and tmp_out.is_file():
-                        out_path.write_bytes(tmp_out.read_bytes())
+                        import shutil as _sh2
+                        _sh2.move(str(tmp_out), str(out_path))
                         caption_words = final_words
                         out_path.with_suffix(".ass").write_text(
                             ass2.read_text(encoding="utf-8"), encoding="utf-8"
                         )
+                        if wm:
+                            cfg["_wm_burned"] = True
                     else:
                         print("[edit] final caption reburn failed:", (pr2.stderr or "")[-400:])
                 else:

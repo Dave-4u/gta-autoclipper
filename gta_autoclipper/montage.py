@@ -217,9 +217,9 @@ def build_moment_montage(source: Path, cfg: dict[str, Any], *, ranking_part: boo
            "-map", f"[{vlab}]"]
     if audio:
         cmd += ["-map", f"[{alab}]", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart", str(out)]
-    pr = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    from .perf import encode_args, run_ffmpeg
+    cmd += [*encode_args(cfg), str(out)]
+    pr = run_ffmpeg(cmd, label="montage", duration_s=sum(seg_out) if seg_out else None)
     if pr.returncode != 0 or not out.is_file() or out.stat().st_size < 5000:
         print(f"[montage] build failed: {(pr.stderr or '')[-400:]}")
         return None

@@ -57,6 +57,11 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
     clips = data.setdefault("clips", {})
     clips["output_dir"] = str((root / clips.get("output_dir", "outputs")).resolve())
     try:
+        from .perf import apply_performance
+        apply_performance(data)
+    except Exception as e:
+        print(f"[perf] settings ignored: {e}")
+    try:
         from .watermarks import apply_to_cfg
         apply_to_cfg(data)
     except Exception as e:  # never block a run on a bad watermarks.json
