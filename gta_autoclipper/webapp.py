@@ -66,7 +66,8 @@ def _cfg(path: str | None = None) -> dict[str, Any]:
 
 
 def _apply_fast_defaults(cfg: dict[str, Any], *, fast: bool = True) -> dict[str, Any]:
-    cfg = dict(cfg)
+    from .quality import resolve_quality
+    cfg = resolve_quality(cfg)
     cfg["analysis"] = dict(cfg.get("analysis") or {})
     cfg["search"] = dict(cfg.get("search") or {})
     cfg["download"] = dict(cfg.get("download") or {})

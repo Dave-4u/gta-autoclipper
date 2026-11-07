@@ -111,7 +111,7 @@ def run_niche_pass(
             tags=list((cand.extra or {}).get("tags") or []),
             custom_keywords=custom_keywords,
         )
-        if not ok:
+        if not ok and cand.source != "local":
             _log(f"[auto] skip off-niche ({reason}): {cand.title[:80]}", log)
             continue
         try:

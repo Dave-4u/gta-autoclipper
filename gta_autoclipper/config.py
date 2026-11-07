@@ -46,6 +46,10 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         raise FileNotFoundError(f"Config not found: {cfg_path}")
     with open(cfg_path, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
+    from .quality import resolve_quality, log_quality, VERSION
+    migrated = int(data.get("quality_policy_version") or 0) < VERSION
+    data = resolve_quality(data)
+    data["_quality_migrated"] = migrated
     # Resolve relative paths against project root
     root = cfg_path.parent
     data["_root"] = root
@@ -66,6 +70,7 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         apply_to_cfg(data)
     except Exception as e:  # never block a run on a bad watermarks.json
         print(f"[watermark] settings ignored: {e}")
+    log_quality(data)
     return data
 
 

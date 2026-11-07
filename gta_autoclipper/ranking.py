@@ -26,6 +26,7 @@ from .history import History
 from .niches import apply_niche_to_config, niche_relevance
 from .style_kind import classify_candidates, classify_style_kind, vision_style_check
 from .voiceover import make_intro_vo
+from .perf import encode_args
 
 
 def _fit_header_words(text: str, max_chars: int = 28) -> str:
@@ -597,7 +598,9 @@ def collect_rank_items(
     cfg_rank["analysis"] = dict(cfg_rank.get("analysis") or {})
     cfg_rank["analysis"]["max_analyze_seconds"] = float(rk.get("analyze_seconds", 75) or 75)
     cfg_rank["analysis"]["whisper_for_highlights"] = False
+    cfg_rank["_ranking_selection"] = True
     cfg_rank["analysis"]["use_whisper"] = False
+    cfg_rank["_fan_sources"] = wants_fan_made(topic)
 
     def _prefilter(cands: list[Candidate]) -> list[Candidate]:
         filtered: list[Candidate] = []
@@ -610,13 +613,13 @@ def collect_rank_items(
             ok, rel, reason = niche_relevance(
                 niche_id, title=cand.title, description=desc, channel=channel, tags=tags,
             )
-            if not ok:
+            if not ok and cand.source != "local":
                 continue
             ok_t, why_t = topic_matches(
                 ttype, title=cand.title, channel=channel, description=desc, tags=tags,
                 has_face_cam=None, topic=topic,
             )
-            if not ok_t:
+            if not ok_t and cand.source != "local":
                 continue
             from .meta_signals import is_mashup_title
             if ttype == "reactions" and is_mashup_title(cand.title):
@@ -654,7 +657,8 @@ def collect_rank_items(
 
     # Batched Gemini style resolve for ambiguous anime/animation leftovers
     if (niche_id or "").lower() in {"anime", "animation", "cartoon", "cartoons"} and filtered:
-        filtered = classify_candidates(filtered, niche_id=niche_id, cfg=cfg_rank, log=_log)
+        filtered = [c for c in filtered if c.source == "local"] + classify_candidates(
+            [c for c in filtered if c.source != "local"], niche_id=niche_id, cfg=cfg_rank, log=_log)
 
     filtered.sort(key=lambda c: c.rank_score, reverse=True)
     probe_n = int(max_probe or rk.get("max_probe", 7) or 7)
@@ -662,7 +666,7 @@ def collect_rank_items(
     origin = classify_origin(filtered, cfg, log=_log) if filtered else {}
     for c in filtered:
         c.extra = dict(c.extra or {})
-        c.extra["origin"] = origin.get(c.id, "official")
+        c.extra["origin"] = "fan" if c.extra.get("source_kind") == "original_fan_animation" else origin.get(c.id, "official")
         _log(f"[ranking] origin={c.extra['origin']:<8} {c.title[:70]}")
     fan_c = [c for c in filtered if c.extra["origin"] == "fan"]
     off_c = [c for c in filtered if c.extra["origin"] == "official"]
@@ -671,6 +675,9 @@ def collect_rank_items(
         group, pool = ("fan", fan_c) if len(fan_c) >= need or len(fan_c) >= len(off_c) else ("official", off_c)
     else:
         group, pool = ("official", off_c) if len(off_c) >= need or len(off_c) >= len(fan_c) else ("fan", fan_c)
+    if niche_id in {"anime", "animation"}:
+        group = "fan" if wants_fan_made(topic) else "official"
+        pool = fan_c if group == "fan" else off_c
     _log(f"[ranking] origin groups: official={len(off_c)} fan={len(fan_c)} → using {group.upper()} only")
     filtered = pool
     shortlist = filtered[: max(probe_n, n)]
@@ -849,7 +856,7 @@ def _render_title_card(
             cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
             cmd += ["-map", "0:v:0", "-map", "1:a:0"]
         cmd += ["-vf", vf, "-t", f"{dur:.2f}",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p", "-r", "30", "-threads", "0",
+                *encode_args(cfg), "-r", "30",
                 "-c:a", "aac", "-shortest", str(card)]
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode == 0 and card.is_file():
@@ -1201,7 +1208,7 @@ def build_ranking_video(
                     f"[niche-check] vision kind={sk.get('kind')} franchise={sk.get('franchise')} "
                     f"ok={sk.get('ok')} | {item.candidate.title[:60]}"
                 )
-                if sk.get("ok") is False and not sk.get("skipped"):
+                if sk.get("ok") is not True or sk.get("skipped"):
                     _log(f"[ranking] DROPPED {item.candidate.id} (style niche gate: {sk.get('reasons')})")
                     continue
                 item.candidate.extra = dict(item.candidate.extra or {})
@@ -1324,7 +1331,7 @@ def build_ranking_video(
         pr = subprocess.run(
             ["ffmpeg", "-y", "-i", str(base), "-vf", vf,
              "-af", "aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo",
-             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p", "-r", "30", "-threads", "0",
+             *encode_args(cfg), "-r", "30",
              "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k", str(fixed)],
             capture_output=True, text=True, check=False,
         )

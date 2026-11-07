@@ -1,3 +1,4 @@
+quality_policy_version: 2
 active_niche: gta6
 search:
   keywords: []
@@ -130,9 +131,9 @@ watermark:
   opacity: 0.45
   size: 0.024              # fraction of video height
 
-# Multi-moment montage for every clip (and each ranking part)
+# Legacy montage settings retained for reference; coherent scenes disable distant stitching.
 montage:
-  enabled: true
+  enabled: false
   total_seconds: [45, 75]          # normal clips
   segments: [4, 7]
   ranking_total_seconds: [18, 26]  # each ranking part
@@ -174,3 +175,15 @@ performance:
   overall_timeout_seconds: 5400   # 90 min hard job budget
   ranking_timeout_seconds: 5400
   watchdog_minutes: 8
+
+# Shared runtime policy (also applied to older config files without rewriting credentials).
+source_policy:
+  mode: episode_or_local
+  authorized_channels: []  # explicit exact YouTube channel IDs or @handles you may use
+selection:
+  mode: coherent_scene
+  max_analyze_seconds: 90
+framing:
+  mode: adaptive
+  blur_width: 180
+  blur_sigma: 5

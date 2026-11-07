@@ -175,7 +175,11 @@ def self_review(
         "REASON: <short if MATCH=no, else ok>\n"
         "Rules: MATCH=no if the header names a person/character who is clearly NOT on screen. "
         "MATCH=no if header claims a reaction but the face-cam is blank/staring. "
-        "MATCH=yes if header is a fair short label of the scene."
+        "MATCH=yes if header is a fair short label of the scene. "
+        "For episode animation: reject AMV/edit overlays, compilation transitions, unrelated "
+        "characters/locations without a connecting action, missing setup/payoff, and visibly "
+        "cropped-out main combatants. Ordinary shot/reverse-shot within one scene is OK. "
+        "Do not infer a character from the title if the images do not support it."
     )
     raw = ""
     try:

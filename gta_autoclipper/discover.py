@@ -192,6 +192,8 @@ def _entry_to_candidate(e: dict[str, Any], source: str) -> Candidate | None:
         like_count=_parse_int(e, "like_count", "likes"),
         comment_count=_parse_int(e, "comment_count", "comments"),
         extra={
+            "uploader_id": e.get("uploader_id") or "",
+            "channel_id": e.get("channel_id") or "",
             "channel": e.get("channel") or e.get("uploader") or "",
             "description": (e.get("description") or "")[:500],
             "tags": list(e.get("tags") or [])[:30],
@@ -282,6 +284,15 @@ def read_links_file(path: str | Path) -> list[Candidate]:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+        local = Path(line).expanduser()
+        if not local.is_absolute():
+            local = p.parent / local
+        if not line.startswith("http") and local.is_file():
+            import hashlib
+            out.append(Candidate(id="local_" + hashlib.sha256(str(local.resolve()).encode()).hexdigest()[:12],
+                                 title=local.stem, url=str(local.resolve()), duration=None,
+                                 source="local", extra={"source_kind": "local_supplied"}))
+            continue
         vid = _url_to_id(line)
         out.append(
             Candidate(
@@ -344,6 +355,9 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
         "anime fight scene",
         "funny viral video",
     ])
+    if cfg.get("niche_id") in {"anime", "animation"}:
+        from .source_policy import source_queries
+        keywords = source_queries(cfg["niche_id"], bool(cfg.get("_fan_sources")))
     random.shuffle(keywords)
     n = int(search_cfg.get("results_per_keyword", 8))
     min_d = float(search_cfg.get("min_source_duration", 15))
@@ -441,5 +455,25 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
     if fresh is not None:
         searched = searched + add  # fresh always ahead of seen
     out = links + searched
+    # Manually supplied YouTube links need the same provenance metadata as search results.
+    # Bound metadata-only extraction; never trust a raw URL's placeholder title.
+    if cfg.get("niche_id") in {"anime", "animation"}:
+        from urllib.parse import urlparse
+        for c in [x for x in out if x.source == "links"][:3]:
+            host = (urlparse(c.url).hostname or "").lower()
+            if host not in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}:
+                continue
+            try:
+                entries = _run_ytdlp_json([c.url], timeout=30, cookie_args=cookie_args)
+                if entries:
+                    resolved = _entry_to_candidate(entries[0], "links")
+                    if resolved:
+                        c.title, c.extra, c.duration = resolved.title, resolved.extra, resolved.duration
+            except Exception:
+                print("[source-policy] Link metadata unavailable; source will not bypass verification")
+    from .source_policy import enforce_source
+    out = [c for c in out if enforce_source(c, cfg)]
+    if not out and cfg.get("niche_id") in {"anime", "animation"}:
+        print("[source-policy] No eligible episode scenes. Supply a local original file or authorize an exact publisher channel in source_policy.authorized_channels; no edit fallback. Copyright matches can still occur.")
     print(f"[discover] {len(out)} candidates after smart rank")
     return out

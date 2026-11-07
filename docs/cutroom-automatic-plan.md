@@ -28,3 +28,63 @@ Offline verification:
 .venv/bin/python tests/test_gemini_pipeline.py
 node --check gta_autoclipper/web/static/cutroom.js
 ```
+
+## Episode quality policy v2
+
+Runtime-only migration is shared by config.load_config (UI and CLI); it never
+rewrites keys, cookies, voice or watermark preferences. Legacy ultrafast and
+CRF>20 performance settings migrate to veryfast/CRF20. Low-CPU remains 720x1280,
+tiny Whisper, single-pass low-resolution background blur; selected CPU/profile,
+source policy and framing are logged without credentials. All modes retain the
+automatic count rules above. No extra user count knobs were introduced.
+
+For anime/animation:
+- Exact publisher handles (see source_policy.py), or user-authorized channel
+  IDs/handles in source_policy.authorized_channels, plus episode/scene/clip
+  metadata are required. Display names and 'official' in a title aren't proof.
+- AMV/edit/compilation/fancam/montage/reaction/shorts/repost signals are rejected,
+  even from a publisher. Trailers/highlights are not treated as episodes.
+- Explicit local file paths in links.txt are supported (relative to that file).
+  Local supply is recorded separately, not inferred from a cached download.
+- source_kind, uploader_status and fan/official origin are distinct concepts.
+  Explicitly authorized original fan animations remain separate from episodes.
+  A fan request cannot silently switch to official, or vice versa.
+- No eligible source means an actionable failure, never a fallback to an edit.
+  Exact metadata gates are conservative; missing platform handles can reject
+  legitimate sources. Uploader provenance is NOT a license or copyright clearance.
+
+### Scene prompt and enforced behavior
+
+The new selector replaces loudness-only anime/animation picking. It samples eight
+chronological 384px frames in at most the first 90 seconds, requests ONE continuous
+same-scene/characters/action thread with setup and payoff, explicitly rejects AMVs,
+recaps, social overlays, speed ramps and unrelated cuts, and asks for natural pauses.
+JSON must affirm original_scene=true and coherent=true and contain valid bounds.
+Ranking target is 18–28s; other clips 30–45s. Bounds must align within 2s to detected
+-35dB / 0.18s audio pauses; otherwise the candidate is rejected. Proxy/file edges
+are not assumed safe. No key, malformed answer or unavailable validation fails
+closed, without a loudness fallback. A validated scene is never expanded/capped
+across new boundaries or stitched into distant moments. Render requires source
+provenance AND the coherent pause-aligned selection marker.
+
+Final Gemini QA additionally rejects edit overlays, compilation transitions,
+unconnected characters/locations, missing setup/payoff and cropped main combatants.
+For episode niches, ranking no longer soft-passes that final mismatch gate.
+These are sampled-frame and audio-pause checks, NOT perfect temporal understanding
+or linguistic sentence detection. False rejections and missed mid-word errors
+are possible; review the output. They cannot establish licensing or fair use.
+
+### Stable adaptive framing
+
+Near-native portrait (<=2% aspect loss) can crop. Other footage only crops when
+all three 384px samples provide confident action/character union boxes that fit
+inside 9:16 with 5% horizontal margin. Wide/two-character/uncertain/failed evidence
+retains the ENTIRE image centered above a blurred duplicate. Choice and crop
+center stay fixed for the segment, not jittery per-frame tracking. Foreground
+keeps aspect ratio; no stretching or extra zoom. Background blur is computed at
+180px width (clamped 90–240), sigma 5 (clamped 2–6), then enlarged. Existing
+caption/rank/watermark layers and preferences are retained. Sparse evidence can
+miss motion between samples; uncertain inputs default to full fit.
+
+Offline fixture: `PYTHONPATH=. .venv/bin/python scripts/render_framing_fixture.py`
+produces clearly labeled synthetic tests, not an episode-source validation.

@@ -489,6 +489,9 @@ def find_highlights_light(path: Path, cfg: dict[str, Any]) -> list[Segment]:
     Fast ranking/CPU analyzer: loudness peaks only (no motion/face/blackdetect/whisper).
     Typically finishes in a few seconds on a 60–90s proxy.
     """
+    if cfg.get("niche_id") in {"anime", "animation"}:
+        from .coherent import select_scene
+        return select_scene(path, cfg)
     clips_cfg = cfg.get("clips", {})
     ana = cfg.get("analysis", {})
     min_d = float(clips_cfg.get("min_duration", 8))
@@ -552,6 +555,9 @@ def find_highlights(
     path: Path, cfg: dict[str, Any]
 ) -> list[Segment]:
     """Score timeline; for reaction niches bias to laugh/scream/face peaks and center with lead-in."""
+    if cfg.get("niche_id") in {"anime", "animation"}:
+        from .coherent import select_scene
+        return select_scene(path, cfg)
     clips_cfg = cfg.get("clips", {})
     ana = cfg.get("analysis", {})
     weights = ana.get("weights") or {}

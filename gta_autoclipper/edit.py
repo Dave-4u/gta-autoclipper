@@ -613,6 +613,13 @@ def render_clip(
     video_id: str = "",
     source_meta: dict[str, Any] | None = None,
 ) -> Path | None:
+    if cfg.get("niche_id") in {"anime", "animation"}:
+        if (source_meta or {}).get("source_kind") not in {"episode_scene", "original_fan_animation", "local_supplied"}:
+            print("[source-policy] REJECT missing original scene provenance; supply a local file explicitly or authorized episode scene")
+            return None
+        if "coherent_scene_pause_aligned" not in (segment.reason or ""):
+            print("[scene] REJECT unvalidated selection; no loudness/montage fallback")
+            return None
     out = _render_clip_impl(source, segment, cfg, title=title, index=index,
                             video_id=video_id, source_meta=source_meta)
     # Ranking burns its watermark once on the assembled video, not on every part
@@ -643,7 +650,7 @@ def _render_clip_impl(
     _mont_done = False
     try:
         from .montage import build_moment_montage, montage_cfg
-        if montage_cfg(cfg).get("enabled", True):
+        if montage_cfg(cfg).get("enabled", True) and cfg.get("niche_id") not in {"anime", "animation"}:
             _mt = build_moment_montage(
                 source, cfg, ranking_part=bool(clips.get("ranking_part")),
                 anchor=(segment.start, segment.end), tag=f"{video_id or 'v'}_{index}",
@@ -660,7 +667,9 @@ def _render_clip_impl(
     except Exception as _e:
         print(f"[montage] skip: {_e}")
     if not _mont_done:
-        segment = _cap_segment(segment, cfg)
+        coherent_scene = "coherent_scene_pause_aligned" in (segment.reason or "")
+        if not coherent_scene:
+            segment = _cap_segment(segment, cfg)
         # Still enforce the length floor even without a montage (short sources → skip, don't ship 6s trash)
         _floor = float((cfg.get("montage") or {}).get(
             "ranking_min_seconds" if clips.get("ranking_part") else "min_seconds"
@@ -672,7 +681,7 @@ def _render_clip_impl(
         except Exception:
             _sd = segment.end
         need = _floor - (segment.end - segment.start)
-        if need > 0.5 and _sd > segment.end + 1:
+        if not coherent_scene and need > 0.5 and _sd > segment.end + 1:
             expand = min(need, max(0.0, _sd - segment.end - 0.3))
             segment = type(segment)(start=segment.start, end=segment.end + expand,
                                     score=segment.score, reason=(segment.reason or "") + "+expand")
@@ -842,7 +851,7 @@ def _render_clip_impl(
     import functools as _ft
     # Every fill-crop: strip baked black bars + centre on the action (full-screen 9:16, no bars)
     try:
-        _pre, _acx = smart_frame(source, segment.start, segment.end)
+        _pre, _acx = ("", .5) if niche_id in {"anime", "animation", "gta6", "gaming", "movies"} else smart_frame(source, segment.start, segment.end)
     except Exception:
         _pre, _acx = "", 0.5
     fill_crop_filter = _ft.partial(_fcf, pre_crop=_pre, cx=_acx)
@@ -859,7 +868,18 @@ def _render_clip_impl(
     if niche_id in {"gta6", "anime", "animation", "gaming", "movies"}:
         is_reactionish = False
     gem_layout = meta.get("gemini_layout") or {}
-    if gem_layout.get("face_bbox") and gem_layout.get("game_bbox"):
+    if niche_id in {"anime", "animation", "gta6", "gaming", "movies"}:
+        from .adaptive_frame import plan_segment, adaptive_filter
+        try:
+            framing_mode, framing_cx, framing_reason = plan_segment(source, segment.start, segment.end, cfg)
+        except Exception:
+            framing_mode, framing_cx, framing_reason = "fit", .5, "framing evidence unavailable"
+        split_base = adaptive_filter(width=width, height=height, speed=speed,
+                                     mode=framing_mode, cx=framing_cx,
+                                     blur_width=(cfg.get("framing") or {}).get("blur_width",180),
+                                     blur_sigma=(cfg.get("framing") or {}).get("blur_sigma",5))
+        print(f"[framing] stable_segment={framing_mode} reason={framing_reason}; not subject tracking")
+    elif gem_layout.get("face_bbox") and gem_layout.get("game_bbox"):
         face_layout = layout_from_gemini(gem_layout)
         if face_layout.face and face_layout.game:
             split_base = split_filter_complex(
@@ -1569,7 +1589,7 @@ def _render_clip_impl(
             rev = self_review(out_path, _hdr, cfg=cfg, title=title or "")
             print(f"[edit] header-match ok={rev.get('ok')} reasons={rev.get('reasons')} desc={str(rev.get('desc',''))[:120]}")
             if not rev.get("ok") and not rev.get("skipped"):
-                if cfg.get("_ranking_soft_header"):
+                if cfg.get("_ranking_soft_header") and niche_id not in {"anime", "animation"}:
                     print(f"[edit] soft header mismatch (ranking keep): {_hdr!r} reasons={rev.get('reasons')}")
                 else:
                     print(f"[edit] REJECT header mismatch for {_hdr!r}")
@@ -1577,7 +1597,7 @@ def _render_clip_impl(
                     except Exception: pass
                     return None
         # Final niche style self-review: anime vs western animation
-        if niche_id in {"anime", "animation", "cartoon", "cartoons"} and not cfg.get("_skip_style_match"):
+        if niche_id in {"anime", "animation", "cartoon", "cartoons"}:
             from .style_kind import vision_style_check
             sk = vision_style_check(
                 out_path, niche_id=niche_id, cfg=cfg, title=title or "", header=_hdr,
@@ -1586,7 +1606,7 @@ def _render_clip_impl(
                 f"[niche-check] final kind={sk.get('kind')} franchise={sk.get('franchise')} "
                 f"ok={sk.get('ok')} reasons={sk.get('reasons')}"
             )
-            if sk.get("ok") is False and not sk.get("skipped"):
+            if sk.get("ok") is not True or sk.get("skipped"):
                 print(f"[edit] REJECT style niche mismatch for niche={niche_id}")
                 try: out_path.unlink(missing_ok=True)
                 except Exception: pass

@@ -58,6 +58,12 @@ def download_video(candidate: Candidate, cfg: dict[str, Any]) -> Path | None:
     if procutil.cancelled():
         print("[download] cancelled")
         return None
+    from .source_policy import enforce_source
+    if not enforce_source(candidate, cfg):
+        return None
+    if candidate.source == "local":
+        local = Path(candidate.url)
+        return local if local.is_file() else None
     out_dir = Path(cfg["download"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     fmt = cfg["download"].get("format", "bv*[height<=1080]+ba/b[height<=1080]/b")
