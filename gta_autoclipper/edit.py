@@ -640,7 +640,7 @@ def render_clip(
         if (source_meta or {}).get("source_kind") not in {"episode_scene", "original_fan_animation", "local_supplied"}:
             print("[source-policy] REJECT missing original scene provenance; supply a local file explicitly or authorized episode scene")
             return None
-        if "coherent_scene_pause_aligned" not in (segment.reason or ""):
+        if not ((segment.reason or "").startswith("coherent_scene_") and (segment.reason or "").endswith("_aligned")):
             print("[scene] REJECT unvalidated selection; no loudness/montage fallback")
             return None
     out = _render_clip_impl(source, segment, cfg, title=title, index=index,
@@ -690,7 +690,7 @@ def _render_clip_impl(
     except Exception as _e:
         print(f"[montage] skip: {_e}")
     if not _mont_done:
-        coherent_scene = "coherent_scene_pause_aligned" in (segment.reason or "")
+        coherent_scene = (segment.reason or "").startswith("coherent_scene_") and (segment.reason or "").endswith("_aligned")
         if not coherent_scene:
             segment = _cap_segment(segment, cfg)
         # Still enforce the length floor even without a montage (short sources → skip, don't ship 6s trash)

@@ -58,19 +58,21 @@ For anime/animation:
 The new selector replaces loudness-only anime/animation picking. It samples eight
 chronological 384px frames in at most the first 90 seconds, requests ONE continuous
 same-scene/characters/action thread with setup and payoff, explicitly rejects AMVs,
-recaps, social overlays, speed ramps and unrelated cuts, and asks for natural pauses.
+recaps, social overlays, speed ramps and unrelated cuts, and asks for complete beats with natural boundaries.
 JSON must affirm original_scene=true and coherent=true and contain valid bounds.
 Ranking target is 18–28s; other clips 30–45s. Bounds must align within 2s to detected
--35dB / 0.18s audio pauses; otherwise the candidate is rejected. Proxy/file edges
-are not assumed safe. No key, malformed answer or unavailable validation fails
+-35dB / 0.18s audio pauses first. Continuous-audio action may instead use nearby
+FFmpeg-detected shot cuts, only with >=0.85 continuity confidence, confirmed natural
+boundaries and explicit no-dialogue evidence. Dialogue requires detected sentence/word
+gaps, not arbitrary cuts. Proxy/file edges are not assumed safe. No key, malformed answer or unavailable validation fails
 closed, without a loudness fallback. A validated scene is never expanded/capped
 across new boundaries or stitched into distant moments. Render requires source
-provenance AND the coherent pause-aligned selection marker.
+provenance AND the coherent pause/shot/word-gap-aligned selection marker.
 
 Final Gemini QA additionally rejects edit overlays, compilation transitions,
 unconnected characters/locations, missing setup/payoff and cropped main combatants.
 For episode niches, ranking no longer soft-passes that final mismatch gate.
-These are sampled-frame and audio-pause checks, NOT perfect temporal understanding
+These are sampled-frame and audio/shot-boundary checks, NOT perfect temporal understanding
 or linguistic sentence detection. False rejections and missed mid-word errors
 are possible; review the output. They cannot establish licensing or fair use.
 
@@ -118,3 +120,64 @@ bug was reproduced. The fixture now uses textured video. Numerical checks compar
 full fitted foreground and edge-to-edge crop against independently scaled/cropped
 references, require texture on both crop edges (no pillarboxing), and compare
 blurred versus sharp background edge gradients. Review artifacts remain synthetic.
+
+
+## Episode recovery / bounded downloads
+
+Anime/animation lazily try at most three **separate** sections at 18%, 50%, 78%
+of an episode (short/unknown duration starts at zero). Default 60s, configurable
+45–90s; never stitch these windows. A valid scene ends the search immediately.
+Each source has a shared 240s download/selection deadline, further limited by the
+run budget minus a 300s finishing reserve. Automatic ranking still targets five
+with its existing 5280s internal / 5400s outer limit; no count controls return.
+Scheduled autopilot cycles get fresh run/circuit state.
+
+The download supervisor observes increased file bytes or FFmpeg media position:
+45s without real progress is a stall, but an active slow download continues until
+the finite source deadline. Warning chatter is not progress. Socket timeout15s;
+yt-dlp's nested retries are disabled; at most two outer attempts, only for transient
+network/stall errors and only if >=30s remains. No second lighter-quality attempt:
+section formats remain >=720p, <=1080p, non-AV1. Forced-keyframe reencoding on section
+downloads was removed. Exact cache entries must probe as usable >=720p media;
+accidental full-file results are rejected. Never accept a different cached window.
+Failed IDs are skipped for the run; three consecutive download failures open a
+circuit. Two consecutive provider failures open a separate provider circuit.
+
+Scene replies have at most two calls within a shared 40s wall / remaining source
+time (20s request cap). Invalid JSON/empty/provider errors and invalid timestamps
+are distinct from a real content rejection. A valid coherent verdict with invalid
+timestamps gets one constrained correction, not silent truncation or arbitrary
+clamping. Content rejection is not retried on the same window. Provider failure
+stops new-window attempts; genuine content/boundary rejection may try the next.
+Boundary FFmpeg scans cap45s and remaining source time. Tiny Whisper word-gap
+analysis runs in a disposable subprocess capped40s/remaining time and is cancelled
+with its process tree, rather than leaving unbounded native inference running.
+Logs expose reason enums, bytes, media position and remaining time, not raw
+provider/yt-dlp stderr, cookie paths or signed URLs. Missing output/cache/temp
+parents are recreated. Original footage and niche/required QA gates stay strict.
+
+### Reproduction evidence (Linux box, not Windows verification)
+
+Artifacts: `/workspace/outputs/episode_recovery/` (not committed).
+A public source that passed the publisher-handle/original-scene metadata gate
+(`RzClCJFpSoM`) downloaded a real45s 1280x720 section in31.92s, including increasing
+bytes/media-position logs. The initial selection was rejected, then the revised
+prompt revealed a coherent/original verdict with invalid duration. With the bounded
+timestamp correction, it selected4.60–28.44s at natural shot boundaries in6.00s.
+A production-adaptive full-fit render and required header/style QA passed in10.99s:
+`live_scene_review_sample.mp4`, 23.840s, H264/AAC,720x1280. Style QA identified
+**Boruto: Naruto Next Generations**. See `live_render_review.json`. This verifies
+one download/selection/framing/QA path, NOT a full UI/Top5 run, captions, VO or Windows.
+No footage is copyright-cleared by these checks; regional/network access can differ.
+
+`PYTHONPATH=. .venv/bin/python scripts/reproduce_episode_boundaries.py` produces a
+clearly labelled synthetic continuous-sine fixture. Actual FFmpeg finds no silence
+but shot cuts at5s/35s, and accepts the30s coherent action window (3.98s original
+measurement). This is boundary mechanics, not Gemini semantic verification.
+`scripts/reproduce_episode_sample.py` reproduces the render/QA from the existing
+live section and accepted selection JSON; it removes the output if required QA fails.
+
+PC log timeouts and the restrictive pause-only code path are confirmed evidence;
+the precise Windows/network cause behind FFmpeg3436169992 is still unknown.
+Removing forced reencoding is a plausible performance improvement, not proof of
+that specific exit code's cause. No PC changes or Windows runtime tests were made.

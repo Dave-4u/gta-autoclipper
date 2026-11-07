@@ -68,11 +68,24 @@ def has_gemini(cfg: dict[str, Any] | None = None) -> bool:
     return bool(resolve_api_key(cfg))
 
 
-def _client(api_key: str):
+def _error_label(message):
+    low=str(message).lower()
+    if any(x in low for x in ("429","quota","resource_exhausted","rate limit")):
+        return "provider_rate_limit"
+    if any(x in low for x in ("503","502","unavailable")):
+        return "provider_unavailable"
+    if "timeout" in low or "timed out" in low:
+        return "provider_timeout"
+    if any(x in low for x in ("401","403","api key","permission")):
+        return "provider_authentication"
+    return "provider_error"
+
+
+def _client(api_key: str, timeout_seconds: float | None = None):
     from google import genai
     import os
     # Without a timeout a stalled free-tier request hangs the whole job forever (seen in ranking).
-    t_ms = int(float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "90") or 90) * 1000)
+    t_ms = int(float(timeout_seconds if timeout_seconds is not None else os.environ.get("GEMINI_TIMEOUT_SECONDS", "90") or 90) * 1000)
     try:
         from google.genai import types
         return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=t_ms))
@@ -87,6 +100,8 @@ def generate(
     cfg: dict[str, Any] | None = None,
     model: str | None = None,
     max_retries: int = 5,
+    timeout_seconds: float | None = None,
+    total_seconds: float | None = None,
 ) -> str:
     api_key = resolve_api_key(cfg)
     if not api_key:
@@ -95,7 +110,7 @@ def generate(
     models = [preferred] + [m for m in FALLBACK_MODELS if m != preferred]
     from google.genai import types
 
-    client = _client(api_key)
+    client = _client(api_key, timeout_seconds)
     parts: list[Any] = []
     for img in images or []:
         p = Path(img)
@@ -109,13 +124,16 @@ def generate(
     last_err = ""
     import os as _os, time as _time
     _t0 = _time.time()
-    _wall = float(_os.environ.get("GEMINI_TOTAL_SECONDS", "150") or 150)
+    _wall = float(total_seconds if total_seconds is not None else _os.environ.get("GEMINI_TOTAL_SECONDS", "150") or 150)
     for model_name in models:
         for attempt in range(max_retries):
-            if _time.time() - _t0 > _wall:
+            remaining_wall = _wall - (_time.time() - _t0)
+            if remaining_wall <= 0:
                 print(f"[gemini] gave up after {_wall:.0f}s total (models/retries) — using fallback")
                 return ""
             try:
+                if total_seconds is not None:
+                    client = _client(api_key, min(float(timeout_seconds or 20), remaining_wall))
                 resp = client.models.generate_content(
                     model=model_name,
                     contents=contents,
@@ -139,15 +157,15 @@ def generate(
                 msg = last_err.lower()
                 # Move to next model on daily quota / not found
                 if any(x in msg for x in ("per day", "not found", "no longer available")):
-                    print(f"[gemini] switch model after: {last_err[:120]}")
+                    print(f"[gemini] switch model reason={_error_label(last_err)}")
                     break
                 retryable = any(x in msg for x in ("429", "rate", "quota", "resource exhausted", "503", "unavailable"))
                 if not retryable or attempt >= max_retries - 1:
                     break
                 sleep_s = min(60.0, (2 ** attempt) + random.uniform(0, 0.5))
-                print(f"[gemini] backoff {sleep_s:.1f}s ({last_err[:100]})")
+                print(f"[gemini] backoff {sleep_s:.1f}s reason={_error_label(last_err)}")
                 time.sleep(sleep_s)
-    raise RuntimeError(f"gemini_failed:{last_err[:200]}")
+    raise RuntimeError(f"gemini_failed:{_error_label(last_err)}")
 
 
 def generate_video(

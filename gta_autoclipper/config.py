@@ -70,6 +70,8 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         apply_to_cfg(data)
     except Exception as e:  # never block a run on a bad watermarks.json
         print(f"[watermark] settings ignored: {e}")
+    import time
+    data["_run_deadline_monotonic"] = time.monotonic() + min(5400, float((data.get("job") or {}).get("overall_timeout_seconds") or 5400))
     log_quality(data)
     return data
 

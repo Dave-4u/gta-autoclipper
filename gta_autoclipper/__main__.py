@@ -38,7 +38,12 @@ def run_once(cfg: dict, *, max_videos: int = 2, skip_whisper: bool | None = None
     for cand in candidates[:max_videos]:
         print(f"\n[run] === {cand.title} ({cand.id}) views={cand.view_count} score={cand.rank_score:.2f}")
         try:
-            path = download_video(cand, cfg)
+            episode_segments = None
+            if cfg.get("niche_id") in {"anime", "animation"}:
+                from .episode_windows import prepare_episode
+                path, episode_segments = prepare_episode(cand,cfg,find_highlights)
+            else:
+                path = download_video(cand, cfg)
             if not path:
                 print("[run] download failed, skipping")
                 history.mark(cand.id, {"status": "download_failed", "title": cand.title})
@@ -46,7 +51,7 @@ def run_once(cfg: dict, *, max_videos: int = 2, skip_whisper: bool | None = None
             dur = probe_duration(path)
             print(f"[run] downloaded {path.name} ({dur:.1f}s)")
 
-            segments = find_highlights(path, cfg)
+            segments = episode_segments if episode_segments is not None else find_highlights(path, cfg)
             if not segments:
                 print("[run] no highlights found")
                 history.mark(cand.id, {"status": "no_highlights", "title": cand.title})

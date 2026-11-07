@@ -44,7 +44,7 @@ def _cookie_args(cfg: dict[str, Any] | None = None) -> list[str]:
         if cp.is_file():
             args.extend(["--cookies", str(cp)])
         else:
-            print(f"[discover] cookies file not found: {cookies}")
+            print("[discover] configured cookies file missing (path not logged)")
     return args
 
 
@@ -80,18 +80,20 @@ def _run_ytdlp_json(
         print(f"[discover] yt-dlp timed out after {timeout}s — skipping this query")
         return []
     except Exception as e:
-        print(f"[discover] yt-dlp error: {e}")
+        print(f"[discover] yt-dlp error_type={type(e).__name__}")
         return []
     stdout = (proc.stdout or "").strip()
     stderr = (proc.stderr or "").strip()
     if proc.returncode != 0 and not stdout:
         err = stderr[:300]
         if err:
-            print(f"[discover] yt-dlp non-zero ({proc.returncode}): {err}")
+            from .download_watch import diagnostic_reason
+            print(f"[discover] status=failed reason={diagnostic_reason(stderr)}")
         return []
     if not stdout and stderr:
         # Sometimes yt-dlp prints only to stderr on block
-        print(f"[discover] yt-dlp empty stdout: {stderr[:300]}")
+        from .download_watch import diagnostic_reason
+        print(f"[discover] status=failed reason={diagnostic_reason(stderr)}")
         return []
     lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
     results: list[dict[str, Any]] = []
@@ -349,6 +351,9 @@ def smart_rank_score(
 
 
 def discover(cfg: dict[str, Any], history) -> list[Candidate]:
+    from .download_watch import SourceHealth
+    cfg.setdefault("_source_health", SourceHealth())
+    cfg.setdefault("_provider_health", SourceHealth(limit=2))
     search_cfg = cfg.get("search", {})
     keywords = list(search_cfg.get("keywords") or [
         "GTA 6 trailer",
@@ -377,7 +382,7 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
     seen_pool: list[Candidate] = []
     cookie_args = _cookie_args(cfg)
     if cookie_args:
-        print(f"[discover] using cookies: {' '.join(cookie_args)}")
+        print("[discover] configured authentication enabled (details not logged)")
 
     seen_ids: set[str] = set()
     candidates: list[Candidate] = []
@@ -399,7 +404,7 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
                 kw, n=n, prefer_date=prefer_date, timeout=search_timeout, cookie_args=cookie_args
             )
         except Exception as e:
-            print(f"[discover] search failed for {kw!r}: {e}")
+            print(f"[discover] search failed error_type={type(e).__name__}")
             batch = []
         if use_trending and batch is not None:
             try:
@@ -407,7 +412,7 @@ def discover(cfg: dict[str, Any], history) -> list[Candidate]:
                     search_trending_related(kw, n=max(3, n // 2), cookie_args=cookie_args)
                 )
             except Exception as e:
-                print(f"[discover] trending search failed for {kw!r}: {e}")
+                print(f"[discover] trending search failed error_type={type(e).__name__}")
         skipped_dur = skipped_age = skipped_seen = 0
         for c in batch or []:
             if c.id in seen_ids:

@@ -115,13 +115,18 @@ def run_niche_pass(
             _log(f"[auto] skip off-niche ({reason}): {cand.title[:80]}", log)
             continue
         try:
-            path = download_video(cand, niche_cfg)
+            episode_segments = None
+            if niche_id in {"anime", "animation"}:
+                from .episode_windows import prepare_episode
+                path, episode_segments = prepare_episode(cand,niche_cfg,find_highlights)
+            else:
+                path = download_video(cand, niche_cfg)
             if not path:
                 history.mark(cand.id, {"status": "download_failed", "niche": niche_id})
                 continue
             dur = probe_duration(path)
             _log(f"[auto] downloaded {path.name} ({dur:.1f}s)", log)
-            segments = find_highlights(path, niche_cfg)
+            segments = episode_segments if episode_segments is not None else find_highlights(path, niche_cfg)
             if not segments:
                 history.mark(cand.id, {"status": "no_highlights", "niche": niche_id})
                 continue
@@ -231,6 +236,10 @@ def run_autopilot(
     all_out: list[str] = []
     try:
         while True:
+            # Fresh finite budget for each scheduled cycle, not the age of loaded config.
+            cfg['_run_deadline_monotonic'] = time.monotonic() + min(5400,float((cfg.get('job') or {}).get('overall_timeout_seconds') or 5400))
+            cfg.pop('_source_health',None)
+            cfg.pop('_provider_health',None)
             for niche_id in niche_list:
                 if get_state().stop_requested:
                     break

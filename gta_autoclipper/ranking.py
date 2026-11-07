@@ -692,7 +692,12 @@ def collect_rank_items(
         if _timed_out():
             return None
         try:
-            path = download_video(cand, cfg_rank)
+            episode_segments = None
+            if niche_id in {"anime", "animation"}:
+                from .episode_windows import prepare_episode
+                path, episode_segments = prepare_episode(cand,cfg_rank,find_highlights_light)
+            else:
+                path = download_video(cand, cfg_rank)
             if not path or _timed_out():
                 return None
             face = None
@@ -710,7 +715,7 @@ def collect_rank_items(
             if _timed_out():
                 return None
             # Lightweight analyze only for ranking
-            segs = find_highlights_light(path, cfg_rank)
+            segs = episode_segments if episode_segments is not None else find_highlights_light(path, cfg_rank)
             if not segs:
                 return None
             seg = segs[0]
@@ -1095,6 +1100,7 @@ def build_ranking_video(
     from .planning import ranking_timing, remaining_render_budget
     budget, hard_wall = ranking_timing(cfg, automatic=automatic, deadline_s=deadline_s)
     deadline = time.time() + budget
+    cfg["_run_deadline_monotonic"] = time.monotonic() + budget
     min_on_timeout = int(rk.get("min_items_on_timeout", 3) or 3)
     _log(f"[ranking] budget={budget:.0f}s hard_wall={hard_wall:.0f}s automatic={automatic} target={n} min_on_timeout={min_on_timeout}")
     # Ranking clips should be short

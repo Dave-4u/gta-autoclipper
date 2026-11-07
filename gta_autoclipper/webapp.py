@@ -210,7 +210,12 @@ def _run_single(req: StartRequest) -> None:
                 _progress.log("[job] stopped or overall timeout")
                 break
             _progress.begin("download", f"{cand.id} — {cand.title[:60]}")
-            path = download_video(cand, cfg)
+            episode_segments = None
+            if niche in {"anime", "animation"}:
+                from .episode_windows import prepare_episode
+                path, episode_segments = prepare_episode(cand,cfg,find_highlights)
+            else:
+                path = download_video(cand, cfg)
             if not path:
                 _progress.end("download", status="fail", detail="download failed")
                 hist.mark(cand.id, {"status": "download_failed", "niche": niche})
@@ -224,7 +229,7 @@ def _run_single(req: StartRequest) -> None:
             _progress.begin("analyze", f"highlights ≤{analyze_timeout:.0f}s")
 
             def _an():
-                return find_highlights(path, cfg)
+                return episode_segments if episode_segments is not None else find_highlights(path, cfg)
 
             ok_a, segs, err_a = run_with_timeout(_an, seconds=analyze_timeout, label="analyze", progress=_progress)
             if not ok_a:
