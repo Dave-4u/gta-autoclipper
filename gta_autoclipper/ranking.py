@@ -1055,6 +1055,7 @@ def build_ranking_video(
     with_vo: bool = True,
     log=None,
     deadline_s: float | None = None,
+    automatic: bool = False,
     cancel_event=None,
 ) -> Path | None:
     def _log(msg: str) -> None:
@@ -1072,6 +1073,15 @@ def build_ranking_video(
         return False
 
     cfg = load_config(config_path)
+    if automatic:
+        from .planning import automatic_plan
+        plan = automatic_plan("ranking", niche_id)
+        n = plan.output_target
+        cfg["ranking"] = dict(cfg.get("ranking") or {})
+        # Discovery/probe budget is not the final output count; keep replacement spares.
+        cfg["ranking"].update(spare_items=plan.spare_items,
+                              max_probe=plan.probe_limit - plan.spare_items)
+        print(f"[plan] {plan.summary}", flush=True)
     ensure_dirs(cfg)
     cfg = apply_niche_to_config(cfg, niche_id)
     rk = dict(cfg.get("ranking") or {})

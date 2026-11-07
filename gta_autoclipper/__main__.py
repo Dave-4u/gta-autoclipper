@@ -122,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Comma-separated keywords when using --niche custom",
     )
+    parser.add_argument("--automatic-plan", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--ranking", action="store_true", help="Build a Top-N ranking video for one niche")
     parser.add_argument("--topic", default=None, help="Ranking topic (auto-suggest if omitted)")
     parser.add_argument("--rank-n", type=int, default=5, help="Number of ranking items")
@@ -164,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
             n=max(3, min(7, args.rank_n)),
             config_path=args.config,
             deadline_s=args.deadline,
+            automatic=args.automatic_plan,
         )
         print(out or "[ranking] failed")
         return 0

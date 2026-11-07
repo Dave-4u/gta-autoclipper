@@ -38,9 +38,24 @@ class StartRequest(BaseModel):
     niche: str = "anime"
     mode: str = "single"  # single | ranking | autopilot
     topic: str = ""
-    rank_n: int = 5
-    max_videos: int = 1
-    max_clips: int = 2
+    # Old clients may submit counts; extra fields are ignored, never executed.
+    @property
+    def plan(self):
+        from .planning import automatic_plan
+        return automatic_plan(self.mode, self.niche)
+
+    @property
+    def rank_n(self):
+        return 5
+
+    @property
+    def max_videos(self):
+        return self.plan.source_limit
+
+    @property
+    def max_clips(self):
+        return self.plan.output_target if self.plan.mode == "autopilot" else self.plan.clips_per_video
+
     voiceover: bool = True
     captions: bool = True
     fast: bool = True
@@ -285,7 +300,8 @@ def _run_ranking(req: StartRequest) -> None:
             return build_ranking_video(
                 niche,
                 topic=topic,
-                n=max(3, min(7, int(req.rank_n or 5))),
+                n=5,
+                automatic=True,
                 config_path=_config_path,
                 log=lambda m: _progress.log(m),
                 deadline_s=budget,
@@ -376,6 +392,14 @@ def create_app(config_path: str | None = None) -> FastAPI:
         snap["autopilot_running"] = JOB.running() and "--auto" in JOB.cmd
         return snap
 
+    @app.get("/api/plan")
+    def plan(mode: str = "single", niche: str = "anime"):
+        from .planning import automatic_plan
+        try:
+            return automatic_plan(mode, niche).as_dict()
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+
     @app.post("/api/start")
     def start(req: StartRequest):
         # Jobs run as a separate `python -m gta_autoclipper ...` process (see jobrunner.py):
@@ -383,6 +407,10 @@ def create_app(config_path: str | None = None) -> FastAPI:
         from .jobrunner import JOB, cli_args_for
         if JOB.running():
             raise HTTPException(409, "A job is already running")
+        try:
+            plan = req.plan
+        except ValueError as e:
+            raise HTTPException(422, str(e))
         cfg = _cfg()
         job_cfg = cfg.get("job") or {}
         mode = (req.mode or "single").lower()
@@ -395,7 +423,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             hard = float(job_cfg.get("overall_timeout_seconds") or 5400)
         JOB.start(cli_args_for(req, _config_path), cwd=project_root(), hard_timeout_s=hard,
                   stall_min=float(job_cfg.get("watchdog_minutes") or 8))
-        return {"ok": True, "mode": req.mode, "niche": req.niche, "pid": JOB.proc.pid if JOB.proc else None}
+        return {"ok": True, "mode": req.mode, "niche": req.niche, "plan": plan.as_dict(), "pid": JOB.proc.pid if JOB.proc else None}
 
     @app.get("/api/watermarks")
     def wm_get():

@@ -31,11 +31,25 @@
     tallyText.textContent = text;
   }
 
+  let planVersion = 0;
+  async function updatePlan() {
+    const version = ++planVersion;
+    try {
+      const res = await fetch(`/api/plan?mode=${encodeURIComponent(mode)}&niche=${encodeURIComponent(niche.value)}`);
+      const data = await res.json();
+      if (version === planVersion) $("automaticPlan").textContent = data.summary || "Select a supported niche.";
+    } catch (_) {
+      if (version === planVersion) $("automaticPlan").textContent = "Automatic plan will be selected when the job starts.";
+    }
+  }
+  niche.addEventListener("change", updatePlan);
+
   function setMode(next) {
     mode = next;
     document.querySelectorAll("#modeSeg button").forEach((b) => {
       b.classList.toggle("on", b.dataset.mode === mode);
     });
+    updatePlan();
     topicField.hidden = mode !== "ranking";
     topicField.style.display = mode === "ranking" ? "" : "none";
   }
@@ -55,6 +69,7 @@
       niche.appendChild(opt);
     });
     if (data.defaults?.niche) niche.value = data.defaults.niche;
+    updatePlan();
     $("topMeta").textContent = `OUTPUTS ${data.outputs_count || 0}`;
   }
 
@@ -132,9 +147,6 @@
       niche: niche.value,
       mode,
       topic: $("topic").value || "",
-      rank_n: 5,
-      max_videos: Number($("maxVideos").value || 1),
-      max_clips: Number($("maxClips").value || 2),
       voiceover: $("voiceover").checked,
       captions: $("captions").checked,
       fast: $("fast").checked,

@@ -168,20 +168,23 @@ JOB = Job()
 def cli_args_for(req: Any, config_path: str | None) -> list[str]:
     mode = (getattr(req, "mode", "single") or "single").lower()
     niche = str(getattr(req, "niche", "anime") or "anime")
+    from .planning import automatic_plan
+    plan = automatic_plan(mode, niche)
     a: list[str] = []
     if config_path:
         a += ["--config", str(config_path)]
     if mode == "ranking":
-        a += ["--ranking", "--niche", niche, "--rank-n", str(max(3, min(7, int(getattr(req, "rank_n", 5) or 5))))]
+        a += ["--ranking", "--niche", niche, "--rank-n", "5"]
         if (getattr(req, "topic", "") or "").strip():
             a += ["--topic", req.topic.strip()]
+        a.append("--automatic-plan")
         return a
     if mode in ("autopilot", "auto"):
-        a += ["--auto", "--niche", niche, "--clips-per-niche", str(max(1, int(req.max_clips or 1))),
-              "--max-videos", str(max(1, int(req.max_videos or 1)))]
+        a += ["--auto", "--niche", niche, "--clips-per-niche", str(plan.output_target),
+              "--max-videos", str(plan.source_limit)]
     else:
-        a += ["--once", "--niche", niche, "--max-videos", str(max(1, int(req.max_videos or 1))),
-              "--max-clips", str(max(1, int(req.max_clips or 1)))]
+        a += ["--once", "--niche", niche, "--max-videos", str(plan.source_limit),
+              "--max-clips", str(plan.clips_per_video)]
         if not getattr(req, "captions", True):
             a.append("--no-captions")
     if getattr(req, "fast", True):
