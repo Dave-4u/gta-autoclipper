@@ -88,3 +88,33 @@ miss motion between samples; uncertain inputs default to full fit.
 
 Offline fixture: `PYTHONPATH=. .venv/bin/python scripts/render_framing_fixture.py`
 produces clearly labeled synthetic tests, not an episode-source validation.
+
+## Windows review and automatic ranking budget follow-up
+
+The reported PC was already veryfast/CRF20/720p; that evidence does NOT support
+blaming ultrafast for its failed output. Code audit found `mkstemp(...)[1]` in both
+scene-frame extraction and face-layout extraction: the returned file descriptor
+was discarded without closing it. Windows can then refuse FFmpeg/read/delete
+access. Both paths now use a shared close-before-use helper and finally cleanup;
+partial extraction failure cleans previously created frames. Frame extraction has
+30s per-frame and review probing 15s timeouts.
+
+Required clip/header/style review now rejects exceptions, missing frames/key,
+skipped QA and malformed/nonaffirmative answers. A review failure is not a
+successful ranking part even when the separate expensive video-upload gate is
+disabled. CLI ranking failure now exits 1, not 0 with zero files.
+
+The prior automatic path preferred `ranking.timeout_seconds` (often 1500) over
+performance/job 5400 values. Automatic UI/CLI now share 5280s internal work budget
+plus 120s outer grace under the existing 5400s process wall. `--fast` cannot shorten
+this automatic budget. Expert direct CLI `--deadline` remains an explicit finite
+override. Abort/watchdog controls are unchanged. After each part, remaining-time
+planning uses max(last part time, mean part time) * 1.25 and an assembly reserve
+of at least 300s, logs remaining parts and measured estimates, and stops before
+exhaustion. It targets five but cannot guarantee five if sources/QA/time fail.
+
+The initial flat-color framing fixture concealed the blur/crop; no actual layout
+bug was reproduced. The fixture now uses textured video. Numerical checks compare
+full fitted foreground and edge-to-edge crop against independently scaled/cropped
+references, require texture on both crop edges (no pillarboxing), and compare
+blurred versus sharp background edge gradients. Review artifacts remain synthetic.

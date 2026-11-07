@@ -1092,10 +1092,11 @@ def build_ranking_video(
     ensure_dirs(cfg)
     cfg = apply_niche_to_config(cfg, niche_id)
     rk = dict(cfg.get("ranking") or {})
-    budget = float(deadline_s if deadline_s is not None else rk.get("timeout_seconds", 1500) or 1500)
+    from .planning import ranking_timing, remaining_render_budget
+    budget, hard_wall = ranking_timing(cfg, automatic=automatic, deadline_s=deadline_s)
     deadline = time.time() + budget
     min_on_timeout = int(rk.get("min_items_on_timeout", 3) or 3)
-    _log(f"[ranking] budget={budget:.0f}s min_on_timeout={min_on_timeout}")
+    _log(f"[ranking] budget={budget:.0f}s hard_wall={hard_wall:.0f}s automatic={automatic} target={n} min_on_timeout={min_on_timeout}")
     # Ranking clips should be short
     cfg.setdefault("clips", {})
     cfg["clips"]["max_clips_per_video"] = 1
@@ -1258,9 +1259,10 @@ def build_ranking_video(
             _log("[ranking] stopped — no more parts")
             break
         left = deadline - time.time()
-        est = (sum(part_times) / len(part_times)) if part_times else 120.0
-        if left < assemble_reserve + est:
-            _log(f"[ranking] budget: {left:.0f}s left, part≈{est:.0f}s + assemble {assemble_reserve:.0f}s — "
+        est, reserve = remaining_render_budget(part_times, assemble_reserve)
+        _log(f"[ranking] measured plan: remaining_parts={max(0,n-len(rendered_items))} part_est={est:.0f}s assembly_reserve={reserve:.0f}s left={left:.0f}s")
+        if left < reserve + est:
+            _log(f"[ranking] budget: {left:.0f}s left, part≈{est:.0f}s + assemble {reserve:.0f}s — "
                  f"stopping with {len(rendered_items)} part(s)")
             break
         _log(f"[ranking] render part {len(rendered_items) + 1}/{n} (candidate {k + 1}/{len(queue)}): "

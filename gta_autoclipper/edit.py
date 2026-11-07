@@ -603,6 +603,29 @@ def build_transformative_montage(
     return out
 
 
+def required_clip_review(path: Path, header: str, cfg: dict[str, Any], title: str = "") -> bool:
+    """A failed/skipped/malformed required QA is never a successful clip."""
+    from .scene_vlm import self_review
+    from .style_kind import vision_style_check
+    niche = str(cfg.get("niche_id") or "")
+    style_required = niche in {"anime", "animation", "cartoon", "cartoons"}
+    try:
+        if header.strip() or style_required:
+            review = self_review(path, header or title, cfg=cfg, title=title)
+            print(f"[review] header required ok={review.get('ok')} skipped={review.get('skipped')} reasons={review.get('reasons')}")
+            if review.get("ok") is not True or review.get("skipped"):
+                return False
+        if style_required:
+            review = vision_style_check(path, niche_id=niche, cfg=cfg, title=title, header=header)
+            print(f"[niche-check] final kind={review.get('kind')} franchise={review.get('franchise')} ok={review.get('ok')}")
+            if review.get("ok") is not True or review.get("skipped"):
+                return False
+        return True
+    except Exception as e:
+        print(f"[review] REJECT required QA unavailable: {type(e).__name__}; fix frame/Gemini failure and retry")
+        return False
+
+
 def render_clip(
     source: Path,
     segment: Segment,
@@ -1576,43 +1599,19 @@ def _render_clip_impl(
                 _shf.move(str(_faded), str(out_path))
     except Exception as _fe:
         print(f"[edit] outro fade skip: {_fe}")
-    # Header must match on-screen content (Gemini self-review)
+    # Required frame/header/niche QA cannot be skipped by a temp-file or Gemini error.
     try:
-        from .scene_vlm import self_review
-        _hdr = ""
+        import json as _jh
+        _hdr = str((_jh.loads(out_path.with_suffix(".hook.json").read_text()).get("hook")) or title or "")
+    except Exception:
+        _hdr = title or ""
+    if not required_clip_review(out_path, _hdr, cfg, title or ""):
+        print("[edit] REJECT required review failed; clip is not a successful ranking part")
         try:
-            import json as _jh
-            _hdr = str((_jh.loads(out_path.with_suffix(".hook.json").read_text()).get("hook")) or title or "")
-        except Exception:
-            _hdr = title or ""
-        if _hdr.strip() and not cfg.get("_skip_header_match"):
-            rev = self_review(out_path, _hdr, cfg=cfg, title=title or "")
-            print(f"[edit] header-match ok={rev.get('ok')} reasons={rev.get('reasons')} desc={str(rev.get('desc',''))[:120]}")
-            if not rev.get("ok") and not rev.get("skipped"):
-                if cfg.get("_ranking_soft_header") and niche_id not in {"anime", "animation"}:
-                    print(f"[edit] soft header mismatch (ranking keep): {_hdr!r} reasons={rev.get('reasons')}")
-                else:
-                    print(f"[edit] REJECT header mismatch for {_hdr!r}")
-                    try: out_path.unlink(missing_ok=True)
-                    except Exception: pass
-                    return None
-        # Final niche style self-review: anime vs western animation
-        if niche_id in {"anime", "animation", "cartoon", "cartoons"}:
-            from .style_kind import vision_style_check
-            sk = vision_style_check(
-                out_path, niche_id=niche_id, cfg=cfg, title=title or "", header=_hdr,
-            )
-            print(
-                f"[niche-check] final kind={sk.get('kind')} franchise={sk.get('franchise')} "
-                f"ok={sk.get('ok')} reasons={sk.get('reasons')}"
-            )
-            if sk.get("ok") is not True or sk.get("skipped"):
-                print(f"[edit] REJECT style niche mismatch for niche={niche_id}")
-                try: out_path.unlink(missing_ok=True)
-                except Exception: pass
-                return None
-    except Exception as _he:
-        print(f"[edit] header-match skip: {_he}")
+            out_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
 
     # Final VIDEO gate — upload rendered clip; require score >= 7
     if (cfg.get("clips") or {}).get("skip_final_review"):

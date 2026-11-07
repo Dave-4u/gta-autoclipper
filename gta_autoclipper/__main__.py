@@ -168,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
             automatic=args.automatic_plan,
         )
         print(out or "[ranking] failed")
-        return 0
+        return 0 if out else 1
     if args.auto:
         from .autopilot import run_autopilot
 

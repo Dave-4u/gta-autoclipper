@@ -20,7 +20,7 @@ def run(out):
     for name,boxes,draw in cases:
         start=time.monotonic()
         src=out/f'{name}_source.mp4'
-        subprocess.run(['ffmpeg','-v','error','-y','-f','lavfi','-i','color=c=0x203040:s=1280x720:r=30:d=4',
+        subprocess.run(['ffmpeg','-v','error','-y','-f','lavfi','-i','testsrc2=size=1280x720:rate=30:duration=4',
                         '-f','lavfi','-i','sine=frequency=330:sample_rate=48000:duration=4',
                         '-vf',draw,'-c:v','libx264','-preset','veryfast','-crf','18','-threads','2',
                         '-c:a','aac','-shortest',str(src)],check=True)
@@ -38,6 +38,43 @@ def run(out):
         records.append(dict(case=name,mode=mode,reason=reason,seconds=round(time.monotonic()-start,3),
                             output=str(dst),probe=json.loads(probe.stdout)))
         subprocess.run(['ffmpeg','-v','error','-y','-ss','2','-i',str(dst),'-frames:v','1',str(out/f'{name}.jpg')],check=True)
+        from PIL import Image
+        import numpy as np
+        image = out/f'{name}.png'
+        subprocess.run(['ffmpeg','-v','error','-y','-ss','2','-i',str(dst),'-frames:v','1',str(image)],check=True)
+        actual=np.asarray(Image.open(image).convert('RGB')).astype(float)
+        expected=out/f'{name}_expected.png'
+        # Independent standard fit/crop references, not solid-color heuristics.
+        vf=('format=rgb24,scale=-2:1280,crop=720:1280,format=yuv420p' if mode=='crop'
+            else 'scale=720:1280:force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p')
+        subprocess.run(['ffmpeg','-v','error','-y','-ss','2','-i',str(src),'-frames:v','1','-vf',vf,str(expected)],check=True)
+        reference=np.asarray(Image.open(expected).convert('RGB')).astype(float)
+        if mode=='crop':
+            roi=actual[300:1000]
+            expected_roi=reference[300:1000]
+            metrics={'crop_reference_mae':float(np.abs(roi-expected_roi).mean()),
+                     'left_edge_std':float(roi[:,:24].std()),'right_edge_std':float(roi[:,-24:].std())}
+            assert metrics['crop_reference_mae'] < 12, metrics
+            assert metrics['left_edge_std'] > 15 and metrics['right_edge_std'] > 15, metrics
+        else:
+            y=(1280-reference.shape[0])//2
+            metrics={'full_foreground_reference_mae':float(np.abs(actual[y:y+reference.shape[0]]-reference).mean())}
+            # Texture must exist outside the fitted foreground; blurred background is observable.
+            background=actual[180:400]
+            metrics['background_std']=float(background.std())
+            metrics['background_gradient']=float(np.abs(np.diff(background,axis=1)).mean())
+            sharp=out/'wide_sharp_background.png'
+            subprocess.run(['ffmpeg','-v','error','-y','-ss','2','-i',str(src),'-frames:v','1',
+                            '-vf','scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280',str(sharp)],check=True)
+            unblurred=np.asarray(Image.open(sharp).convert('RGB')).astype(float)[180:400]
+            metrics['unblurred_background_gradient']=float(np.abs(np.diff(unblurred,axis=1)).mean())
+            metrics['blurred_max_gradient']=float(np.abs(np.diff(background,axis=1)).max())
+            metrics['sharp_max_gradient']=float(np.abs(np.diff(unblurred,axis=1)).max())
+            assert metrics['full_foreground_reference_mae'] < 12 and metrics['background_std'] > 15,metrics
+            assert metrics['background_gradient'] < metrics['unblurred_background_gradient'],metrics
+            assert metrics['blurred_max_gradient'] < metrics['sharp_max_gradient'] / 2,metrics
+        records[-1]['pixel_verification']=metrics
+
     (out/'verification.json').write_text(json.dumps(records,indent=2))
     print(json.dumps(records,indent=2))
 

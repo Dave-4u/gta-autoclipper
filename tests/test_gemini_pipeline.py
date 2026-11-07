@@ -76,7 +76,7 @@ def test_self_review_mock():
     fake = "DESC: Kai Cenat looks shocked on face cam.\nMATCH: yes\nEMOTION: shocked\nREASON: ok"
     Path("/tmp/x.jpg").write_bytes(b"\xff\xd8\xff\xd9")
     with patch("gta_autoclipper.gemini_client.resolve_api_key", return_value="fake-key"), \
-         patch("gta_autoclipper.scene_vlm.grab_frame_files", return_value=[Path("/tmp/x.jpg")]), \
+         patch("gta_autoclipper.scene_vlm.grab_frame_files", return_value=[Path("/tmp/x.jpg")] * 3), \
          patch("gta_autoclipper.gemini_client.generate", return_value=fake), \
          patch("gta_autoclipper.scene_vlm._cleanup"):
         rev = self_review(Path("/tmp"), "Kai Cenat reacts", start=0, end=5, cfg={}, title="Kai Cenat Reacts")

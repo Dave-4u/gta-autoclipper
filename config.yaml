@@ -98,7 +98,7 @@ gemini:
 
 
 ranking:
-  timeout_seconds: 1500
+  timeout_seconds: 1500       # expert CLI default; automatic Cutroom uses a 5400s hard wall
   min_items_on_timeout: 3
   min_parts: 3            # render Top N with N>=3 if some parts fail
   spare_items: 2          # extra candidates to try when a part fails

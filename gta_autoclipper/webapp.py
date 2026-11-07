@@ -289,11 +289,8 @@ def _run_ranking(req: StartRequest) -> None:
         niche = req.niche if niche_is_enabled(req.niche) else "anime"
         topic = (req.topic or "").strip() or suggest_topic(niche, int(req.rank_n or 5), cfg)
         _progress.begin("ranking", f"{niche} — {topic}")
-        budget = float(
-            (cfg.get("job") or {}).get("ranking_timeout_seconds")
-            or (cfg.get("ranking") or {}).get("timeout_seconds")
-            or (25 * 60)
-        )
+        from .planning import ranking_timing
+        budget, _ = ranking_timing(cfg, automatic=True)
         cancel = threading.Event()
         procutil.clear_cancel()
 
@@ -416,8 +413,8 @@ def create_app(config_path: str | None = None) -> FastAPI:
         job_cfg = cfg.get("job") or {}
         mode = (req.mode or "single").lower()
         if mode == "ranking":
-            hard = float((cfg.get("ranking") or {}).get("timeout_seconds")
-                         or job_cfg.get("ranking_timeout_seconds") or 5400) + 300
+            from .planning import ranking_timing
+            _, hard = ranking_timing(cfg, automatic=True)
         elif mode in {"autopilot", "auto"}:
             hard = float(job_cfg.get("autopilot_timeout_seconds") or 5400)
         else:

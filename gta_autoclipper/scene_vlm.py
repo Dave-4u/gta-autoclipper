@@ -4,25 +4,31 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any
 
 
 def grab_frame_files(path: Path, times: list[float], *, width: int = 512) -> list[Path]:
+    from .tempfiles import closed_temp_path
     frames: list[Path] = []
-    for t in times:
-        out = Path(tempfile.mkstemp(suffix=".jpg")[1])
-        cmd = [
-            "ffmpeg", "-y", "-ss", f"{max(0.0, t):.2f}", "-i", str(path),
-            "-frames:v", "1", "-vf", f"scale={width}:-1", "-q:v", "3", str(out),
-        ]
-        subprocess.run(cmd, capture_output=True, check=False)
-        if out.is_file() and out.stat().st_size > 500:
-            frames.append(out)
-        else:
-            out.unlink(missing_ok=True)
-    return frames
+    pending = None
+    try:
+        for t in times:
+            pending = closed_temp_path(suffix=".jpg")  # descriptor closed BEFORE ffmpeg opens it
+            cmd = [
+                "ffmpeg", "-y", "-ss", f"{max(0.0, t):.2f}", "-i", str(path),
+                "-frames:v", "1", "-vf", f"scale={width}:-1", "-q:v", "3", str(pending),
+            ]
+            result = subprocess.run(cmd, capture_output=True, check=False, timeout=30)
+            if result.returncode == 0 and pending.is_file() and pending.stat().st_size > 500:
+                frames.append(pending)
+            else:
+                _cleanup([pending])
+            pending = None
+        return frames
+    except BaseException:
+        _cleanup(frames + ([pending] if pending is not None else []))
+        raise
 
 
 def _cleanup(files: list[Path]) -> None:
@@ -154,16 +160,16 @@ def self_review(
     if end is None:
         proc = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
-            capture_output=True, text=True, check=False,
+            capture_output=True, text=True, check=False, timeout=15,
         )
         try:
             end = float(json.loads(proc.stdout)["format"]["duration"])
         except Exception:
             end = start + 8.0
     if not has_gemini(cfg):
-        return {"ok": True, "desc": "", "overlap": 1.0, "reasons": [], "skipped": "no_key"}
+        return {"ok": False, "desc": "", "overlap": 0.0, "reasons": ["review_no_key"], "skipped": "no_key"}
     dur = max(0.5, end - start)
-    frames = grab_frame_files(path, [start + dur * x for x in (0.2, 0.5, 0.8)])
+    frames: list[Path] = []
     prompt = (
         "You are QA for a Shorts clip.\n"
         f"On-screen header text: {header!r}\n"
@@ -183,12 +189,16 @@ def self_review(
     )
     raw = ""
     try:
+        frames = grab_frame_files(path, [start + dur * x for x in (0.2, 0.5, 0.8)])
+        if len(frames) != 3:
+            return {"ok": False, "reasons": ["review_missing_frames"], "skipped": "error"}
         raw = generate(prompt=prompt, images=frames, cfg=cfg)
     except Exception as e:
-        print(f"[review/gemini] failed: {e}")
+        print(f"[review/gemini] failed: {type(e).__name__}")
+        return {"ok": False, "desc": "", "overlap": 0.0,
+                "reasons": [f"review_error:{type(e).__name__}"], "skipped": "error"}
+    finally:
         _cleanup(frames)
-        return {"ok": True, "desc": "", "overlap": 0.0, "reasons": [f"review_error:{e}"], "skipped": "error"}
-    _cleanup(frames)
     desc = match = emotion = reason = ""
     for ln in (raw or "").splitlines():
         s = ln.strip()
@@ -202,8 +212,8 @@ def self_review(
         elif low.startswith("reason:"):
             reason = s.split(":", 1)[1].strip()
     fail: list[str] = []
-    if match.startswith("no"):
-        fail.append(reason or "header_mismatch")
+    if match != "yes":
+        fail.append(reason or ("header_mismatch" if match == "no" else "invalid_review_response"))
     if emotion == "blank" and any(k in (header or "").lower() for k in ("react", "face", "cinna", "kai")):
         fail.append("blank_face")
     return {"ok": not fail, "desc": desc or raw[:300], "overlap": 1.0 if not fail else 0.0,

@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 import subprocess
-import tempfile
 
 
 @dataclass
@@ -24,18 +23,20 @@ def _yunet_path() -> Path:
 
 def _grab(path: Path, t: float, width: int = 640):
     import cv2
-    out = Path(tempfile.mkstemp(suffix=".jpg")[1])
-    subprocess.run(
-        ["ffmpeg", "-y", "-ss", f"{max(0.0, t):.2f}", "-i", str(path),
-         "-frames:v", "1", "-vf", f"scale={width}:-1", "-q:v", "3", str(out)],
-        capture_output=True, check=False,
-    )
-    img = cv2.imread(str(out)) if out.is_file() else None
+    from .tempfiles import closed_temp_path
+    out = closed_temp_path(suffix=".jpg")
     try:
-        out.unlink(missing_ok=True)
-    except Exception:
-        pass
-    return img
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{max(0.0, t):.2f}", "-i", str(path),
+             "-frames:v", "1", "-vf", f"scale={width}:-1", "-q:v", "3", str(out)],
+            capture_output=True, check=False, timeout=30,
+        )
+        return cv2.imread(str(out)) if result.returncode == 0 and out.is_file() else None
+    finally:
+        try:
+            out.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _detect_faces(img) -> list[tuple[float, float, float, float]]:
